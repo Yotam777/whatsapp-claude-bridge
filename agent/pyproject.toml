@@ -1,0 +1,15 @@
+[project]
+name = "whatsapp-claude-agent"
+version = "1.0.0"
+description = "Always-on companion of the WhatsApp bridge: talk to Claude from WhatsApp, voice transcription, backups, dashboard"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+# local voice-note transcription (faster-whisper, ~1.6 GB Hebrew model downloaded on first use)
+voice = ["faster-whisper>=1.1", "av>=12"]
+# project plugins may need these (e.g. reading QR codes, decrypting submissions)
+plugins = ["opencv-python-headless>=4.10", "cryptography>=42"]
+
+[dependency-groups]
+dev = ["pytest>=8"]

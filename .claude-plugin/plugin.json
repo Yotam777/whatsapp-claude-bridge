@@ -1,0 +1,46 @@
+{
+  "name": "whatsapp-bridge",
+  "displayName": "WhatsApp ↔ Claude Bridge",
+  "version": "1.0.0",
+  "description": "WhatsApp for Claude: read, search and manage your personal WhatsApp from Claude Code, and chat with Claude from WhatsApp. Hardened whatsmeow bridge with drafts-first sending, anti-ban pacing, voice-note transcription, polls, media backup and a desktop dashboard (Windows).",
+  "author": {
+    "name": "WallaBoohi",
+    "url": "https://github.com/WallaBoohi"
+  },
+  "homepage": "https://github.com/WallaBoohi/whatsapp-claude-bridge",
+  "repository": "https://github.com/WallaBoohi/whatsapp-claude-bridge",
+  "license": "MIT",
+  "keywords": [
+    "whatsapp",
+    "messaging",
+    "mcp",
+    "whatsmeow",
+    "chat",
+    "voice-transcription",
+    "hebrew",
+    "automation",
+    "personal-assistant"
+  ],
+  "userConfig": {
+    "tool_root": {
+      "type": "directory",
+      "title": "WhatsApp bridge folder",
+      "description": "Folder where you cloned whatsapp-claude-bridge and ran setup.cmd (it holds whatsapp-bridge/store)",
+      "required": true
+    }
+  },
+  "mcpServers": {
+    "whatsapp": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "${CLAUDE_PLUGIN_ROOT}/whatsapp-mcp-server",
+        "run",
+        "main.py"
+      ],
+      "env": {
+        "WA_TOOL_ROOT": "${user_config.tool_root}"
+      }
+    }
+  }
+}

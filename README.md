@@ -52,6 +52,17 @@ The wizard: links your WhatsApp (QR) → finds your control group (create a grou
 writes the config → installs components → registers the `whatsapp` MCP server → starts everything at logon →
 installs the dashboard → runs the self-test.
 
+### Add it to Claude Code as a plugin
+
+After `setup.cmd`, install the plugin (MCP tools + a WhatsApp skill) in any Claude Code session:
+
+```text
+/plugin install whatsapp-bridge --marketplace WallaBoohi/whatsapp-claude-bridge
+```
+
+or from a shell: `claude plugin marketplace add WallaBoohi/whatsapp-claude-bridge` then `claude plugin install whatsapp-bridge@wallaboohi`.
+When asked, point **WhatsApp bridge folder** at the folder where you ran `setup.cmd`.
+
 ## Everyday use
 
 - **Chat:** write in your Claude group. Start a message with `!` to bypass the daily budget cap.

@@ -7,9 +7,11 @@ import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+# Where the bridge is installed: WA_TOOL_ROOT (set by the Claude Code plugin) or the checkout this file lives in
+TOOL_ROOT = os.environ.get("WA_TOOL_ROOT") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MESSAGES_DB_PATH = os.path.join(TOOL_ROOT, 'whatsapp-bridge', 'store', 'messages.db')
 WHATSAPP_API_BASE_URL = "http://127.0.0.1:8765/api"
-TOKEN_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "whatsapp-bridge", "store", "api_token")
+TOKEN_FILE = os.path.join(TOOL_ROOT, "whatsapp-bridge", "store", "api_token")
 
 
 def _auth():

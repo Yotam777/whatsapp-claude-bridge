@@ -6,9 +6,9 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from whatsapp import MESSAGES_DB_PATH, WHATSAPP_API_BASE_URL, _auth
+from whatsapp import MESSAGES_DB_PATH, TOOL_ROOT, WHATSAPP_API_BASE_URL, _auth
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = TOOL_ROOT
 AGENT_DB = os.path.join(ROOT, "agent", "agent.db")
 
 

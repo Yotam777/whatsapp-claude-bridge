@@ -1,0 +1,70 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc
+          path-type: inherit
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: whatsapp-bridge/go.mod
+          cache-dependency-path: whatsapp-bridge/go.sum
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Bridge — vet, test, build
+        working-directory: whatsapp-bridge
+        shell: msys2 {0}
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          VERSION=$(cat ../VERSION)
+          go vet .
+          go test ./...
+          go build -ldflags "-X main.version=${VERSION}" -o whatsapp-bridge.exe .
+
+      - name: Agent — unit tests
+        working-directory: agent
+        run: uv run --group dev pytest -q tests
+
+      - name: MCP server — import check
+        working-directory: whatsapp-mcp-server
+        run: uv run python -c "import main, extras"
+
+      - name: Dashboard app
+        run: uv run --no-project python tools/release_dash.py "$(cat dash/VERSION)" "$(git log -1 --pretty=%s)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: |
+            whatsapp-bridge/whatsapp-bridge.exe
+            releases/*.exe
+            releases/latest.json
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file CHANGELOG.md \
+            whatsapp-bridge/whatsapp-bridge.exe releases/*.exe releases/latest.json

@@ -1,3 +1,22 @@
-*.db
-claude_desktop_config.json
-whatsapp.log
+# ---- personal data: never commit ----
+whatsapp-bridge/store/
+whatsapp-bridge/bridge.log*
+whatsapp-bridge/qr.png
+agent/config.json
+agent/home/
+agent/*.db
+agent/*.db-*
+agent/agent.log*
+agent/agent.out*
+agent/selftest.json
+TODO.md
+
+# ---- build output (published as GitHub Releases, not in the repo) ----
+*.exe
+build/
+releases/
+dist/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/

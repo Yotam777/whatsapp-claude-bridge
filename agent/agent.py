@@ -457,6 +457,8 @@ def update_check():
         res = json.loads(out.stdout.strip().splitlines()[-1])
     except Exception:
         return
+    if "error" in res:
+        return
     json.dump(res, open(os.path.join(HERE, "update_check.json"), "w", encoding="utf-8"), ensure_ascii=False)
     if res.get("available") and kv_get("update_notified") != res["latest"]:
         kv_set("update_notified", res["latest"])

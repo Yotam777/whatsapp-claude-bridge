@@ -161,7 +161,7 @@ def main():
 
     step(9, "בדיקה עצמית", "Self-test")
     time.sleep(20)
-    subprocess.run([uv(), "run", "-q", "python", "-X", "utf8", os.path.join(ROOT, "tools", "selftest.py"), "--quiet"], cwd=AGENT)
+    subprocess.run([uv(), "run", "-q", "--no-sync", "python", "-X", "utf8", os.path.join(ROOT, "tools", "selftest.py"), "--quiet"], cwd=AGENT)
     say("\n🎉 סיימנו. כתוב משהו בקבוצת Claude ותקבל תשובה.", "\n🎉 Done. Write something in the Claude group and you'll get an answer.")
 
 

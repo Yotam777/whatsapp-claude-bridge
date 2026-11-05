@@ -185,7 +185,7 @@ def action(a):
     if kind == "backup":
         import shutil
         uv = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe")
-        subprocess.Popen([uv, "run", "-q", "python", "-X", "utf8", "agent.py", "backup"],
+        subprocess.Popen([uv, "run", "-q", "--no-sync", "python", "-X", "utf8", "agent.py", "backup"],
                          cwd=os.path.join(ROOT, "agent"), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return {"ok": True}
     if kind == "restart":
@@ -201,7 +201,8 @@ def action(a):
         out = subprocess.run([uv, "run", "-q", "--no-project", "python", "-X", "utf8", os.path.join(ROOT, "tools", "update.py"), "--check"],
                              capture_output=True, text=True, encoding="utf-8", timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         res = json.loads(out.stdout.strip().splitlines()[-1]) if out.stdout.strip() else {"error": out.stderr[-300:]}
-        json.dump(res, open(cache, "w", encoding="utf-8"), ensure_ascii=False)
+        if "error" not in res:  # don't remember a failed check (offline, release not out yet)
+            json.dump(res, open(cache, "w", encoding="utf-8"), ensure_ascii=False)
         return res
     if kind == "tool_update_apply":
         # visible window so the user can follow the update; it stops and restarts the bridge and the agent

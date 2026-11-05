@@ -29,6 +29,16 @@ def run(cmd, cwd=ROOT, env=None):
     return r.stdout
 
 
+def rewrite(rel, fn):
+    path = os.path.join(ROOT, *rel.split("/"))
+    with open(path, encoding="utf-8", newline="") as f:
+        old = f.read()
+    new = fn(old)
+    if new != old:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(new)
+
+
 def personal_data_scan(patterns):
     files = run(["git", "ls-files"]).split()
     hits = []
@@ -50,22 +60,16 @@ def main():
     if run(["git", "status", "--porcelain", "--untracked-files=no"]).strip() and not dry:
         sys.exit("✖ יש שינויים שלא נשמרו (commit) — שמור אותם קודם.")
 
-    # 1. version everywhere
-    open(os.path.join(ROOT, "VERSION"), "w").write(ver + "\n")
-    open(os.path.join(ROOT, "dash", "VERSION"), "w").write(ver + "\n")
-    pj = os.path.join(ROOT, ".claude-plugin", "plugin.json")
-    p = json.load(open(pj, encoding="utf-8")); p["version"] = ver
-    json.dump(p, open(pj, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    pp = os.path.join(ROOT, "agent", "pyproject.toml")
-    open(pp, "w", encoding="utf-8").write(re.sub(r'(?m)^version = ".*"$', f'version = "{ver}"', open(pp, encoding="utf-8").read(), count=1))
+    # 1. version everywhere (read before writing; keep each file's line endings)
+    for rel in ("VERSION", "dash/VERSION"):
+        rewrite(rel, lambda t: re.sub(r"^\S+", ver, t, count=1))
+    rewrite(".claude-plugin/plugin.json", lambda t: re.sub(r'("version"\s*:\s*")[^"]*"', rf'\g<1>{ver}"', t, count=1))
+    rewrite("agent/pyproject.toml", lambda t: re.sub(r'(?m)^version = ".*"', f'version = "{ver}"', t, count=1))
 
     # 2. changelog
-    cl = os.path.join(ROOT, "CHANGELOG.md")
-    text = open(cl, encoding="utf-8").read()
     entry = f"## {ver} — {dt.date.today().isoformat()}\n{notes or '—'}\n\n"
-    if f"## {ver} " not in text:
-        text = text.replace("# Changelog\n\n", "# Changelog\n\n" + entry, 1)
-        open(cl, "w", encoding="utf-8").write(text)
+    rewrite("CHANGELOG.md", lambda t: t if f"## {ver} " in t else
+            re.sub(r"# Changelog\r?\n\r?\n", lambda m: m.group(0) + entry, t, count=1))
 
     # 3. checks
     go = shutil.which("go") or "C:/Program Files/Go/bin/go.exe"
@@ -93,12 +97,14 @@ def main():
     if hits:
         sys.exit("✖ נמצא מידע אישי בקבצים שעולים לגיט:\n" + "\n".join(hits))
     print("✔ כל הבדיקות עברו")
+    bumped = ["VERSION", "dash/VERSION", ".claude-plugin/plugin.json", "agent/pyproject.toml", "CHANGELOG.md"]
     if dry:
+        run(["git", "checkout", "--"] + bumped)
         print("(dry run — לא נשמר ולא פורסם)")
         return
 
     # 4. commit, tag, push
-    run(["git", "add", "VERSION", "dash/VERSION", ".claude-plugin/plugin.json", "agent/pyproject.toml", "CHANGELOG.md"])
+    run(["git", "add"] + bumped)
     run(["git", "commit", "-m", f"Release v{ver}\n\n{notes}"])
     run(["git", "tag", "-a", f"v{ver}", "-m", f"v{ver}"])
     branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).strip()

@@ -154,6 +154,7 @@ def main():
             return 0
         target, assets = rel["tag"], rel["assets"]
     old_ref, old_ver = git("rev-parse", "HEAD"), current_version()
+    old_branch = git("symbolic-ref", "--quiet", "--short", "HEAD", check=False)
     shutil.copy(BRIDGE_EXE, BRIDGE_EXE + ".bak") if os.path.exists(BRIDGE_EXE) else None
     log(f"מעדכן {old_ver} ← {target} / updating {old_ver} → {target}")
     stop_services()
@@ -175,7 +176,7 @@ def main():
         return 0
     log("↩ הבדיקה נכשלה — חוזר לגרסה הקודמת / self-test failed — rolling back")
     stop_services()
-    git("checkout", "--quiet", old_ref)
+    git("checkout", "--quiet", old_branch or old_ref)
     if os.path.exists(BRIDGE_EXE + ".bak"):
         os.replace(BRIDGE_EXE + ".bak", BRIDGE_EXE)
     try:

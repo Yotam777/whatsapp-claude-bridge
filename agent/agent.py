@@ -51,6 +51,7 @@ T = {
         "logged_out_t": "ווצאפ נותק מהחשבון", "logged_out_b": "צריך לסרוק QR מחדש — הכלי לא מקבל הודעות",
         "down_t": "ווצאפ מנותק", "down_b": "אין חיבור כבר {mins} דקות",
         "back": "✅ החיבור לווצאפ חזר אחרי כ-{mins} דקות.",
+        "update": "🆕 גרסה {latest} של הכלי זמינה (מותקנת {current}).\n{notes}\n\nלעדכון: בלוח הבקרה ← \"בדוק עדכון לכל הכלי\", או הרץ update.cmd.",
         "handoff_prompt": "השיחה הזו נסגרת ותתחיל שיחה חדשה. כתוב סיכום העברה של עד 12 שורות: משימות פתוחות, החלטות, "
                           "העדפות של {owner} ודברים שחייבים לזכור. רק הסיכום, בלי הקדמה.",
         "handoff_title": "# סיכום מהשיחה הקודמת",
@@ -68,6 +69,7 @@ T = {
         "logged_out_t": "WhatsApp logged out", "logged_out_b": "Scan the QR code again — the tool receives no messages",
         "down_t": "WhatsApp disconnected", "down_b": "No connection for {mins} minutes",
         "back": "✅ WhatsApp connection is back after about {mins} minutes.",
+        "update": "🆕 Version {latest} of the tool is available (installed {current}).\n{notes}\n\nTo update: dashboard → \"Check for a tool update\", or run update.cmd.",
         "handoff_prompt": "This session is closing and a new one starts. Write a hand-off summary of up to 12 lines: open tasks, "
                           "decisions, {owner}'s preferences and things to remember. Only the summary.",
         "handoff_title": "# Summary of the previous session",
@@ -445,6 +447,22 @@ def backup():
     log(f"backup done: dbs -> {day}, media checked {fetched}/{len(todo)}, new files copied {copied}")
 
 
+# ---------- updates ----------
+
+def update_check():
+    """Daily: tell the owner once about each new release (they decide when to update)."""
+    out = subprocess.run([shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe"), "run", "-q", "--no-project", "python", "-X", "utf8",
+                          os.path.join(ROOT, "tools", "update.py"), "--check"], capture_output=True, text=True, encoding="utf-8", timeout=120)
+    try:
+        res = json.loads(out.stdout.strip().splitlines()[-1])
+    except Exception:
+        return
+    json.dump(res, open(os.path.join(HERE, "update_check.json"), "w", encoding="utf-8"), ensure_ascii=False)
+    if res.get("available") and kv_get("update_notified") != res["latest"]:
+        kv_set("update_notified", res["latest"])
+        reply(T["update"].format(latest=res["latest"], current=res["current"], notes=(res.get("notes") or "")[:800]))
+
+
 # ---------- plugins ----------
 # A plugin is a Python file with setup(agent). It may register:
 #   agent.on_message(fn(row))                    called for every new message (row as in sweep())
@@ -453,7 +471,7 @@ def backup():
 #   agent.background(fn)                         long-running thread
 #   agent.manual(name, fn)                       `agent.py <name>` on the command line
 
-_hooks, _periodic, _daily, _threads, _manual = [], [], [], [], {"backup": backup}
+_hooks, _periodic, _daily, _threads, _manual = [], [], [], [], {"backup": backup, "update_check": update_check}
 on_message = _hooks.append
 background = _threads.append
 every = lambda minutes, key, fn: _periodic.append((minutes, key, fn))
@@ -600,7 +618,7 @@ def scheduler():
         today = now.date().isoformat()
         try:
             kv_set("heartbeat", now.isoformat())
-            for at, key, fn in [(CFG["backup_time"], "backup", backup)] + _daily:
+            for at, key, fn in [(CFG["backup_time"], "backup", backup), (CFG.get("update_check_time", "09:00"), "update_check", update_check)] + _daily:
                 if now.strftime("%H:%M") >= at and kv_get(f"day:{key}") != today:
                     kv_set(f"day:{key}", today)
                     work.put(fn)

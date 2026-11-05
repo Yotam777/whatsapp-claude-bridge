@@ -20,3 +20,5 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+agent/update_check.json
+agent/update.log

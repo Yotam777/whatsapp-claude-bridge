@@ -4,6 +4,6 @@ cd /d "%~dp0agent"
 set "UV=uv"
 where uv >nul 2>&1 || set "UV=%USERPROFILE%\.local\bin\uv.exe"
 :loop
-"%UV%" run -q --extra voice --extra plugins python -X utf8 agent.py >> agent.out 2>&1
+"%UV%" run -q --no-sync python -X utf8 agent.py >> agent.out 2>&1
 timeout /t 15 /nobreak > nul
 goto loop

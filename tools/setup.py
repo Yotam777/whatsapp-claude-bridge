@@ -130,9 +130,6 @@ def main():
     subprocess.run([uv(), "sync", "-q"] + extras + ["--extra", "plugins"], cwd=AGENT, check=True)
     subprocess.run([uv(), "sync", "-q"], cwd=os.path.join(ROOT, "whatsapp-mcp-server"), check=True)
     run_agent = os.path.join(ROOT, "run-agent.cmd")
-    txt = open(run_agent, encoding="utf-8").read()
-    if not cfg["transcribe"]:
-        open(run_agent, "w", encoding="utf-8").write(txt.replace("--extra voice ", ""))
     say("✔ הרכיבים הותקנו", "✔ components installed")
 
     step(6, "חיבור ל-Claude Code", "Connect to Claude Code")

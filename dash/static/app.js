@@ -15,12 +15,12 @@ const EN = {
   "📝 טיוטות בלבד": "📝 Drafts only", "אתה בודק ושולח": "you review and send", "⚡ שליחה עצמאית": "⚡ Auto send", "לשעה אחת": "for one hour",
   "⏸ השהה 6 שעות": "⏸ Pause 6 hours", "▶ חידוש שליחה": "▶ Resume sending", "מצב המערכת": "System status",
   "↻ הפעל מחדש גשר": "↻ Restart bridge", "↻ הפעל מחדש סוכן": "↻ Restart agent", "💾 גיבוי עכשיו": "💾 Back up now",
-  "עדכוני לוח הבקרה": "Dashboard updates", "בדוק עדכונים": "Check for updates", "פעילות ב-24 השעות האחרונות": "Activity in the last 24 hours",
+  "עדכונים": "Updates", "גרסת הכלי:": "Tool version:", "בדוק עדכון לכל הכלי": "Check for a tool update", "בדוק עדכון ללוח הבקרה": "Check for a dashboard update", "פעילות ב-24 השעות האחרונות": "Activity in the last 24 hours",
   "עלות Claude לפי יום": "Claude cost per day", "טיוטות": "Drafts", "שליחות": "Sent", "תמלולים": "Transcripts", "יומן": "Log",
   "לוח בקרה · גרסה": "Dashboard · version",
   "הנתונים נקראים מהמחשב שלך בלבד · עובד גם בלי אינטרנט": "Data is read from this computer only · works offline",
 };
-const DYNAMIC = new Set(["chat", "sys", "connText", "connSub", "modeNote", "pauseBox", "updNote", "updated", "toast", "log", "ver"]);
+const DYNAMIC = new Set(["chat", "sys", "connText", "connSub", "modeNote", "pauseBox", "updNote", "toolUpdNote", "toolVer", "updated", "toast", "log", "ver"]);
 function translateStatic() {
   document.documentElement.lang = lang; document.documentElement.dir = lang === "en" ? "ltr" : "rtl";
   document.title = L("ווצאפ ↔ Claude", "WhatsApp ↔ Claude");
@@ -96,6 +96,20 @@ $("updBtn").onclick = async () => {
   } else $("updNote").textContent = j.message || L("הגרסה עדכנית", "Up to date");
 };
 
+$("toolUpdBtn").onclick = async () => {
+  $("toolUpdNote").textContent = L("בודק…", "Checking…");
+  const j = await act({ do: "tool_update_check", force: true });
+  if (!j) return;
+  if (j.error && !j.latest) { $("toolUpdNote").textContent = L("לא ניתן לבדוק כרגע (אין אינטרנט?)", "Can't check right now (offline?)"); return; }
+  if (!j.available) { $("toolUpdNote").textContent = L(`הכלי עדכני (${j.current})`, `Up to date (${j.current})`); return; }
+  $("toolUpdNote").innerHTML = L(`גרסה ${esc(j.latest)} זמינה. `, `Version ${esc(j.latest)} is available. `);
+  const b = document.createElement("button"); b.className = "btn primary small"; b.textContent = L("עדכן עכשיו", "Update now");
+  b.onclick = () => { if (confirm(L("העדכון עוצר את הגשר והסוכן לדקה-שתיים, בודק את עצמו, וחוזר לגרסה הקודמת אם משהו נכשל. להמשיך?",
+    "The update stops the bridge and the agent for a minute or two, tests itself, and rolls back if anything fails. Continue?")))
+    act({ do: "tool_update_apply" }, L("העדכון התחיל בחלון נפרד", "Update started in a separate window")); };
+  $("toolUpdNote").appendChild(b);
+};
+
 function timeline(d) {
   // 96 slots of 15 minutes, coloured from the connection log
   const el = $("timeline"), now = Date.now(), slot = 15 * 60000, n = 96, start = now - n * slot;
@@ -131,7 +145,7 @@ function drawCharts(d) {
 
 function render(d) {
   last = d;
-  $("ver").textContent = d.version;
+  $("ver").textContent = d.version; $("toolVer").textContent = d.tool_version || "—";
   $("updated").textContent = L("עודכן ", "Updated ") + new Date().toLocaleTimeString(LOCALE(), { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   const b = d.bridge || {}, p = d.policy || {}, a = d.agent || {};
   // hero

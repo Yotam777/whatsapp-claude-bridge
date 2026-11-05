@@ -121,6 +121,7 @@ def data():
     spent = rows(p["agent"], "SELECT coalesce(sum(cost),0) s FROM claude_runs WHERE substr(at,1,10) = ?", (today,))
     return {
         "version": VERSION,
+        "tool_version": (open(os.path.join(ROOT, "VERSION")).read().strip() if os.path.exists(os.path.join(ROOT, "VERSION")) else "?"),
         "now": dt.datetime.now().isoformat(timespec="seconds"),
         "bridge": b,
         "policy": b.get("policy") if "policy" in b else local_policy(),
@@ -189,6 +190,22 @@ def action(a):
         return {"ok": True}
     if kind == "restart":
         kill({"bridge": "whatsapp-bridge.exe", "agent": "agent.py"}[a["what"]])
+        return {"ok": True}
+    if kind == "tool_update_check":
+        import time
+        cache = os.path.join(ROOT, "agent", "update_check.json")
+        if not a.get("force") and os.path.exists(cache) and time.time() - os.path.getmtime(cache) < 6 * 3600:
+            return json.load(open(cache, encoding="utf-8"))
+        import shutil
+        uv = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe")
+        out = subprocess.run([uv, "run", "-q", "--no-project", "python", "-X", "utf8", os.path.join(ROOT, "tools", "update.py"), "--check"],
+                             capture_output=True, text=True, encoding="utf-8", timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        res = json.loads(out.stdout.strip().splitlines()[-1]) if out.stdout.strip() else {"error": out.stderr[-300:]}
+        json.dump(res, open(cache, "w", encoding="utf-8"), ensure_ascii=False)
+        return res
+    if kind == "tool_update_apply":
+        # visible window so the user can follow the update; it stops and restarts the bridge and the agent
+        subprocess.Popen(["cmd.exe", "/c", "start", "Update", os.path.join(ROOT, "update.cmd")], cwd=ROOT)
         return {"ok": True}
     if kind == "update_check":
         from dash import updater

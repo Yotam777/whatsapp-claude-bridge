@@ -8,7 +8,16 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_API_BASE_URL = "http://127.0.0.1:8765/api"
+TOKEN_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "whatsapp-bridge", "store", "api_token")
+
+
+def _auth():
+    """Bearer token the bridge requires on every API call (created by the bridge on first start)."""
+    try:
+        return {"Authorization": "Bearer " + open(TOKEN_FILE).read().strip()}
+    except OSError:
+        return {}
 
 @dataclass
 class Message:
@@ -622,7 +631,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if 'conn' in locals():
             conn.close()
 
-def send_message(recipient: str, message: str) -> Tuple[bool, str]:
+def send_message(recipient: str, message: str, quoted_message_id: str = "") -> Tuple[bool, str]:
     try:
         # Validate input
         if not recipient:
@@ -633,8 +642,13 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
             "recipient": recipient,
             "message": message,
         }
+        if quoted_message_id:
+            payload["quoted_id"] = quoted_message_id  # reply quoting that message
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_auth())
+        if response.status_code != 200 and response.headers.get("Content-Type", "").startswith("application/json"):
+            result = response.json()  # drafts / pauses come back as non-200 with an explanation
+            return result.get("success", False), result.get("message", response.text)
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -668,7 +682,7 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_auth())
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -708,7 +722,7 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_auth())
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -741,7 +755,7 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_auth())
         
         if response.status_code == 200:
             result = response.json()

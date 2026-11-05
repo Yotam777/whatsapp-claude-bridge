@@ -157,14 +157,19 @@ def get_message_context(
 @mcp.tool()
 def send_message(
     recipient: str,
-    message: str
+    message: str,
+    quoted_message_id: str = ""
 ) -> Dict[str, Any]:
     """Send a WhatsApp message to a person or group. For group chats use the JID.
+
+    Sending to anyone except the owner normally produces a *draft* for the owner to review (bridge
+    draft mode), not a sent message — tell the user the draft is waiting.
 
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         message: The message text to send
+        quoted_message_id: optional ID of a message in the same chat to reply to (shown quoted above the reply)
     
     Returns:
         A dictionary containing success status and a status message
@@ -177,7 +182,7 @@ def send_message(
         }
     
     # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(recipient, message)
+    success, status_message = whatsapp_send_message(recipient, message, quoted_message_id)
     return {
         "success": success,
         "message": status_message
@@ -245,6 +250,47 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+# ---------- enhanced bridge tools ----------
+import extras  # noqa: E402
+
+
+@mcp.tool()
+def get_status() -> Dict[str, Any]:
+    """WhatsApp connection status: connected, connected_since, disconnects, sent_today, send policy (draft/auto, paused), pending drafts."""
+    return extras.status()
+
+
+@mcp.tool()
+def search_all(query: str, limit: int = 30) -> List[Dict[str, Any]]:
+    """Search text in all messages AND in transcripts of voice notes, newest first."""
+    return extras.search(query, limit)
+
+
+@mcp.tool()
+def list_transcripts(query: Optional[str] = None, chat_jid: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    """Transcripts of voice notes (made locally by the agent). Optional text filter and chat filter."""
+    return extras.transcripts(query, chat_jid, limit)
+
+
+@mcp.tool()
+def list_polls(chat_jid: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
+    """Polls with their options, each voter's choice and a tally per option."""
+    return extras.polls(chat_jid, limit)
+
+
+@mcp.tool()
+def list_drafts(status: str = "pending", limit: int = 20) -> List[Dict[str, Any]]:
+    """Drafts waiting for the owner (sends to other people become drafts in draft mode). status: pending | sent | discarded."""
+    return extras.drafts(status, limit)
+
+
+@mcp.tool()
+def react_to_message(chat_jid: str, message_id: str, emoji: str, sender: str = "") -> Dict[str, Any]:
+    """React to a message with an emoji (empty emoji removes the reaction). sender: author of that message (empty = me)."""
+    return extras.react(chat_jid, message_id, emoji, sender)
+
+
 
 if __name__ == "__main__":
     # Initialize and run the server

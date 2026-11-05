@@ -26,7 +26,7 @@ def _root():
     if os.environ.get("WA_TOOL_ROOT"):
         return os.environ["WA_TOOL_ROOT"]
     try:
-        return json.load(open(SETTINGS, encoding="utf-8"))["tool_root"]
+        return json.load(open(SETTINGS, encoding="utf-8-sig"))["tool_root"]  # PowerShell 5 writes a BOM
     except Exception:
         return os.path.dirname(PKG)
 

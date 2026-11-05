@@ -17,7 +17,7 @@ from dash.server import ROOT, VERSION
 def _settings():
     p = os.path.join(os.environ.get("LOCALAPPDATA", ""), "WhatsAppDash", "settings.json")
     try:
-        return json.load(open(p, encoding="utf-8"))
+        return json.load(open(p, encoding="utf-8-sig"))
     except Exception:
         return {}
 

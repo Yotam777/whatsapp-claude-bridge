@@ -42,7 +42,8 @@ OWNER = CFG.get("owner_name") or ("הבעלים" if LANG == "he" else "the owner
 # every text the agent itself writes to WhatsApp / Windows, in Hebrew and English
 T = {
     "he": {
-        "budget_stop": "💸 הגעתי לתקרת העלות היומית (${spent:.2f} מתוך ${budget:.0f}). כדי להמשיך בכל זאת — התחל את ההודעה ב-!",
+        "budget_stop": "💸 הגעתי לתקרת העלות היומית (${spent:.2f} מתוך ${budget:.0f}). כדי להמשיך בכל זאת — התחל את ההודעה ב-! (או ב-!!! לשעה שלמה בלי הגבלה)",
+        "override_hour": "🔓 בלי תקרת עלות עד {until}.",
         "budget_warn": "⚠️ נוצלו ${spent:.2f} מתוך תקרה יומית של ${budget:.0f}.",
         "working": "⏳ עובד על זה, זה לוקח קצת יותר זמן…",
         "failed": "לא הצלחתי לעבד את ההודעה, נסה שוב.",
@@ -60,7 +61,8 @@ T = {
                   "אם צריך להחזיר קובץ (אקסל, תמונה, PDF) — שמור אותו בתיקייה outbox והוא יישלח אחרי התשובה.",
     },
     "en": {
-        "budget_stop": "💸 Daily cost cap reached (${spent:.2f} of ${budget:.0f}). Start the message with ! to continue anyway.",
+        "budget_stop": "💸 Daily cost cap reached (${spent:.2f} of ${budget:.0f}). Start the message with ! to continue anyway (or !!! for a whole hour).",
+        "override_hour": "🔓 No cost cap until {until}.",
         "budget_warn": "⚠️ ${spent:.2f} used of the ${budget:.0f} daily cap.",
         "working": "⏳ Working on it, this takes a bit longer…",
         "failed": "I couldn't process that message, please try again.",
@@ -173,9 +175,23 @@ def send(recipient, text, media=None, quoted=None):
     return ok
 
 
+def italic(text):
+    """WhatsApp italics line by line (a marker can't span lines), so the tool's messages look different from the owner's.
+    Lines with underscores or code are left as they are."""
+    out = []
+    for line in text.split("\n"):
+        body = line.strip()
+        if not body or "_" in body or "```" in body:
+            out.append(line)
+        else:
+            out.append(line[:len(line) - len(line.lstrip())] + "_" + body + "_")
+    return "\n".join(out)
+
+
 def reply(text, quoted=None):
     kv_set("last_tool_msg", json.dumps({"ts": dt.datetime.now().isoformat(timespec="seconds"), "text": text.strip()[:300]}, ensure_ascii=False))
-    send(CFG["claude_group"], CFG["reply_prefix"] + text.strip(), quoted=quoted)
+    body = italic(text.strip()) if CFG.get("reply_italic", True) else text.strip()
+    send(CFG["claude_group"], CFG["reply_prefix"] + body, quoted=quoted)
 
 
 def react(msg_id, emoji):
@@ -296,6 +312,8 @@ def _run_claude(prompt, model, resume, timeout):
     cmd = [shutil.which("claude") or "claude", "-p", prompt, "--output-format", "json", "--permission-mode", "auto"]
     if model:
         cmd += ["--model", model]
+    if CFG.get("strict_mcp"):
+        cmd += ["--strict-mcp-config"]  # skip the heavy connector tool lists (Gmail, Shopify...) to cut tokens
     if resume:
         cmd += ["--resume", resume]
     t0 = time.time()
@@ -325,7 +343,7 @@ def claude(prompt, model=None, session=True, timeout=900):
     """Run Claude Code headless in HOME. The conversation session is resumed until it is rotated (daily, with hand-off)."""
     sid = kv_get("session_id") if session else None
     started = kv_get("session_started")
-    if sid and started and dt.datetime.now() - dt.datetime.fromisoformat(started) > dt.timedelta(hours=CFG["session_rotate_hours"]):
+    if sid and started and dt.datetime.fromisoformat(started).date() != dt.date.today():  # rotate at midnight
         write_handoff(sid)
         sid = None
     try:
@@ -370,6 +388,16 @@ def send_outbox(since):
             shutil.move(p, os.path.join(done, f"{dt.datetime.now():%Y%m%d_%H%M%S}_{f}"))
 
 
+def pick_model(text):
+    """Cost routing: Haiku for short lookups/updates, Sonnet for anything heavier (config: light_model / claude_model)."""
+    t = text.lstrip("!").strip()
+    heavy_words = ("תמלל", "סכם", "סיכום", "נתח", "ניתוח", "דוח", "דו\"ח", "אקסל", "קובץ", "תקן", "קוד", "סקריפט", "הגדרות",
+                   "שלח ל", "טיוטה", "מייל", "הצעת", "השווה", "תכנן", "למה", "בדוק לעומק", "ערוך", "תוסיף", "תשנה", "תעדכן את הקוד")
+    heavy = len(t) > 140 or T["attached"].split("{")[0] in text or any(w in t for w in heavy_words)
+    light, strong = CFG.get("light_model") or "haiku", CFG.get("claude_model") or "sonnet"
+    return strong if heavy else light
+
+
 def command_worker():
     while True:
         with adb() as db:
@@ -382,7 +410,11 @@ def command_worker():
         try:
             budget = float(CFG.get("daily_budget_usd", 5))
             spent = spent_today()
-            override = text.lstrip().startswith("!")
+            if text.lstrip().startswith("!!!"):  # lift the cap for an hour
+                until = dt.datetime.now() + dt.timedelta(hours=1)
+                kv_set("override_until", until.isoformat(timespec="seconds"))
+                reply(T["override_hour"].format(until=until.strftime("%H:%M")))
+            override = text.lstrip().startswith("!") or (kv_get("override_until") or "") > dt.datetime.now().isoformat(timespec="seconds")
             if spent >= budget and not override:
                 reply(T["budget_stop"].format(spent=spent, budget=budget))
             else:
@@ -390,16 +422,15 @@ def command_worker():
                     kv_set("budget_warned", dt.date.today().isoformat())
                     reply(T["budget_warn"].format(spent=spent, budget=budget))
                 prompt = T["prompt"].format(owner=OWNER, when=when, text=text.lstrip("!").strip())
-                light = len(text) < 60 and T["attached"].split("{")[0] not in text
-                model = (CFG.get("light_model") if light else None) or CFG.get("claude_model") or None
+                model = pick_model(text)
                 started = time.time()
                 progress = threading.Timer(45, lambda: reply(T["working"]))
                 progress.start()
                 try:
-                    answer = claude(prompt, model=model)
+                    answer = claude(prompt, model=model, session=not CFG.get("fresh_sessions"))
                 finally:
                     progress.cancel()
-                reply(answer or T["failed"])
+                reply(answer or T["failed"], quoted=mid if CFG.get("quote_replies", True) else None)
                 send_outbox(started)
                 react(mid, "✅")
         except Exception:

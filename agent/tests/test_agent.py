@@ -80,3 +80,10 @@ def test_plugin_hooks_register(agent, tmp_path):
     mod.load_plugins()
     assert (len(mod._hooks), len(mod._periodic)) == (before[0] + 1, before[1] + 1)
     assert "job" in mod._manual
+
+
+def test_italic_marks_tool_messages(agent):
+    mod, _ = agent
+    assert mod.italic("שלום\n\n  • נקודה ") == "_שלום_\n\n  _• נקודה_"
+    assert mod.italic("https://x.com/a_b") == "https://x.com/a_b"  # underscores: left as is
+    assert mod.italic("```code```") == "```code```"

@@ -65,7 +65,7 @@ When asked, point **WhatsApp bridge folder** at the folder where you ran `setup.
 
 ## Everyday use
 
-- **Chat:** write in your Claude group. Start a message with `!` to bypass the daily budget cap.
+- **Chat:** write in your Claude group. Answers arrive in italics with 🤖, quoting your message, so they're easy to tell apart from yours. Start a message with `!` to bypass the daily budget cap, or `!!!` to lift it for an hour.
 - **Send mode:** dashboard → "Drafts only" / "Auto send for an hour"; pause / resume.
 - **Self-test:** `uv run python -X utf8 tools/selftest.py` (`--quiet` sends nothing).
 - **Personal instructions for Claude:** edit `agent/home/CLAUDE.md` (not committed).

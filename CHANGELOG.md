@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.0.1 — 2026-11-06
+תשובות בכתב נטוי עם ציטוט ההודעה שלך · !!! מבטל את תקרת העלות לשעה · Claude זול יותר (Haiku לשאלות קצרות, בלי טעינת כלים מיותרים) · תקרה יומית ברירת מחדל 20$ / Italic replies quoting your message · !!! lifts the cost cap for an hour · cheaper Claude runs · 20 USD default cap
+
 ## 1.0.0 — 2026-11-06
 First release of the enhanced fork.
 

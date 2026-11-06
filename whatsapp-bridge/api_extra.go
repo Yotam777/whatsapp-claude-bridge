@@ -178,7 +178,11 @@ func registerExtraAPI(client *whatsmeow.Client) {
 		defer cancel()
 		err = client.LeaveGroup(ctx, jid)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"success": err == nil, "error": fmt.Sprint(err)})
+		res := map[string]any{"success": err == nil}
+		if err != nil {
+			res["error"] = err.Error()
+		}
+		json.NewEncoder(w).Encode(res)
 	})
 }
 

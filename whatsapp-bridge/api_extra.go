@@ -3,12 +3,17 @@ package main
 // Extra REST endpoints for the control panel: health/status and the send policy.
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/types"
 )
 
 var bridgeStarted = time.Now()
@@ -104,4 +109,90 @@ func registerExtraAPI(client *whatsmeow.Client) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(loadPolicy())
 	})
+
+	// {"name":"Claude","participants":[],"description":"..."} → {"jid":"...@g.us"}. With no participants the group holds
+	// only this account — the setup wizard uses it to create the owner's private control group.
+	http.HandleFunc("/api/create_group", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Name         string   `json:"name"`
+			Participants []string `json:"participants"`
+			Description  string   `json:"description"`
+		}
+		if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&req) != nil {
+			http.Error(w, "POST json", http.StatusBadRequest)
+			return
+		}
+		name, err := groupName(req.Name)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		jids := make([]types.JID, 0, len(req.Participants))
+		for _, p := range req.Participants {
+			jid := types.NewJID(p, types.DefaultUserServer)
+			if strings.Contains(p, "@") {
+				if jid, err = types.ParseJID(p); err != nil {
+					http.Error(w, "bad participant "+p, http.StatusBadRequest)
+					return
+				}
+			}
+			jids = append(jids, jid)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		w.Header().Set("Content-Type", "application/json")
+		info, err := client.CreateGroup(ctx, whatsmeow.ReqCreateGroup{Name: name, Participants: jids})
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]any{"error": err.Error()})
+			return
+		}
+		res := map[string]any{"jid": info.JID.String(), "name": info.Name}
+		if req.Description != "" {
+			if err := client.SetGroupDescription(ctx, info.JID, req.Description); err != nil {
+				res["description_error"] = err.Error()
+			}
+		}
+		json.NewEncoder(w).Encode(res)
+	})
+
+	// {"jid":"...@g.us"} — leave a group (refuses the control group)
+	http.HandleFunc("/api/leave_group", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			JID string `json:"jid"`
+		}
+		if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&req) != nil {
+			http.Error(w, "POST json", http.StatusBadRequest)
+			return
+		}
+		jid, err := types.ParseJID(req.JID)
+		if err != nil || jid.Server != types.GroupServer {
+			http.Error(w, "bad group jid", http.StatusBadRequest)
+			return
+		}
+		if req.JID == loadPolicy().ControlGroup {
+			http.Error(w, "refusing to leave the control group", http.StatusForbidden)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		err = client.LeaveGroup(ctx, jid)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"success": err == nil, "error": fmt.Sprint(err)})
+	})
+}
+
+// groupName trims the name and enforces WhatsApp's 25-character limit (longer names fail with 406).
+func groupName(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		s = "Claude"
+	}
+	if !utf8.ValidString(s) {
+		return "", fmt.Errorf("group name is not valid UTF-8")
+	}
+	if utf8.RuneCountInString(s) > 25 {
+		return "", fmt.Errorf("group name longer than 25 characters")
+	}
+	return s, nil
 }

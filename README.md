@@ -48,7 +48,7 @@ cd whatsapp-claude-bridge
 setup.cmd
 ```
 
-The wizard: links your WhatsApp (QR) → finds your control group (create a group with only you and write `claude-setup`) →
+The wizard: links your WhatsApp (QR) → creates your private "Claude" control group automatically (or picks up a group you made yourself where you wrote `claude-setup`) →
 writes the config → installs components → registers the `whatsapp` MCP server → starts everything at logon →
 installs the dashboard → runs the self-test.
 

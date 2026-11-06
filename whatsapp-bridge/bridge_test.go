@@ -80,3 +80,18 @@ func TestEnvInt(t *testing.T) {
 		t.Fatal("envInt")
 	}
 }
+
+func TestGroupName(t *testing.T) {
+	if n, err := groupName("  "); err != nil || n != "Claude" {
+		t.Fatalf("empty name: %q %v", n, err)
+	}
+	if n, err := groupName("Claude test (אפשר למחוק)"); err != nil || n != "Claude test (אפשר למחוק)" {
+		t.Fatalf("hebrew name: %q %v", n, err)
+	}
+	if _, err := groupName("Claude \xf0\xe9"); err == nil {
+		t.Fatal("invalid UTF-8 should be rejected")
+	}
+	if _, err := groupName("abcdefghijklmnopqrstuvwxyz"); err == nil {
+		t.Fatal("26 chars should be rejected")
+	}
+}

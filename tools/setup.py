@@ -92,11 +92,20 @@ def main():
     step(3, "קבוצת הבקרה (השיחה שלך עם Claude)", "Control group (your chat with Claude)")
     cfg_path = os.path.join(AGENT, "config.json")
     cfg = json.load(open(cfg_path, encoding="utf-8")) if os.path.exists(cfg_path) else json.load(open(os.path.join(AGENT, "config.example.json"), encoding="utf-8"))
+    created = False
     if not str(cfg.get("claude_group", "")).endswith("@g.us"):
-        say("צור בווצאפ קבוצה בשם Claude שבה אתה לבד (הוסף מישהו והוצא אותו), וכתוב בה:  claude-setup",
-            "In WhatsApp create a group named Claude with only you in it (add someone and remove them), and write in it:  claude-setup")
         group = None
-        for _ in range(300):
+        if ask("ליצור עכשיו קבוצת Claude שבה רק אתה? כ/ל", "Create a Claude group with only you in it now? y/n", "כ" if lang == "he" else "y").lower() in ("כ", "y", "yes", "כן"):
+            try:
+                group = api("/create_group", {"name": "Claude", "participants": [],
+                                              "description": "השיחה הפרטית שלך עם Claude" if lang == "he" else "Your private chat with Claude"}).get("jid")
+                created = bool(group)
+            except Exception as e:
+                say(f"⚠ יצירת הקבוצה נכשלה ({e}) — ניצור אותה ידנית.", f"⚠ Could not create the group ({e}) — let's do it by hand.")
+        if not group:
+            say("צור בווצאפ קבוצה בשם Claude שבה אתה לבד (הוסף מישהו והוצא אותו), וכתוב בה:  claude-setup",
+                "In WhatsApp create a group named Claude with only you in it (add someone and remove them), and write in it:  claude-setup")
+        for _ in range(0 if group else 300):
             time.sleep(2)
             r = sqlite3.connect(f"file:{os.path.join(STORE, 'messages.db')}?mode=ro", uri=True).execute(
                 "SELECT chat_jid FROM messages WHERE is_from_me = 1 AND trim(lower(content)) = 'claude-setup' AND chat_jid LIKE '%@g.us' "
@@ -120,6 +129,9 @@ def main():
     cfg["store_dir"] = "whatsapp-bridge/store"
     json.dump(cfg, open(cfg_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     api("/policy", {"owner": [me_pn] + ([me_lid] if me_lid else []), "control_group": cfg["claude_group"], "mode": "draft"})
+    if created:  # the control group is the owner's own chat, so this goes out even in drafts-only mode
+        api("/send", {"recipient": cfg["claude_group"], "message": "👋 זו השיחה שלך עם Claude. כתוב כאן כל בקשה." if lang == "he"
+                      else "👋 This is your chat with Claude. Write any request here."})
     home = os.path.join(AGENT, "home")
     if not os.path.exists(os.path.join(home, "CLAUDE.md")):
         shutil.copytree(os.path.join(AGENT, "home.example"), home, dirs_exist_ok=True)

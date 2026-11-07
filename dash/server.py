@@ -231,7 +231,7 @@ def action(a):
         text = (a.get("text") or "").strip()
         if not text:
             return {"error": "empty"}
-        res = bridge("/send", {"recipient": cfg()["claude_group"], "message": text})
+        res = bridge("/send", {"recipient": cfg()["claude_group"], "message": text}, timeout=60)  # the bridge paces sends: 8 s was too short, the app showed an error and the owner re-sent
         return res if "error" in res else {"ok": True}
     if kind == "group_info":  # the control group's live name (dashboard card)
         g = cfg().get("claude_group", "")

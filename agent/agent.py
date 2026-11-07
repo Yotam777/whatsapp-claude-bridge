@@ -122,8 +122,19 @@ def adb():
     """)
     global _runs_migrated
     if not _runs_migrated:  # older databases: record which model each run used (dashboard cost view)
-        if "model" not in [r[1] for r in db.execute("PRAGMA table_info(claude_runs)")]:
+        cols = [r[1] for r in db.execute("PRAGMA table_info(claude_runs)")]
+        if "model" not in cols:
             db.execute("ALTER TABLE claude_runs ADD COLUMN model TEXT")
+        if "cum" not in cols:  # Claude reports the session's cumulative cost; cost = this run only, cum = what Claude reported
+            db.execute("ALTER TABLE claude_runs ADD COLUMN cum REAL")
+        prev = {}  # rows written before this fix (cum NULL): turn the cumulative figure into this run's share
+        for rowid, sess, cost, cum in db.execute("SELECT rowid, session, cost, cum FROM claude_runs ORDER BY at").fetchall():
+            if cum is None:
+                p = prev.get(sess)
+                db.execute("UPDATE claude_runs SET cost = ?, cum = ? WHERE rowid = ?", (cost - p if p is not None and cost >= p else cost, cost, rowid))
+                cum = cost
+            prev[sess] = cum
+        db.commit()
         _runs_migrated = True
     return db
 
@@ -434,9 +445,14 @@ def _run_claude(prompt, model, resume, timeout, on_stage=None):
         raise RuntimeError("claude returned no result")
     usage = res.get("usage", {})
     with adb() as db:
-        db.execute("INSERT INTO claude_runs (at, session, cost, input_tokens, output_tokens, seconds, ok, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                   (dt.datetime.now().isoformat(), res.get("session_id"), res.get("total_cost_usd", 0), usage.get("input_tokens", 0),
-                    usage.get("output_tokens", 0), time.time() - t0, 0 if res.get("is_error") else 1, model or CFG.get("claude_model") or ""))
+        # total_cost_usd is cumulative for a resumed session: store only this run's share (budget + dashboard sum `cost`)
+        cum = float(res.get("total_cost_usd") or 0)
+        prev = db.execute("SELECT cum FROM claude_runs WHERE session = ? AND cum IS NOT NULL ORDER BY at DESC LIMIT 1",
+                          (res.get("session_id"),)).fetchone() if resume else None
+        cost = cum - prev[0] if prev and prev[0] is not None and cum >= prev[0] else cum
+        db.execute("INSERT INTO claude_runs (at, session, cost, input_tokens, output_tokens, seconds, ok, model, cum) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   (dt.datetime.now().isoformat(), res.get("session_id"), cost, usage.get("input_tokens", 0),
+                    usage.get("output_tokens", 0), time.time() - t0, 0 if res.get("is_error") else 1, model or CFG.get("claude_model") or "", cum))
     return res
 
 

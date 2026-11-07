@@ -24,3 +24,4 @@ agent/update_check.json
 agent/update.log
 agent/actions.log
 agent/model_override.json
+agent/assets/

@@ -16,7 +16,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: msys2/setup-msys2@v2
         with:
@@ -24,12 +24,12 @@ jobs:
           install: mingw-w64-ucrt-x86_64-gcc
           path-type: inherit
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: whatsapp-bridge/go.mod
           cache-dependency-path: whatsapp-bridge/go.sum
 
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10
 
       - name: Bridge — vet, test, build
         working-directory: whatsapp-bridge
@@ -53,7 +53,7 @@ jobs:
       - name: Dashboard app
         run: uv run --no-project python tools/release_dash.py "$(cat dash/VERSION)" "$(git log -1 --pretty=%s)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: binaries
           path: |
@@ -66,5 +66,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file CHANGELOG.md \
+          # release notes = only this version's section of the changelog
+          V="${GITHUB_REF_NAME#v}"
+          awk -v v="$V" '/^## /{p = index($0, "## " v " ") == 1} p' CHANGELOG.md > release-notes.md
+          [ -s release-notes.md ] || cp CHANGELOG.md release-notes.md
+          gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file release-notes.md \
             whatsapp-bridge/whatsapp-bridge.exe releases/*.exe releases/latest.json

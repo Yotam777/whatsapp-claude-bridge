@@ -62,7 +62,7 @@ $("pauseBtn").onclick = () => act({ do: "pause", hours: 6 }, L("השליחה ל�
 $("resumeBtn").onclick = () => act({ do: "resume" }, L("השליחה חודשה", "Sending resumed"));
 $("backupBtn").onclick = () => act({ do: "backup" }, L("הגיבוי התחיל ברקע", "Backup started"));
 document.querySelectorAll("[data-restart]").forEach(b => b.onclick = () => {
-  const what = b.dataset.restart === "bridge" ? L("הגשר", "the bridge") : L("הסוכן", "the agent");
+  const what = { bridge: L("הגשר", "the bridge"), agent: L("הסוכן", "the agent"), all: L("את הגשר ואת הסוכן", "the bridge and the agent") }[b.dataset.restart];
   if (confirm(L(`להפעיל מחדש את ${what}? זה לוקח כ-20 שניות.`, `Restart ${what}? It takes about 20 seconds.`))) act({ do: "restart", what: b.dataset.restart }, L(`${what} מופעל מחדש…`, `Restarting ${what}…`));
 });
 $("updBtn").onclick = async () => {
@@ -103,7 +103,28 @@ $("releaseBtn").onclick = () => {
 };
 let pubShown = false;
 
-// ---- continue the conversation from here (a normal message from you in the WhatsApp group) ----
+// ---- display settings (saved on this computer) ----
+const VIEW_KEY = "wa-dash-view", STEPS = [0.85, 0.92, 1, 1.1, 1.2, 1.32, 1.45];
+let view = { chat: 2, ui: 2, font: "", bg: "" };
+try { view = Object.assign(view, JSON.parse(localStorage.getItem(VIEW_KEY) || "{}")); } catch (e) {}
+function applyView() {
+  const r = document.documentElement.style;
+  r.setProperty("--chat-scale", STEPS[view.chat]); r.setProperty("--ui-scale", STEPS[view.ui]);
+  if (view.font) r.setProperty("--ui-font", view.font); else r.removeProperty("--ui-font");
+  $("chat").dataset.bg = view.bg || "";
+  $("chatFsOut").textContent = Math.round(100 * STEPS[view.chat]) + "%"; $("uiFsOut").textContent = Math.round(100 * STEPS[view.ui]) + "%";
+  $("fontSel").value = view.font || ""; $("bgSel").value = view.bg || "";
+  try { localStorage.setItem(VIEW_KEY, JSON.stringify(view)); } catch (e) {}
+}
+document.querySelectorAll("[data-step]").forEach(b => b.onclick = () => {
+  const k = b.dataset.step; view[k] = Math.max(0, Math.min(STEPS.length - 1, view[k] + Number(b.dataset.d))); applyView();
+});
+$("fontSel").onchange = e => { view.font = e.target.value; applyView(); };
+$("bgSel").onchange = e => { view.bg = e.target.value; applyView(); };
+$("viewReset").onclick = () => { view = { chat: 2, ui: 2, font: "", bg: "" }; applyView(); };
+applyView();
+
+// ---- continue the conversation from here// ---- continue the conversation from here (a normal message from you in the WhatsApp group) ----
 const say = $("say");
 const grow = () => { say.style.height = "auto"; say.style.height = Math.min(140, say.scrollHeight) + "px"; };
 say.addEventListener("input", grow);

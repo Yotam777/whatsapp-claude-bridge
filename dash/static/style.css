@@ -22,8 +22,8 @@
 }
 
 * { box-sizing: border-box; }
-html { font-size: 15px; }
-body { margin: 0; background: var(--bg); color: var(--text); font-family: "Heebo", "Segoe UI", Arial, sans-serif; line-height: 1.5; }
+html { font-size: calc(15px * var(--ui-scale, 1)); }
+body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--ui-font, "Heebo"), "Segoe UI", Arial, sans-serif; line-height: 1.5; }
 :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; border-radius: 8px; }
 .skip { position: absolute; inset-inline-start: -999px; } .skip:focus { inset-inline-start: 12px; top: 12px; background: var(--surface); padding: 8px 12px; z-index: 10; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
@@ -110,7 +110,7 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0 8px; }
 .meter.warn span { background: var(--warn); } .meter.bad span { background: var(--bad); }
 
 .chat { flex: 1; min-height: 80px; display: flex; flex-direction: column; gap: 8px; overflow: auto; padding: 8px 8px; background: var(--surface-2); border-radius: 12px; }
-.bubble { max-width: 70%; padding: 8px 12px 6px; border-radius: 12px; box-shadow: var(--shadow); white-space: pre-wrap; word-break: break-word; font-size: 1.13rem; line-height: 1.5; border: 1px solid var(--line); }
+.bubble { max-width: 70%; padding: 8px 12px 6px; border-radius: 12px; box-shadow: var(--shadow); white-space: pre-wrap; word-break: break-word; font-size: calc(1.13rem * var(--chat-scale, 1)); line-height: 1.5; border: 1px solid var(--line); }
 .bubble.me { align-self: flex-end; background: var(--bubble-me); border-start-end-radius: 4px; }
 .bubble.tool { align-self: flex-start; background: var(--bubble-tool); border-start-start-radius: 4px; }
 .bubble .meta { display: block; color: var(--muted); font-size: .78rem; margin-top: 3px; text-align: end; }
@@ -118,7 +118,7 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0 8px; }
 :root[data-theme="dark"] .bubble .who { color: var(--ok); }
 .chip { background: var(--warn-bg); color: var(--warn); font-size: .78rem; border-radius: 20px; padding: 2px 10px; font-weight: 600; }
 .composer { flex: none; display: flex; gap: 8px; align-items: flex-end; margin-top: 10px; }
-.composer textarea { flex: 1; resize: none; max-height: 140px; font: inherit; font-size: 1.13rem; padding: 9px 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface); color: var(--text); line-height: 1.4; }
+.composer textarea { flex: 1; resize: none; max-height: 140px; font: inherit; font-size: calc(1.13rem * var(--chat-scale, 1)); padding: 9px 12px; border-radius: 12px; border: 1px solid var(--line); background: var(--surface); color: var(--text); line-height: 1.4; }
 .composer textarea:focus-visible { outline: 2px solid var(--brand); outline-offset: 0; }
 .composer .btn { min-height: 40px; }
 
@@ -217,3 +217,18 @@ details.item > summary::-webkit-details-marker { display: none; }
 .msg-row { display: grid; grid-template-columns: 42px auto 1fr; gap: 8px; font-size: .86rem; padding: 4px 0; border-top: 1px dashed var(--line); align-items: baseline; }
 .msg-row span:last-child { white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg-row.solo { grid-template-columns: 42px 1fr; }
+
+/* display card */
+.view-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 0; border-top: 1px solid var(--line); font-size: .86rem; }
+.view-row:first-of-type { border-top: 0; }
+.stepper { display: inline-flex; align-items: center; gap: 4px; }
+.stepper output { min-width: 44px; text-align: center; font-variant-numeric: tabular-nums; color: var(--muted); }
+.view-row select { max-width: 150px; }
+.btn.wide { width: 100%; margin-top: 8px; justify-content: center; }
+.btn.danger-soft { border-color: var(--bad); color: var(--bad); }
+.btn.ghost { background: transparent; border-color: transparent; color: var(--muted); }
+.chat[data-bg="wa"] { background: #efe7dd; }
+.chat[data-bg="white"] { background: #ffffff; }
+.chat[data-bg="mint"] { background: #e8f5ee; }
+.chat[data-bg="navy"] { background: #032331; }
+.chat[data-bg="dots"] { background: var(--surface-2) radial-gradient(var(--line) 1px, transparent 1px) 0 0 / 14px 14px; }

@@ -105,6 +105,7 @@
           <button class="btn small" data-restart="agent" data-en="↻ Agent">↻ סוכן</button>
           <button class="btn small" id="backupBtn" data-en="💾 Backup">💾 גיבוי</button>
         </div>
+        <button class="btn small wide danger-soft" data-restart="all" title="מפעיל מחדש את הגשר ואת הסוכן (כ-30 שניות, ווצאפ מתנתק לרגע)" data-en="↻ Restart everything (bridge + agent)">↻ הפעל הכול מחדש (גשר + סוכן)</button>
         <details class="more">
           <summary data-en="Updates & release">עדכונים ופרסום</summary>
           <p class="note tight"><span data-en="Tool version:">גרסת הכלי:</span> <strong id="toolVer">—</strong></p>
@@ -119,6 +120,21 @@
               <button class="btn small primary" id="releaseBtn">🚀 שחרר</button></div>
           </div>
         </details>
+      </section>
+      <section class="card compact" aria-labelledby="h-view">
+        <div class="card-head"><h2 id="h-view" data-en="Display">תצוגה</h2><button class="btn small ghost" id="viewReset" title="חזרה לברירת המחדל" data-en="Reset">איפוס</button></div>
+        <div class="view-row"><span data-en="Chat text">כתב השיחה</span>
+          <span class="stepper"><button class="btn small" data-step="chat" data-d="-1" aria-label="הקטן כתב שיחה">A−</button><output id="chatFsOut">100%</output><button class="btn small" data-step="chat" data-d="1" aria-label="הגדל כתב שיחה">A+</button></span></div>
+        <div class="view-row"><span data-en="Interface size">גודל הממשק</span>
+          <span class="stepper"><button class="btn small" data-step="ui" data-d="-1" aria-label="הקטן ממשק">A−</button><output id="uiFsOut">100%</output><button class="btn small" data-step="ui" data-d="1" aria-label="הגדל ממשק">A+</button></span></div>
+        <div class="view-row"><label for="fontSel" data-en="Font">גופן</label>
+          <select id="fontSel" class="btn small sel">
+            <option value="">Heebo (ברירת מחדל)</option><option value="Arial">Arial</option><option value="'Segoe UI'">Segoe UI</option>
+            <option value="Tahoma">Tahoma</option><option value="Gisha">Gisha</option><option value="David">David</option></select></div>
+        <div class="view-row"><label for="bgSel" data-en="Chat background">רקע השיחה</label>
+          <select id="bgSel" class="btn small sel">
+            <option value="">ברירת מחדל</option><option value="wa">ווצאפ (בז')</option><option value="white">לבן</option>
+            <option value="mint">ירקרק</option><option value="navy">כחול 4M</option><option value="dots">נקודות</option></select></div>
       </section>
     </aside>
   </div>

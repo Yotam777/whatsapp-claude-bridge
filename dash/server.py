@@ -297,6 +297,11 @@ def action(a):
                          cwd=os.path.join(ROOT, "agent"), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return {"ok": True}
     if kind == "restart":
+        if a.get("what") == "all":  # bridge first; the agent (which may host this server) a moment later, after we answer
+            import threading
+            kill("whatsapp-bridge.exe")
+            threading.Timer(1.5, kill, args=("agent.py",)).start()
+            return {"ok": True}
         kill({"bridge": "whatsapp-bridge.exe", "agent": "agent.py"}[a["what"]])
         return {"ok": True}
     if kind == "tool_update_check":

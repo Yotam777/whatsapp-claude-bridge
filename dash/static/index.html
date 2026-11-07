@@ -70,8 +70,8 @@
         <button class="tile" data-detail="cost" style="--accent: var(--brand)"><span class="tile-ico">💲</span><span class="tile-value" id="kCost">—</span><span class="tile-label" data-en="Claude cost today">עלות Claude היום</span>
           <span class="meter" role="progressbar" aria-label="ניצול תקציב יומי" id="kCostMeter"><span id="kCostBar"></span></span></button>
       </div>
-      <div class="chat-top">
-        <div class="steps" id="steps" aria-label="מה הכלי עושה עכשיו" aria-live="polite"></div>
+      <div class="chat-row">
+        <div class="chat" id="chat" tabindex="0" aria-live="polite"></div>
         <section class="model-box" id="modelBox" aria-labelledby="h-model">
           <div class="card-head"><h2 id="h-model" data-en="Claude model">מודל Claude</h2></div>
           <p class="note tight" id="modelNow"></p>
@@ -80,7 +80,6 @@
           <p class="note tight" id="modelRec"></p>
         </section>
       </div>
-      <div class="chat" id="chat" tabindex="0" aria-live="polite"></div>
       <form class="composer" id="composer" autocomplete="off">
         <textarea id="say" rows="1" placeholder="המשך את השיחה עם הכלי… (Enter לשליחה, Shift+Enter לשורה חדשה)" aria-label="הודעה לכלי"></textarea>
         <button class="btn primary" id="sayBtn" type="submit" data-en="Send">שלח</button>
@@ -161,6 +160,15 @@
 </aside>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 <script src="chart.umd.min.js"></script>
+<div class="ctx" id="ctx" role="menu" hidden>
+  <button role="menuitem" data-cmd="copy">📋 העתק</button>
+  <button role="menuitem" data-cmd="cut">✂️ גזור</button>
+  <button role="menuitem" data-cmd="paste">📥 הדבק</button>
+  <button role="menuitem" data-cmd="selectall">🔲 בחר הכול</button>
+  <hr>
+  <button role="menuitem" data-cmd="copymsg">📄 העתק את כל ההודעה</button>
+  <button role="menuitem" data-cmd="quote">↩️ העבר לשורת הכתיבה</button>
+</div>
 <script src="app.js"></script>
 </body>
 </html>

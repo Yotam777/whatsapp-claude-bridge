@@ -344,7 +344,16 @@ function render(d) {
   // chat
   const chat = $("chat"); const atBottom = chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 40;
   const MT = { audio: L("הודעה קולית", "voice note"), image: L("תמונה", "image"), document: L("קובץ", "file"), video: L("וידאו", "video") };
-  chat.innerHTML = (d.conversation || []).map(m => `<div class="bubble ${m.tool ? "tool" : "me"}"><span class="who">${m.tool ? L("🤖 הכלי", "🤖 Tool") : L("אתה", "You")}</span>${wa(m.content || (m.media_type ? "[" + (MT[m.media_type] || m.media_type) + "]" : ""))}<span class="meta">${fmt(m.timestamp)}</span></div>`).join("")
+  const isStatus = m => m.tool && /^_?(⏳|✅ סיימתי)/.test(m.content || "");
+  const conv = d.conversation || [], lastStatus = conv.map(isStatus).lastIndexOf(true);
+  const lv = d.live || null, steps = (lv && lv.steps) || [];
+  const statusHtml = (m, i) => {
+    if (i !== lastStatus || !steps.length) return `<div class="bubble tool status old"><span class="st-head">${wa(m.content)}</span><span class="meta">${fmt(m.timestamp)}</span></div>`;
+    const head = lv.done ? L(`✅ סיימתי · ${Math.floor(lv.secs / 60)}:${String(lv.secs % 60).padStart(2, "0")} · ${esc(lv.model)} · ${steps.length} שלבים`, `✅ done · ${esc(lv.model)}`)
+                         : L(`⏳ עובד · ${esc(lv.model)}`, `⏳ working · ${esc(lv.model)}`);
+    return `<div class="bubble tool status"><span class="st-head">${head}</span><ol>${steps.map((x, j) => `<li class="${j === steps.length - 1 && !lv.done ? "now" : ""}" title="${esc(x.text)}">${hhmm(toDate(x.at))} · ${esc(x.text)}</li>`).join("")}</ol><span class="meta">${fmt(m.timestamp)}</span></div>`;
+  };
+  chat.innerHTML = conv.map((m, i) => isStatus(m) ? statusHtml(m, i) : `<div class="bubble ${m.tool ? "tool" : "me"}"><span class="who">${m.tool ? L("🤖 הכלי", "🤖 Tool") : L("אתה", "You")}</span>${wa(m.content || (m.media_type ? "[" + (MT[m.media_type] || m.media_type) + "]" : ""))}<span class="meta">${fmt(m.timestamp)}</span></div>`).join("")
     || `<p class="empty">${L("עדיין אין שיחה", "No conversation yet")}</p>`;
   drawOutbox(false);
   if (atBottom || !chat._init) { chat.scrollTop = chat.scrollHeight; chat._init = true; }
@@ -373,11 +382,7 @@ function render(d) {
     act({ do: "model", model: sel.value, hours: 0 }, L("המודל הוחלף", "Model changed")); };
   const rc = mi.recommend;
   $("modelRec").textContent = rc && rc.model ? `💡 ${L("המלצה: ", "Suggestion: ")}${(guide[rc.model] || {}).he || rc.model} (${rc.why})` : "";
-  // live steps of the current / last Claude run (stay after the end, the last one marked)
-  const lv = d.live || null, st = (lv && lv.steps) || [];
-  $("modelBox").classList.toggle("working", !!(lv && !lv.done));
-  $("steps").innerHTML = st.length ? `<div class="steps-head">${lv.done ? L(`✅ הריצה האחרונה · ${Math.floor(lv.secs / 60)}:${String(lv.secs % 60).padStart(2, "0")} · ${esc(lv.model)}`, `✅ last run · ${esc(lv.model)}`) : L(`⏳ עובד עכשיו · ${esc(lv.model)}`, `⏳ working · ${esc(lv.model)}`)}</div>` +
-    st.map((x, i) => `<div class="step${i === st.length - 1 ? (lv.done ? " final" : " now") : ""}" title="${esc(x.text)}"><span class="t">${hhmm(toDate(x.at))}</span><span>${esc(x.text)}</span></div>`).join("") : "";
+  $("modelBox").classList.toggle("working", !!(d.live && !d.live.done));
   $("log").textContent = (d.log || []).join("\n");
   renderDrawer(false);
   drawCharts(d);
@@ -407,3 +412,47 @@ async function load() {
   catch (e) { $("connText").textContent = L("אין גישה לנתונים", "No access to data"); $("connSub").textContent = String(e); }
 }
 load(); setInterval(load, 10000);
+
+// ---- right-click menu: copy / cut / paste / select all, copy a whole message, move it to the input box ----
+let ctxTarget = null, ctxBubble = null;
+const ctx = $("ctx");
+function hideCtx() { ctx.hidden = true; }
+document.addEventListener("contextmenu", e => {
+  const inBox = e.target.closest("#say"), bubble = e.target.closest(".bubble");
+  if (!inBox && !bubble) return;
+  e.preventDefault();
+  ctxTarget = inBox ? say : null; ctxBubble = bubble;
+  const sel = String(window.getSelection() || "");
+  ctx.querySelector('[data-cmd="cut"]').hidden = !inBox;
+  ctx.querySelector('[data-cmd="paste"]').hidden = !inBox;
+  ctx.querySelector('[data-cmd="copymsg"]').hidden = ctx.querySelector('[data-cmd="quote"]').hidden = !bubble;
+  ctx.querySelector('[data-cmd="copy"]').disabled = !sel && !(inBox && say.selectionStart !== say.selectionEnd);
+  ctx.hidden = false;
+  const w = ctx.offsetWidth, h = ctx.offsetHeight;
+  ctx.style.left = Math.min(e.clientX, innerWidth - w - 6) + "px"; ctx.style.top = Math.min(e.clientY, innerHeight - h - 6) + "px";
+});
+document.addEventListener("click", e => { if (!e.target.closest("#ctx")) hideCtx(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape") hideCtx(); });
+window.addEventListener("blur", hideCtx);
+const msgText = b => { const c = b.cloneNode(true); c.querySelectorAll(".who,.meta").forEach(x => x.remove()); return c.innerText.trim(); };
+async function copyText(t) { try { await navigator.clipboard.writeText(t); } catch (e) { const ta = document.createElement("textarea"); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); ta.remove(); } }
+ctx.addEventListener("click", async e => {
+  const cmd = e.target.closest("button") && e.target.closest("button").dataset.cmd; if (!cmd) return;
+  hideCtx();
+  const boxSel = () => say.value.slice(say.selectionStart, say.selectionEnd);
+  if (cmd === "copy") { await copyText(ctxTarget ? boxSel() : String(window.getSelection())); toast(L("הועתק", "Copied")); }
+  if (cmd === "cut") { const t = boxSel(); await copyText(t); say.setRangeText("", say.selectionStart, say.selectionEnd, "start"); grow(); }
+  if (cmd === "paste") {
+    say.focus();
+    let t = null;
+    try { t = await navigator.clipboard.readText(); } catch (err) {}
+    if (t != null) { say.setRangeText(t, say.selectionStart, say.selectionEnd, "end"); grow(); }
+    else if (!document.execCommand("paste")) toast(L("להדבקה: Ctrl+V", "To paste: Ctrl+V"));
+  }
+  if (cmd === "selectall") {
+    if (ctxTarget) { say.focus(); say.select(); }
+    else if (ctxBubble) { const r = document.createRange(); r.selectNodeContents(ctxBubble); const s2 = getSelection(); s2.removeAllRanges(); s2.addRange(r); }
+  }
+  if (cmd === "copymsg" && ctxBubble) { await copyText(msgText(ctxBubble)); toast(L("ההודעה הועתקה", "Message copied")); }
+  if (cmd === "quote" && ctxBubble) { const t = msgText(ctxBubble); say.value = (say.value ? say.value + "\n" : "") + t; grow(); say.focus(); }
+});

@@ -253,3 +253,23 @@ details.item > summary::-webkit-details-marker { display: none; }
 @keyframes pulse-frame { 0%, 100% { box-shadow: 0 0 0 0 rgba(31, 170, 89, .55); } 50% { box-shadow: 0 0 0 6px rgba(31, 170, 89, 0); } }
 @media (prefers-reduced-motion: reduce) { .model-box.working { animation: none; } }
 @media (max-width: 1000px) { .chat-top { flex-direction: column; } .model-box { width: auto; } }
+
+/* chat with the model box on its left (top) */
+.chat-row { flex: 1; min-height: 0; display: grid; grid-template-columns: 1fr 290px; gap: 10px; align-items: start; }
+.chat-row .chat { height: 100%; }
+.chat-row .model-box { align-self: start; }
+@media (max-width: 1000px) { .chat-row { grid-template-columns: 1fr; } .chat-row .model-box { order: -1; } }
+/* the status message (thinking / git / running…) stays one compact bubble inside the conversation */
+.bubble.status { font-size: .82rem; padding: 6px 10px 4px; max-width: 60%; }
+.bubble.status .st-head { font-weight: 600; }
+.bubble.status ol { margin: 4px 0 0; padding-inline-start: 18px; color: var(--muted); }
+.bubble.status li { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.bubble.status li.now { color: var(--text); font-weight: 600; }
+.bubble.status.old { opacity: .7; }
+/* right-click menu */
+.ctx { position: fixed; z-index: 60; min-width: 190px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+       box-shadow: 0 8px 24px rgba(16, 24, 40, .18); padding: 4px; display: grid; }
+.ctx button { all: unset; cursor: pointer; padding: 7px 10px; border-radius: 7px; font-size: .88rem; }
+.ctx button:hover, .ctx button:focus-visible { background: var(--surface-2); }
+.ctx hr { border: 0; border-top: 1px solid var(--line); margin: 4px 2px; }
+.ctx[hidden] { display: none; }

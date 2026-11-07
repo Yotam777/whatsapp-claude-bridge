@@ -131,7 +131,7 @@ def data():
         "received": [dict(r, sender=label(r["sender"]), chat=label(r["chat_jid"])) for r in
                      rows(p["msg"], "SELECT chat_jid, sender, timestamp, content, media_type FROM messages WHERE is_from_me = 0 "
                                     "AND substr(timestamp,1,10) = ? ORDER BY timestamp DESC LIMIT 60", (today,))],
-        "runs_today": rows(p["agent"], "SELECT at, cost, seconds, ok FROM claude_runs WHERE substr(at,1,10) = ? ORDER BY at DESC LIMIT 40", (today,)),
+        "runs_today": rows(p["agent"], "SELECT * FROM claude_runs WHERE substr(at,1,10) = ? ORDER BY at DESC LIMIT 60", (today,)),
         "hourly": hourly,
         "received_today": (rows(p["msg"], "SELECT count(*) n FROM messages WHERE is_from_me = 0 AND substr(timestamp,1,10) = ?", (today,)) or [{"n": 0}])[0]["n"],
         "agent": {"heartbeat": kv("heartbeat"), "session_started": kv("session_started"), "backup_done": kv("backup_done"),
@@ -143,7 +143,9 @@ def data():
         "last_owner": jl("last_owner_msg"), "last_tool": jl("last_tool_msg"),
         "drafts": rows(p["msg"], "SELECT id, name, recipient, message, created, status FROM drafts ORDER BY id DESC LIMIT 40"),
         "sent": [dict(r, recipient=label(r["recipient"])) for r in
-                 rows(p["msg"], "SELECT recipient, ok, detail, timestamp FROM send_log ORDER BY id DESC LIMIT 40")],
+                 rows(p["msg"], "SELECT s.recipient, s.ok, s.detail, s.timestamp, s.recipient = ? AS own, "
+                      "(SELECT substr(m.content, 1, 400) FROM messages m WHERE m.id = s.message_id LIMIT 1) AS text "
+                      "FROM send_log s ORDER BY s.id DESC LIMIT 60", (c.get("claude_group", ""),))],
         "transcripts": [dict(r, sender=label(r["sender"]), chat=label(r["chat_jid"])) for r in
                         rows(p["agent"], "SELECT chat_jid, sender, ts, text FROM transcripts ORDER BY ts DESC LIMIT 40")],
         "transcribed_today": (rows(p["agent"], "SELECT count(*) n FROM transcripts WHERE substr(ts,1,10) = ?", (today,)) or [{"n": 0}])[0]["n"],

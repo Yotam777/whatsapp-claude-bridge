@@ -208,3 +208,4 @@ details.more summary { cursor: pointer; font-size: .82rem; font-weight: 600; col
 .item.pending { background: color-mix(in srgb, var(--warn-bg) 45%, var(--surface)); }
 .item-body { border-inline-start: 3px solid var(--line); }
 .drawer { width: min(560px, 100vw); }
+.meter.hot span { background: var(--bad); }

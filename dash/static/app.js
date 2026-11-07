@@ -129,7 +129,7 @@ $("todayBtn").onclick = () => setToday(!todayOpen);
 setToday(todayOpen);
 
 // ---- detail drawer ----
-let drawerKind = null;
+let drawerKind = null, sentAll = false;
 const DRAWERS = () => ({
   drafts: L("📝 טיוטות", "📝 Drafts"), sent: L("📤 נשלחו", "📤 Sent"), received: L("📥 התקבלו", "📥 Received"),
   tr: L("🎙️ תמלולים", "🎙️ Transcripts"), cost: L("💲 עלות", "💲 Cost"),
@@ -166,9 +166,13 @@ function drawerContent(kind, d) {
       + (rest.length ? `<h3 class="muted" style="font-size:.82rem;margin:8px 0 0">${L("היסטוריה", "History")}</h3>` + rest.map(draftCard).join("") : "");
   }
   if (kind === "sent") {
-    const s = d.sent || [];
-    return s.length ? s.map(r => `<article class="item ${r.ok ? "ok-i" : "bad-i"}"><div class="item-head"><strong>${esc(r.recipient)}</strong><span class="muted" style="font-size:.78rem">${fmt(r.timestamp)}</span></div>
-      <span class="${r.ok ? "ok" : "bad"}">${r.ok ? "✔ " + L("נשלחה", "sent") : "✖ " + esc(String(r.detail).slice(0, 160))}</span></article>`).join("") : empty(L("אין שליחות", "Nothing sent"));
+    const all = d.sent || [], others = all.filter(r => !r.own), s = sentAll ? all : others;
+    const chips = `<div class="sum-row"><button class="btn small${sentAll ? "" : " primary"}" data-sent="0">${L("לאנשים אחרים", "To others")} · ${others.length}</button>
+      <button class="btn small${sentAll ? " primary" : ""}" data-sent="1">${L("הכול (כולל תשובות בקבוצה)", "All (incl. group replies)")} · ${all.length}</button></div>`;
+    return chips + (s.length ? s.map(r => `<article class="item ${r.ok ? "ok-i" : "bad-i"}"><div class="item-head"><span class="avatar">${esc(String(r.recipient || "?").trim().charAt(0))}</span><div class="who-col"><strong>${esc(r.recipient)}</strong><span class="muted" style="font-size:.78rem">${fmt(r.timestamp)} · ${ago(r.timestamp)}</span></div>
+      <span class="pill ${r.ok ? "sent" : "failed"}">${r.ok ? L("נשלחה", "sent") : L("נכשלה", "failed")}</span></div>
+      ${r.text ? `<div class="item-body">${esc(r.text)}</div>` : ""}${r.ok ? "" : `<span class="bad" style="font-size:.8rem">${esc(String(r.detail).slice(0, 160))}</span>`}</article>`).join("")
+      : empty(sentAll ? L("אין שליחות", "Nothing sent") : L("לא נשלחה אף הודעה לאנשים אחרים — הכול טיוטות 👍", "Nothing sent to others — drafts only 👍")));
   }
   if (kind === "received") {
     const m = d.received || [], MT = { audio: L("הודעה קולית", "voice note"), image: L("תמונה", "image"), document: L("קובץ", "file"), video: L("וידאו", "video") };
@@ -182,9 +186,13 @@ function drawerContent(kind, d) {
   }
   if (kind === "cost") {
     const a = d.agent || {}, c = d.costs || [], runs = d.runs_today || [], max = Math.max(0.01, ...c.map(x => x.cost));
+    const byModel = {}; runs.forEach(r => { const m = r.model || "?"; byModel[m] = byModel[m] || { n: 0, cost: 0 }; byModel[m].n++; byModel[m].cost += r.cost || 0; });
+    const mmax = Math.max(0.01, ...Object.values(byModel).map(x => x.cost)), pct = Math.min(100, 100 * (a.spent_today || 0) / (a.budget || 1));
     return `<div class="sum-row"><span class="stat">${L("היום", "Today")}: $${(a.spent_today ?? 0).toFixed(2)}</span><span class="stat">${L("תקרה", "Cap")}: $${a.budget}</span><span class="stat">${L("ריצות היום", "Runs today")}: ${runs.length}</span></div>
+      <div class="item"><div class="item-head"><strong>${L("ניצול התקרה היומית", "Daily cap used")}</strong><span class="muted">${Math.round(pct)}%</span></div><span class="meter${pct > 80 ? " hot" : ""}"><span style="width:${pct}%"></span></span></div>
+      ${Object.keys(byModel).length ? `<div class="item"><div class="item-head"><strong>${L("היום לפי מודל", "Today by model")}</strong></div>${Object.entries(byModel).sort((x, y) => y[1].cost - x[1].cost).map(([m, v]) => `<div class="bar-row" style="grid-template-columns:90px 1fr 120px"><span>${m === "?" ? L("לא נרשם", "not recorded") : esc(m)}</span><span class="meter"><span style="width:${100 * v.cost / mmax}%"></span></span><span>$${v.cost.toFixed(2)} · ${v.n} ${L("ריצות", "runs")}</span></div>`).join("")}</div>` : ""}
       <div class="item"><div class="item-head"><strong>${L("לפי יום", "By day")}</strong></div>${c.slice().reverse().map(r => `<div class="bar-row"><span class="muted">${r.day.slice(8, 10)}.${r.day.slice(5, 7)}</span><span class="meter"><span style="width:${100 * r.cost / max}%"></span></span><span>$${r.cost}</span></div>`).join("")}</div>
-      <div class="item"><div class="item-head"><strong>${L("ריצות Claude היום", "Claude runs today")}</strong></div>${runs.length ? runs.map(r => `<div class="bar-row" style="grid-template-columns:52px 1fr 70px"><span class="muted">${hhmm(toDate(r.at))}</span><span class="${r.ok ? "" : "bad"}">${r.ok ? "" : "✖ "}${Math.round(r.seconds)} ${L("שנ'", "s")}</span><span>$${(r.cost || 0).toFixed(3)}</span></div>`).join("") : `<span class="muted">—</span>`}</div>`;
+      <div class="item"><div class="item-head"><strong>${L("ריצות Claude היום", "Claude runs today")}</strong></div>${runs.length ? runs.map(r => `<div class="bar-row" style="grid-template-columns:52px 70px 1fr 70px"><span class="muted">${hhmm(toDate(r.at))}</span><span class="muted">${esc(r.model || "")}</span><span class="${r.ok ? "" : "bad"}">${r.ok ? "" : "✖ "}${Math.round(r.seconds)} ${L("שנ'", "s")}</span><span>$${(r.cost || 0).toFixed(3)}</span></div>`).join("") : `<span class="muted">—</span>`}</div>`;
   }
   return "";
 }
@@ -195,6 +203,7 @@ function renderDrawer(reset) {
   $("drawerTabs").innerHTML = Object.entries(names).map(([k, n]) => `<button role="tab" aria-selected="${k === drawerKind}" data-k="${k}">${n}</button>`).join("");
   $("drawerTabs").querySelectorAll("button").forEach(b => b.onclick = () => { drawerKind = b.dataset.k; renderDrawer(true); });
   body.innerHTML = drawerContent(drawerKind, last);
+  body.querySelectorAll("[data-sent]").forEach(b => b.onclick = () => { sentAll = b.dataset.sent === "1"; renderDrawer(true); });
   body.scrollTop = reset ? 0 : top;
   body.querySelectorAll("[data-approve]").forEach(b => b.onclick = () => {
     const r = (last.drafts || []).find(x => x.id == b.dataset.approve); if (!r) return;

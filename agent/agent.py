@@ -120,7 +120,15 @@ def adb():
         CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT DEFAULT 'time', text TEXT,
             due TEXT, chat_jid TEXT, ref_ts TEXT, status TEXT DEFAULT 'active', created TEXT, fired TEXT);
     """)
+    global _runs_migrated
+    if not _runs_migrated:  # older databases: record which model each run used (dashboard cost view)
+        if "model" not in [r[1] for r in db.execute("PRAGMA table_info(claude_runs)")]:
+            db.execute("ALTER TABLE claude_runs ADD COLUMN model TEXT")
+        _runs_migrated = True
     return db
+
+
+_runs_migrated = False
 
 
 def kv_get(k, default=None):
@@ -375,9 +383,9 @@ def _run_claude(prompt, model, resume, timeout, on_stage=None):
         raise RuntimeError("claude returned no result")
     usage = res.get("usage", {})
     with adb() as db:
-        db.execute("INSERT INTO claude_runs VALUES (?, ?, ?, ?, ?, ?, ?)", (dt.datetime.now().isoformat(), res.get("session_id"),
-                   res.get("total_cost_usd", 0), usage.get("input_tokens", 0), usage.get("output_tokens", 0), time.time() - t0,
-                   0 if res.get("is_error") else 1))
+        db.execute("INSERT INTO claude_runs (at, session, cost, input_tokens, output_tokens, seconds, ok, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                   (dt.datetime.now().isoformat(), res.get("session_id"), res.get("total_cost_usd", 0), usage.get("input_tokens", 0),
+                    usage.get("output_tokens", 0), time.time() - t0, 0 if res.get("is_error") else 1, model or CFG.get("claude_model") or ""))
     return res
 
 

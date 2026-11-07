@@ -285,8 +285,8 @@ func groupName(s string) (string, error) {
 	if err := textOK(s); err != nil {
 		return "", err
 	}
-	if utf8.RuneCountInString(s) > 25 {
-		return "", fmt.Errorf("group name longer than 25 characters")
+	if utf8.RuneCountInString(s) > 100 { // WhatsApp allows 100 characters for a group subject
+		return "", fmt.Errorf("group name longer than 100 characters")
 	}
 	return s, nil
 }

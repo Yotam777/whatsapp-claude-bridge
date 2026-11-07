@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"go.mau.fi/whatsmeow/types"
@@ -91,7 +92,10 @@ func TestGroupName(t *testing.T) {
 	if _, err := groupName("Claude \xf0\xe9"); err == nil {
 		t.Fatal("invalid UTF-8 should be rejected")
 	}
-	if _, err := groupName("abcdefghijklmnopqrstuvwxyz"); err == nil {
-		t.Fatal("26 chars should be rejected")
+	if _, err := groupName("תחזוק ובניית הגשר עם קלאוד"); err != nil {
+		t.Fatalf("a 26-character Hebrew name must be accepted: %v", err)
+	}
+	if _, err := groupName(strings.Repeat("a", 101)); err == nil {
+		t.Fatal("101 chars should be rejected (WhatsApp limit is 100)")
 	}
 }

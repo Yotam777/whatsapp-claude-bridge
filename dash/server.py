@@ -241,13 +241,13 @@ def action(a):
         return res
     if kind == "group_rename":  # rename the control group (owner asked from the dashboard)
         name = (a.get("name") or "").strip()
-        if not name or len(name) > 25:
-            return {"error": "שם בין 1 ל-25 תווים"}
+        if not name or len(name) > 100:
+            return {"error": "שם בין 1 ל-100 תווים"}
         return bridge("/set_group", {"jid": cfg()["claude_group"], "name": name})
     if kind == "group_create":  # create a new dedicated control group (only this account) and point the agent at it
         name = (a.get("name") or "").strip()
-        if not name or len(name) > 25:
-            return {"error": "שם בין 1 ל-25 תווים"}
+        if not name or len(name) > 100:
+            return {"error": "שם בין 1 ל-100 תווים"}
         res = bridge("/create_group", {"name": name, "participants": [], "description": "השיחה הפרטית שלך עם Claude"}, timeout=40)
         if not str(res.get("jid", "")).endswith("@g.us"):
             return res if "error" in res else {"error": "create failed"}

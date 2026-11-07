@@ -176,7 +176,12 @@ def send(recipient, text, media=None, quoted=None):
     if quoted:
         body["quoted_id"] = quoted
     try:
-        res = bridge("/send", body)
+        try:
+            res = bridge("/send", body)
+        except Exception as e:
+            if not _refused(e) or not wait_bridge(180):
+                raise
+            res = bridge("/send", body)  # the bridge was down (e.g. starting up): the first request never reached it
         ok, detail = res.get("success", False), res.get("message", "")
     except Exception as e:
         ok, detail = False, str(e)
@@ -184,6 +189,52 @@ def send(recipient, text, media=None, quoted=None):
         db.execute("INSERT INTO sent VALUES (?, ?, ?, ?, ?)", (dt.datetime.now().isoformat(), recipient, text[:500], ok, detail))
     log("send", recipient, ok, detail[:120])
     return ok
+
+
+def _refused(e):
+    t = str(e)
+    return "10061" in t or "refused" in t.lower()
+
+
+def wait_bridge(seconds=180):
+    """True once the bridge answers /status (used at start-up and when a send found it down)."""
+    end = time.time() + seconds
+    while time.time() < end:
+        try:
+            bridge("/status", timeout=5)
+            return True
+        except Exception:
+            time.sleep(5)
+    return False
+
+
+RESTART_REQ = threading.Event()
+RESTART_FILE = os.path.join(HERE, "restart.request")  # Claude (or anyone) creates it: the agent restarts after the current answer
+
+
+def restart_now(reason):
+    """Exit cleanly; run-agent.cmd starts the agent again within ~15 s and the new process reports in the group."""
+    kv_set("restart_pending", json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "reason": reason}, ensure_ascii=False))
+    log("restart requested:", reason)
+    os._exit(0)
+
+
+def report_restart():
+    """After a requested restart: confirm in the group with the settings actually loaded."""
+    raw = kv_get("restart_pending")
+    if not raw:
+        return
+    kv_set("restart_pending", "")
+    try:
+        info = json.loads(raw)
+    except Exception:
+        info = {}
+    wait_bridge(300)
+    forced = get_override()
+    reply(f"✅ עליתי מחדש ({dt.datetime.now():%H:%M}). "
+          f"סשן: {'נקי לכל הודעה' if CFG.get('fresh_sessions') else 'רציף'} · "
+          f"מודל: {forced or 'אוטו'} · תקרה: ${CFG.get('daily_budget_usd')}"
+          + (f"\nסיבה: {info['reason']}" if info.get("reason") else ""))
 
 
 def italic(text):
@@ -584,6 +635,9 @@ class StatusMsg:
 
 def owner_command(text):
     """Slash commands answered locally (no Claude run, no cost). Returns reply text or None."""
+    if re.match(r"^/(הפעל מחדש|אתחל|restart)\s*$", text.strip()):
+        RESTART_REQ.set()
+        return "🔄 מפעיל את הסוכן מחדש. אכתוב כאן כשאעלה (בערך 20 שניות)."
     m = re.match(r"^/(מודל|model|מודלים|סשן|session)\s*(.*)$", text.strip(), re.S)
     if not m:
         return None
@@ -626,6 +680,8 @@ def command_worker():
                 react(mid, "✅")
                 with adb() as db:
                     db.execute("UPDATE commands SET status = 'done', answered = ? WHERE id = ?", (dt.datetime.now().isoformat(), cid))
+                if RESTART_REQ.is_set():
+                    restart_now("/הפעל מחדש")
                 continue
             budget = float(CFG.get("daily_budget_usd", 5))
             spent = spent_today()
@@ -663,6 +719,15 @@ def command_worker():
             log("command error", traceback.format_exc())
         with adb() as db:
             db.execute("UPDATE commands SET status = 'done', answered = ? WHERE id = ?", (dt.datetime.now().isoformat(), cid))
+        if RESTART_REQ.is_set():
+            restart_now("/הפעל מחדש")
+        if os.path.exists(RESTART_FILE):
+            try:
+                reason = open(RESTART_FILE, encoding="utf-8").read().strip()[:200]
+                os.remove(RESTART_FILE)
+            except OSError:
+                reason = ""
+            restart_now(reason or "בקשת Claude")
 
 
 # ---------- backup ----------
@@ -863,6 +928,25 @@ def sweep_loop():
 
 # ---------- watchdog ----------
 
+def disconnect_reason(since):
+    """Best guess why WhatsApp was down, from the bridge log since `since` (shown with the 'connection is back' notice)."""
+    try:
+        with open(os.path.join(ROOT, "whatsapp-bridge", "bridge.log"), "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 200_000))
+            tail = f.read().decode("utf-8", "ignore")
+    except OSError:
+        return ""
+    starts = len(re.findall(r"starting bridge", tail))
+    if "device_removed" in tail or "logged out" in tail.lower():
+        return "\nסיבה: המכשיר הוסר מ'מכשירים מקושרים' בטלפון — אם זה חוזר, בדוק שם ואל תנתק את המחשב."
+    if re.search(r"(?i)(no such host|network is unreachable|i/o timeout|connection reset|10054|10060|10065)", tail[-20000:]):
+        return "\nסיבה: ניתוק רשת/אינטרנט במחשב (לא חסימה). אם חוזר — לבדוק Wi-Fi/שינה."
+    if starts:
+        return "\nסיבה: הגשר הופעל מחדש (עדכון או הפעלה מחדש)."
+    return "\nסיבה לא ידועה — הלוג לא מראה שגיאה ברורה."
+
+
 def watchdog():
     """Alerts on the PC when WhatsApp stays disconnected or the device was logged out; reports recovery."""
     down_since, alerted = None, False
@@ -880,7 +964,7 @@ def watchdog():
         if ok:
             if alerted and down_since:
                 mins = int((now - down_since).total_seconds() // 60)
-                reply(T["back"].format(mins=mins))
+                reply(T["back"].format(mins=mins) + disconnect_reason(down_since))
             down_since, alerted = None, False
         else:
             down_since = down_since or now
@@ -953,6 +1037,9 @@ if __name__ == "__main__":
         _manual[sys.argv[1]]()
         sys.exit()
     log("agent starting")
+    if os.path.exists(RESTART_FILE):  # a request left over from before this start is already fulfilled
+        os.remove(RESTART_FILE)
+    threading.Thread(target=report_restart, daemon=True).start()
     for target in [worker, command_worker, scheduler, event_listener, watchdog] + _threads:
         threading.Thread(target=target, daemon=True).start()
     sys.path.insert(0, ROOT)

@@ -72,13 +72,6 @@
       </div>
       <div class="chat-row">
         <div class="chat" id="chat" tabindex="0" aria-live="polite"></div>
-        <section class="model-box" id="modelBox" aria-labelledby="h-model">
-          <div class="card-head"><h2 id="h-model" data-en="Claude model">מודל Claude</h2><button class="mb-toggle" id="mbToggle" aria-expanded="true" title="מזער / הרחב">▾ מזער</button></div>
-          <p class="note tight" id="modelNow"></p>
-          <select id="modelSel" class="btn sel" aria-label="בחירת מודל"></select>
-          <p class="note tight" id="modelTip"></p>
-          <p class="note tight" id="modelRec"></p>
-        </section>
       </div>
       <form class="composer" id="composer" autocomplete="off">
         <textarea id="say" rows="1" placeholder="המשך את השיחה עם הכלי… (Enter לשליחה, Shift+Enter לשורה חדשה)" aria-label="הודעה לכלי"></textarea>
@@ -122,6 +115,14 @@
           </div>
         </details>
       </section>
+        <section class="card compact model-box" id="modelBox" aria-labelledby="h-model">
+          <div class="card-head"><h2 id="h-model" data-en="Claude model">מודל Claude</h2><button class="mb-toggle" id="mbToggle" aria-expanded="true" title="מזער / הרחב">▾ מזער</button></div>
+          <p class="note tight" id="modelNow"></p>
+          <select id="modelSel" class="btn sel" aria-label="בחירת מודל"></select>
+          <p class="note tight" id="modelTip"></p>
+          <p class="note tight" id="modelRec"></p>
+        </section>
+
       <section class="card compact" aria-labelledby="h-view">
         <div class="card-head"><h2 id="h-view" data-en="Display">תצוגה</h2><button class="btn small ghost" id="viewReset" title="חזרה לברירת המחדל" data-en="Reset">איפוס</button></div>
         <div class="view-row"><span data-en="Chat text">כתב השיחה</span>

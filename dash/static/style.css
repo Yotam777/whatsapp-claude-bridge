@@ -255,15 +255,13 @@ details.item > summary::-webkit-details-marker { display: none; }
 @media (max-width: 1000px) { .chat-top { flex-direction: column; } .model-box { width: auto; } }
 
 /* chat with the model box on its left (top) */
-/* the chat fills the whole area (also under the model box); the model box floats over its top-left corner */
-.chat-row { flex: 1; min-height: 0; position: relative; display: flex; }
-.chat-row .chat { flex: 1; min-height: 0; padding-top: 10px; }
-.chat-row .model-box { position: absolute; top: 8px; left: 14px; z-index: 3; box-shadow: 0 6px 18px rgba(16, 24, 40, .14); }
+/* chat fills the whole chat card; the model box lives in the side rail (under System, above Display) */
+.chat-row { flex: 1; min-height: 0; display: flex; }
+.chat-row .chat { flex: 1; min-height: 0; }
+.rail .model-box { width: auto; border-width: 2px; }
 .model-box .mb-toggle { all: unset; cursor: pointer; color: var(--muted); font-size: .8rem; padding: 0 4px; }
-.model-box.min { width: auto; padding: 4px 10px; }
 .model-box.min > :not(.card-head) { display: none; }
-.model-box.min .card-head { margin: 0; }
-@media (max-width: 1000px) { .chat-row .model-box { position: static; width: auto; margin-bottom: 8px; } .chat-row { flex-direction: column; } }
+
 /* the status message (thinking / git / running…) stays one compact bubble inside the conversation */
 .bubble.status { font-size: .82rem; padding: 6px 10px 4px; max-width: 60%; }
 .bubble.status .st-head { font-weight: 600; }

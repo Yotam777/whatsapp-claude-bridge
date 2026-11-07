@@ -373,6 +373,11 @@ function render(d) {
     act({ do: "model", model: sel.value, hours: 0 }, L("המודל הוחלף", "Model changed")); };
   const rc = mi.recommend;
   $("modelRec").textContent = rc && rc.model ? `💡 ${L("המלצה: ", "Suggestion: ")}${(guide[rc.model] || {}).he || rc.model} (${rc.why})` : "";
+  // live steps of the current / last Claude run (stay after the end, the last one marked)
+  const lv = d.live || null, st = (lv && lv.steps) || [];
+  $("modelBox").classList.toggle("working", !!(lv && !lv.done));
+  $("steps").innerHTML = st.length ? `<div class="steps-head">${lv.done ? L(`✅ הריצה האחרונה · ${Math.floor(lv.secs / 60)}:${String(lv.secs % 60).padStart(2, "0")} · ${esc(lv.model)}`, `✅ last run · ${esc(lv.model)}`) : L(`⏳ עובד עכשיו · ${esc(lv.model)}`, `⏳ working · ${esc(lv.model)}`)}</div>` +
+    st.map((x, i) => `<div class="step${i === st.length - 1 ? (lv.done ? " final" : " now") : ""}" title="${esc(x.text)}"><span class="t">${hhmm(toDate(x.at))}</span><span>${esc(x.text)}</span></div>`).join("") : "";
   $("log").textContent = (d.log || []).join("\n");
   renderDrawer(false);
   drawCharts(d);

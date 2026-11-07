@@ -387,6 +387,22 @@ def transcript_of(chat_jid, msg_id, sender, ts):
 
 # ---------- headless Claude ----------
 
+def _detail_of(name, inp):
+    """Short, safe detail of a tool call: a file name, a search pattern, the start of a command, a web host."""
+    if name in ("Read", "Edit", "Write", "NotebookEdit"):
+        return os.path.basename(str(inp.get("file_path") or inp.get("notebook_path") or ""))
+    if name in ("Grep", "Glob"):
+        return str(inp.get("pattern", ""))[:30]
+    if name in ("Bash", "PowerShell"):
+        c = re.sub(r"\s+", " ", str(inp.get("description") or inp.get("command") or "")).strip()
+        return c[:48] + ("…" if len(c) > 48 else "")
+    if name == "WebFetch":
+        return re.sub(r"^https?://([^/]+).*$", r"\1", str(inp.get("url", "")))
+    if name == "WebSearch":
+        return str(inp.get("query", ""))[:40]
+    return ""
+
+
 def _stage_of(ev):
     """Human status (Hebrew) for one stream event of Claude Code, or None."""
     if ev.get("type") != "assistant":
@@ -443,7 +459,11 @@ def _run_claude(prompt, model, resume, timeout, on_stage=None):
             elif on_stage:
                 st = _stage_of(ev)
                 if st:
-                    on_stage(st)
+                    det = ""
+                    for part in (ev.get("message") or {}).get("content") or []:
+                        if part.get("type") == "tool_use":
+                            det = _detail_of(part.get("name", ""), part.get("input") or {})
+                    on_stage(st, det)
         proc.wait()
     finally:
         killer.cancel()
@@ -606,18 +626,39 @@ def pick_model(text):
 
 
 class StatusMsg:
-    """One WhatsApp message that is edited while Claude works (stage + elapsed time), then removed when the answer is sent."""
+    """One WhatsApp message that is edited while Claude works (stage, detail, elapsed time, model). At the end it is left
+    in its final state (not deleted). The steps also go to kv 'live_steps' for the dashboard."""
     def __init__(self, model):
         self.model, self.stage, self.mid, self.t0, self.done = model, "🧠 מתחיל", None, time.time(), threading.Event()
+        self.steps = []
+        self._save(False)
         self.timer = threading.Timer(8, self._start)
         self.timer.start()
 
-    def set_stage(self, st):
-        self.stage = st
+    def _save(self, done):
+        try:
+            kv_set("live_steps", json.dumps({"model": self.model, "started": dt.datetime.fromtimestamp(self.t0).isoformat(timespec="seconds"),
+                                             "done": done, "secs": int(time.time() - self.t0), "steps": self.steps[-8:]}, ensure_ascii=False))
+        except Exception as e:
+            log("live_steps save failed", e)
+
+    def set_stage(self, st, detail=""):
+        text = f"{st} · {detail}" if detail else st
+        self.stage = text
+        if not self.steps or self.steps[-1]["text"] != text:
+            self.steps.append({"at": dt.datetime.now().isoformat(timespec="seconds"), "text": text})
+            self._save(False)
+
+    def _elapsed(self):
+        e = int(time.time() - self.t0)
+        return f"{e // 60}:{e % 60:02d}"
 
     def _text(self):
-        e = int(time.time() - self.t0)
-        return CFG["reply_prefix"] + italic(f"⏳ {self.stage} · {e // 60}:{e % 60:02d} · {self.model}")
+        return CFG["reply_prefix"] + italic(f"⏳ {self.stage} · {self._elapsed()} · {self.model}")
+
+    def _final(self):
+        n = len(self.steps)
+        return CFG["reply_prefix"] + italic(f"✅ סיימתי · {self._elapsed()} · {self.model}" + (f" · {n} שלבים" if n else ""))
 
     def _start(self):
         if self.done.is_set():
@@ -644,13 +685,14 @@ class StatusMsg:
                     last = new
                 except Exception as e:
                     log("status edit failed", e)
-        if self.done.is_set() and self.mid:
+        if self.done.is_set() and self.mid:  # leave the final state (owner request 07.11): no delete
             try:
-                bridge("/delete_message", {"jid": CFG["claude_group"], "id": self.mid}, timeout=20)
+                bridge("/edit_message", {"jid": CFG["claude_group"], "id": self.mid, "text": self._final()}, timeout=20)
             except Exception as e:
-                log("status delete failed", e)
+                log("status final edit failed", e)
 
     def finish(self):
+        self._save(True)
         self.done.set()
         self.timer.cancel()
 

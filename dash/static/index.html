@@ -70,6 +70,16 @@
         <button class="tile" data-detail="cost" style="--accent: var(--brand)"><span class="tile-ico">💲</span><span class="tile-value" id="kCost">—</span><span class="tile-label" data-en="Claude cost today">עלות Claude היום</span>
           <span class="meter" role="progressbar" aria-label="ניצול תקציב יומי" id="kCostMeter"><span id="kCostBar"></span></span></button>
       </div>
+      <div class="chat-top">
+        <div class="steps" id="steps" aria-label="מה הכלי עושה עכשיו" aria-live="polite"></div>
+        <section class="model-box" id="modelBox" aria-labelledby="h-model">
+          <div class="card-head"><h2 id="h-model" data-en="Claude model">מודל Claude</h2></div>
+          <p class="note tight" id="modelNow"></p>
+          <select id="modelSel" class="btn sel" aria-label="בחירת מודל"></select>
+          <p class="note tight" id="modelTip"></p>
+          <p class="note tight" id="modelRec"></p>
+        </section>
+      </div>
       <div class="chat" id="chat" tabindex="0" aria-live="polite"></div>
       <form class="composer" id="composer" autocomplete="off">
         <textarea id="say" rows="1" placeholder="המשך את השיחה עם הכלי… (Enter לשליחה, Shift+Enter לשורה חדשה)" aria-label="הודעה לכלי"></textarea>
@@ -79,14 +89,6 @@
 
     <!-- side rail: compact tools -->
     <aside class="rail" aria-label="כלים">
-      <section class="card compact" aria-labelledby="h-model">
-        <div class="card-head"><h2 id="h-model" data-en="Claude model">מודל Claude</h2></div>
-        <p class="note tight" id="modelNow"></p>
-        <select id="modelSel" class="btn sel" aria-label="בחירת מודל"></select>
-        <p class="note tight" id="modelTip"></p>
-        <p class="note tight" id="modelRec"></p>
-      </section>
-
       <section class="card compact" aria-labelledby="h-grp">
         <div class="card-head"><h2 id="h-grp" data-en="Control group">קבוצת הבקרה</h2></div>
         <p class="note tight"><span data-en="Now:">כעת:</span> <strong id="grpName">—</strong></p>

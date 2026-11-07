@@ -235,3 +235,21 @@ details.item > summary::-webkit-details-marker { display: none; }
 
 .bubble.outbox.sending { opacity: .75; }
 .bubble.outbox .meta { font-style: italic; }
+
+/* chat top: live steps (right) + model box (left, under "today's activity") */
+.chat-top { flex: none; display: flex; gap: 10px; align-items: flex-start; margin-bottom: 10px; }
+.steps { flex: 1; display: flex; flex-wrap: wrap; gap: 6px; align-content: flex-start; min-height: 0; }
+.step { display: flex; flex-direction: column; gap: 2px; padding: 6px 10px; border-radius: 10px; background: var(--surface); border: 1px solid var(--line);
+        font-size: .8rem; max-width: 230px; box-shadow: var(--shadow); }
+.step .t { color: var(--muted); font-size: .7rem; font-variant-numeric: tabular-nums; }
+.step span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.step.now { border-color: var(--brand); background: var(--ok-bg); font-weight: 600; }
+.step.final { border-color: var(--ok); }
+.steps .steps-head { width: 100%; font-size: .78rem; color: var(--muted); }
+.model-box { flex: none; width: 290px; border: 2px solid var(--line); border-radius: 12px; padding: 8px 10px; background: var(--surface); }
+.model-box .card-head { margin-bottom: 4px; }
+.model-box .card-head h2 { font-size: .9rem; }
+.model-box.working { border-color: var(--brand); animation: pulse-frame 1.6s ease-in-out infinite; }
+@keyframes pulse-frame { 0%, 100% { box-shadow: 0 0 0 0 rgba(31, 170, 89, .55); } 50% { box-shadow: 0 0 0 6px rgba(31, 170, 89, 0); } }
+@media (prefers-reduced-motion: reduce) { .model-box.working { animation: none; } }
+@media (max-width: 1000px) { .chat-top { flex-direction: column; } .model-box { width: auto; } }

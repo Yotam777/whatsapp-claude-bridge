@@ -140,6 +140,7 @@ def data():
                   "pending": (rows(p["agent"], "SELECT count(*) n FROM commands WHERE status = 'pending'") or [{"n": 0}])[0]["n"],
                   "budget": c.get("daily_budget_usd", 5), "spent_today": round(spent[0]["s"], 2) if spent else 0},
         "model": model_info(),
+        "live": jl("live_steps"),
         "conversation": convo,
         "last_owner": jl("last_owner_msg"), "last_tool": jl("last_tool_msg"),
         "drafts": rows(p["msg"], "SELECT id, name, recipient, message, created, status FROM drafts ORDER BY id DESC LIMIT 40"),

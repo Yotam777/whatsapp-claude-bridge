@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -240,15 +241,31 @@ func registerExtras2API(client *whatsmeow.Client) {
 		return map[string]any{"id": resp.ID}, err
 	})
 
-	// {"jid":"target chat","from":"source chat","id":"msg id"} — forward a TEXT message (marked as forwarded)
+	// {"jid":"target chat","from":"source chat","id":"msg id"} — forward a message (marked as forwarded). Media (image,
+	// video, audio, document) is downloaded and re-sent with its caption through the normal send path (policy + pacer).
 	adminHandler("/api/forward", func(ctx context.Context, b map[string]any) (map[string]any, error) {
 		to, err := types.ParseJID(str(b, "jid"))
 		if err != nil {
 			return nil, err
 		}
-		var text string
-		if globalStore == nil || globalStore.db.QueryRow("SELECT content FROM messages WHERE id=? AND chat_jid=?", str(b, "id"), str(b, "from")).Scan(&text) != nil || text == "" {
-			return nil, errString("text message not found (media forwarding not supported)")
+		var text, mediaType string
+		if globalStore == nil || globalStore.db.QueryRow("SELECT coalesce(content,''), coalesce(media_type,'') FROM messages WHERE id=? AND chat_jid=?",
+			str(b, "id"), str(b, "from")).Scan(&text, &mediaType) != nil {
+			return nil, errString("message not found")
+		}
+		if mediaType != "" {
+			okDl, _, _, path, dlErr := downloadMedia(client, globalStore, str(b, "id"), str(b, "from"))
+			if !okDl || dlErr != nil {
+				return nil, fmt.Errorf("media download failed: %v", dlErr)
+			}
+			if abs, e := filepath.Abs(path); e == nil {
+				path = abs
+			}
+			sent, msg := sendWhatsAppMessage(client, to.String(), text, path)
+			return map[string]any{"sent": sent, "message": msg, "media_type": mediaType}, nil
+		}
+		if text == "" {
+			return nil, errString("empty message")
 		}
 		ok, res, err := gate(to, text)
 		if !ok {

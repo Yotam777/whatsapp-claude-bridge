@@ -89,6 +89,9 @@ func checkPolicy(jid types.JID) (string, SendPolicy) {
 	if t, err := time.Parse(time.RFC3339, p.PausedUntil); err == nil && time.Now().Before(t) {
 		return "paused", p
 	}
+	if _, ok := oneShotApproval.LoadAndDelete(jid.String()); ok {
+		return "send", p // a single ✅-approved draft
+	}
 	if inList(p.Allow, jid) {
 		return "send", p
 	}
@@ -142,28 +145,24 @@ func makeDraft(client *whatsmeow.Client, p SendPolicy, jid types.JID, message, m
 	if c, err := client.Store.Contacts.GetContact(contextBG(), jid); err == nil && c.FullName != "" {
 		name = c.FullName
 	}
+	var draftID int64
 	if globalStore != nil {
-		globalStore.db.Exec(`INSERT INTO drafts (recipient, name, message, media_path, created, status) VALUES (?, ?, ?, ?, ?, 'pending')`,
-			jid.String(), name, message, mediaPath, time.Now())
-	}
-	// best path: type the draft straight into the chat on the owner's phone (nothing is sent)
-	if jid.Server == types.DefaultUserServer && mediaPath == "" {
-		if err := phoneDraft(jid.User, message); err == nil {
-			note := ""
-			if quotedID != "" {
-				note = "\n(הציטוט לא נשמר בטיוטה בטלפון — אם צריך, החלק על ההודעה המקורית וענה עליה)"
-			}
-			sendWhatsAppMessage(client, p.ControlGroup, fmt.Sprintf("🤖 📝 טיוטה מוכנה בטלפון בשיחה עם %s — פתח, ערוך ושלח.%s", name, note), "")
-			return false, fmt.Sprintf("DRAFT: typed into the chat with %s on the phone (not sent)", name)
-		} else {
-			fmt.Println("Phone draft unavailable:", err)
+		if r, err := globalStore.db.Exec(`INSERT INTO drafts (recipient, name, message, media_path, created, status, quoted_id) VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
+			jid.String(), name, message, mediaPath, time.Now(), quotedID); err == nil {
+			draftID, _ = r.LastInsertId()
 		}
 	}
 	var card strings.Builder
 	card.WriteString(fmt.Sprintf("🤖 📝 *טיוטה ממתינה לשליחה* → %s\n", name))
 	if jid.Server == types.DefaultUserServer {
-		card.WriteString("לחץ על הקישור, ההודעה תיפתח מוכנה בשיחה — בדוק ושלח:\n")
-		card.WriteString("https://wa.me/" + jid.User + "?text=" + url.QueryEscape(message) + "\n")
+		// %20 instead of '+' (safer in wa.me); long links get cut by WhatsApp's link detection, so skip them
+		q := strings.ReplaceAll(url.QueryEscape(message), "+", "%20")
+		if len(q) <= 1200 && mediaPath == "" {
+			card.WriteString("לחץ על הקישור, ההודעה תיפתח מוכנה בשיחה — בדוק ושלח:\n")
+			card.WriteString("https://wa.me/" + jid.User + "?text=" + q + "\n")
+		} else {
+			card.WriteString("הטקסט ארוך / יש קובץ — אין קישור אוטומטי. העתק את הטקסט שמתחת (ולחץ על שם איש הקשר: https://wa.me/" + jid.User + ")\n")
+		}
 	} else {
 		card.WriteString("(קבוצה / מזהה ללא מספר — העתק את הטקסט ושלח ידנית)\n")
 	}
@@ -171,7 +170,15 @@ func makeDraft(client *whatsmeow.Client, p SendPolicy, jid types.JID, message, m
 		card.WriteString("📎 קובץ מצורף נשלח בנפרד לכאן — העבר אותו ליעד.\n")
 	}
 	card.WriteString("━━━━━━━━━━\n" + message)
+	card.WriteString("\n━━━━━━━━━\nהגב ✅ על ההודעה הזו כדי לשלוח (הודעה אחת, לנמען הזה בלבד) · ❌ לביטול")
 	ok, res := sendWhatsAppMessage(client, p.ControlGroup, card.String(), "")
+	if ok && draftID > 0 && globalStore != nil {
+		// remember the card's message id so a ✅ reaction on it can approve exactly this draft
+		var cardID string
+		if globalStore.db.QueryRow("SELECT message_id FROM send_log WHERE recipient = ? AND ok = 1 ORDER BY id DESC LIMIT 1", p.ControlGroup).Scan(&cardID) == nil {
+			globalStore.db.Exec("UPDATE drafts SET card_id = ? WHERE id = ?", cardID, draftID)
+		}
+	}
 	if ok && mediaPath != "" {
 		sendWhatsAppMessage(client, p.ControlGroup, "🤖 📎 קובץ לטיוטה → "+name, mediaPath)
 	}

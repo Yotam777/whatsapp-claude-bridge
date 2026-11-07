@@ -156,6 +156,96 @@ func registerExtraAPI(client *whatsmeow.Client) {
 		json.NewEncoder(w).Encode(res)
 	})
 
+	// {"jid":"...@g.us"} — live group name from WhatsApp; also heals the stored chat name if it drifted (agent's daily check)
+	http.HandleFunc("/api/group_info", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			JID string `json:"jid"`
+		}
+		if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&req) != nil {
+			http.Error(w, "POST json", http.StatusBadRequest)
+			return
+		}
+		jid, err := types.ParseJID(req.JID)
+		if err != nil || jid.Server != types.GroupServer {
+			http.Error(w, "bad group jid", http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res := map[string]any{"success": false}
+		info, err := client.GetGroupInfo(ctx, jid)
+		if err != nil {
+			res["error"] = err.Error()
+		} else {
+			res["success"] = true
+			res["name"] = info.Name
+			res["description"] = info.Topic
+			res["stored_name"] = ""
+			res["healed"] = false
+			if globalStore != nil && info.Name != "" {
+				var stored string
+				globalStore.db.QueryRow("SELECT name FROM chats WHERE jid = ?", jid.String()).Scan(&stored)
+				res["stored_name"] = stored
+				if stored != info.Name {
+					globalStore.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", info.Name, jid.String())
+					res["healed"] = true
+				}
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(res)
+	})
+
+	// {"jid":"...@g.us","name":"...","description":"..."} — rename a group and/or set its description (needs admin rights)
+	http.HandleFunc("/api/set_group", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			JID         string  `json:"jid"`
+			Name        *string `json:"name"`
+			Description *string `json:"description"`
+		}
+		if r.Method != http.MethodPost || json.NewDecoder(r.Body).Decode(&req) != nil {
+			http.Error(w, "POST json", http.StatusBadRequest)
+			return
+		}
+		jid, err := types.ParseJID(req.JID)
+		if err != nil || jid.Server != types.GroupServer {
+			http.Error(w, "bad group jid", http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		res := map[string]any{"success": true}
+		if req.Name != nil {
+			name, nerr := groupName(*req.Name)
+			if nerr == nil {
+				nerr = client.SetGroupName(ctx, jid, name)
+			}
+			if nerr != nil {
+				res["success"], res["name_error"] = false, nerr.Error()
+			} else if globalStore != nil {
+				globalStore.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", name, jid.String())
+			}
+		}
+		if req.Description != nil {
+			derr := textOK(*req.Description)
+			if derr == nil {
+				derr = client.SetGroupDescription(ctx, jid, *req.Description)
+			}
+			if derr != nil {
+				res["success"], res["description_error"] = false, derr.Error()
+			}
+		}
+		if false {
+			if derr := client.SetGroupDescription(ctx, jid, *req.Description); derr != nil {
+				res["success"], res["description_error"] = false, derr.Error()
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(res)
+	})
+
+	registerAdminAPI(client)
+
 	// {"jid":"...@g.us"} — leave a group (refuses the control group)
 	http.HandleFunc("/api/leave_group", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -192,11 +282,19 @@ func groupName(s string) (string, error) {
 	if s == "" {
 		s = "Claude"
 	}
-	if !utf8.ValidString(s) {
-		return "", fmt.Errorf("group name is not valid UTF-8")
+	if err := textOK(s); err != nil {
+		return "", err
 	}
 	if utf8.RuneCountInString(s) > 25 {
 		return "", fmt.Errorf("group name longer than 25 characters")
 	}
 	return s, nil
+}
+
+// textOK refuses text that was mangled on its way in (console code page turns Hebrew into "????" / U+FFFD).
+func textOK(s string) error {
+	if !utf8.ValidString(s) || strings.ContainsRune(s, '�') || strings.Contains(s, "??") {
+		return fmt.Errorf("text looks corrupted (invalid UTF-8 / U+FFFD / '??') - send it as UTF-8 JSON from a file, never via a shell command line")
+	}
+	return nil
 }

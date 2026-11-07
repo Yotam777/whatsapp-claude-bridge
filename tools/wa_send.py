@@ -14,7 +14,23 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 token = open(os.path.join(ROOT, "whatsapp-bridge", "store", "api_token")).read().strip()  # bridge API password
 req = urllib.request.Request("http://127.0.0.1:8765/api/send", data=json.dumps(body).encode(),
                              headers={"Content-Type": "application/json", "Authorization": "Bearer " + token})
+def _log(result):
+    # יומן פעולות: מי (Claude), מתי, למי, מה נשלח (תחילת הטקסט), והתוצאה — נכתב גם אם השליחה נכשלה
+    import datetime
+    try:
+        line = "%s | Claude | to=%s | media=%s | text=%r | result=%s\n" % (
+            datetime.datetime.now().isoformat(timespec="seconds"), to, body.get("media_path", "-"),
+            body["message"][:80], str(result)[:200].replace("\n", " "))
+        with open(os.path.join(ROOT, "agent", "actions.log"), "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
 try:
-    print(urllib.request.urlopen(req, timeout=180).read().decode())
+    out = urllib.request.urlopen(req, timeout=180).read().decode()
+    print(out)
+    _log(out)
 except urllib.error.HTTPError as e:
-    print(e.read().decode())
+    out = e.read().decode()
+    print(out)
+    _log("HTTP %s %s" % (e.code, out))

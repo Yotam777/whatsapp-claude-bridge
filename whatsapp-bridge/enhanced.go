@@ -67,7 +67,13 @@ func initEnhancedSchema(store *MessageStore) error {
 			timestamp TIMESTAMP
 		);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	// ✅-approval support (ignore "duplicate column" errors on an already migrated db)
+	store.db.Exec("ALTER TABLE drafts ADD COLUMN card_id TEXT")
+	store.db.Exec("ALTER TABLE drafts ADD COLUMN quoted_id TEXT")
+	return nil
 }
 
 // ---------- polls ----------

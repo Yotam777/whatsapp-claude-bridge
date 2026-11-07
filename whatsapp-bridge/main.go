@@ -986,6 +986,9 @@ func main() {
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
+			if handleReaction(client, v) {
+				break
+			}
 			// Process regular messages
 			handleMessage(client, messageStore, v, logger)
 
@@ -997,6 +1000,16 @@ func main() {
 			// Hand the phone's re-upload answer to whoever is waiting for it
 			if ch, ok := mediaRetryWaiters.Load(v.MessageID); ok {
 				ch.(chan *events.MediaRetry) <- v
+			}
+
+		case *events.GroupInfo:
+			// Group renamed: keep the stored chat name in step with WhatsApp (GetChatName never overwrites an existing name).
+			if v.Name != nil && v.Name.Name != "" {
+				if _, err := messageStore.db.Exec("UPDATE chats SET name = ? WHERE jid = ?", v.Name.Name, v.JID.String()); err != nil {
+					logger.Warnf("Could not store new group name for %s: %v", v.JID.String(), err)
+				} else {
+					logger.Infof("Group %s renamed to: %s", v.JID.String(), v.Name.Name)
+				}
 			}
 
 		case *events.TemporaryBan:

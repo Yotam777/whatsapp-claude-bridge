@@ -57,6 +57,9 @@ def main():
     if len(sys.argv) < 2 or not re.fullmatch(r"\d+\.\d+\.\d+", sys.argv[1]):
         sys.exit("שימוש: release.cmd X.Y.Z \"מה השתנה\" [--dry-run]")
     ver, notes, dry = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith("--") else ""), "--dry-run" in sys.argv
+    for a in sys.argv[2:]:  # --notes-file=<utf8 file>: notes without passing Hebrew through the command line
+        if a.startswith("--notes-file="):
+            notes = open(a.split("=", 1)[1], encoding="utf-8").read().strip()
     if run(["git", "status", "--porcelain", "--untracked-files=no"]).strip() and not dry:
         sys.exit("✖ יש שינויים שלא נשמרו (commit) — שמור אותם קודם.")
 

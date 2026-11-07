@@ -112,7 +112,7 @@ def data():
     b = bridge("/status")
     jl = lambda k: json.loads(kv(k)) if kv(k) else None
     convo = rows(p["msg"], "SELECT id, timestamp, is_from_me, content, media_type FROM messages WHERE chat_jid = ? "
-                           "ORDER BY rowid DESC LIMIT 10", (group,))[::-1]
+                           "ORDER BY rowid DESC LIMIT 60", (group,))[::-1]
     for m in convo:
         m["tool"] = (m["content"] or "").startswith(c["reply_prefix"].strip())
         if m["tool"]:
@@ -122,16 +122,23 @@ def data():
     return {
         "version": VERSION,
         "tool_version": (open(os.path.join(ROOT, "VERSION")).read().strip() if os.path.exists(os.path.join(ROOT, "VERSION")) else "?"),
+        "maintainer": bool(c.get("maintainer")),
         "now": dt.datetime.now().isoformat(timespec="seconds"),
         "bridge": b,
         "policy": b.get("policy") if "policy" in b else local_policy(),
-        "conn_log": rows(p["msg"], "SELECT at, event FROM conn_log WHERE at > ? ORDER BY at", (day0,)),
+        "conn_log": rows(p["msg"], "SELECT at, event FROM (SELECT at, event FROM conn_log WHERE at <= ? ORDER BY at DESC LIMIT 1) "
+                                   "UNION ALL SELECT at, event FROM conn_log WHERE at > ? ORDER BY at", (day0, day0)),
+        "received": [dict(r, sender=label(r["sender"]), chat=label(r["chat_jid"])) for r in
+                     rows(p["msg"], "SELECT chat_jid, sender, timestamp, content, media_type FROM messages WHERE is_from_me = 0 "
+                                    "AND substr(timestamp,1,10) = ? ORDER BY timestamp DESC LIMIT 60", (today,))],
+        "runs_today": rows(p["agent"], "SELECT at, cost, seconds, ok FROM claude_runs WHERE substr(at,1,10) = ? ORDER BY at DESC LIMIT 40", (today,)),
         "hourly": hourly,
         "received_today": (rows(p["msg"], "SELECT count(*) n FROM messages WHERE is_from_me = 0 AND substr(timestamp,1,10) = ?", (today,)) or [{"n": 0}])[0]["n"],
         "agent": {"heartbeat": kv("heartbeat"), "session_started": kv("session_started"), "backup_done": kv("backup_done"),
                   "events_connected": kv("events_connected"), "plugins": [os.path.basename(x) for x in c.get("plugins", [])],
                   "pending": (rows(p["agent"], "SELECT count(*) n FROM commands WHERE status = 'pending'") or [{"n": 0}])[0]["n"],
                   "budget": c.get("daily_budget_usd", 5), "spent_today": round(spent[0]["s"], 2) if spent else 0},
+        "model": model_info(),
         "conversation": convo,
         "last_owner": jl("last_owner_msg"), "last_tool": jl("last_tool_msg"),
         "drafts": rows(p["msg"], "SELECT id, name, recipient, message, created, status FROM drafts ORDER BY id DESC LIMIT 40"),
@@ -153,16 +160,112 @@ def kill(name_like):
                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
+def git_action(kind, a):
+    """Maintainer only (config.json "maintainer": true): save to git and publish a release from the dashboard."""
+    if not cfg().get("maintainer"):
+        return {"error": "not enabled (set maintainer: true in agent/config.json)"}
+    import re
+    nw = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    git = lambda *x: subprocess.run(["git", *x], cwd=ROOT, capture_output=True, text=True, encoding="utf-8", timeout=120, creationflags=nw)
+    if kind == "git_status":
+        ver = open(os.path.join(ROOT, "VERSION")).read().strip()
+        m = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", ver)
+        nxt = f"{m[1]}.{m[2]}.{int(m[3]) + 1}" if m else ver
+        changed = [l for l in git("status", "--porcelain").stdout.splitlines() if l.strip()]
+        return {"version": ver, "next": nxt, "branch": git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip(),
+                "changed": len(changed), "files": [l[3:] for l in changed[:15]], "last": git("log", "-1", "--format=%s").stdout.strip()}
+    notes = (a.get("notes") or "").strip()
+    if kind == "git_commit":
+        if not notes:
+            return {"error": "write a short description of the change"}
+        git("add", "-A")  # personal data is excluded by .gitignore; the release scan checks again
+        r = git("commit", "-m", notes)
+        return {"ok": r.returncode == 0, "out": (r.stdout + r.stderr)[-400:]}
+    ver = a.get("version", "")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", ver):
+        return {"error": "version must look like 1.0.2"}
+    if git("status", "--porcelain", "--untracked-files=no").stdout.strip():
+        return {"error": "there are unsaved changes - press 'save to git' first"}
+    import tempfile
+    nf = os.path.join(tempfile.gettempdir(), "wa_release_notes.txt")
+    open(nf, "w", encoding="utf-8").write(notes)
+    # visible window: the user watches the checks, the push and any error
+    subprocess.Popen(["cmd.exe", "/c", "start", "Release", "cmd", "/k", os.path.join(ROOT, "release.cmd"), ver, f"--notes-file={nf}"], cwd=ROOT)
+    return {"ok": True}
+
+
+def _model_file():
+    return os.path.join(ROOT, "agent", "model_override.json")
+
+
+def model_info():
+    """Model selection shared with the agent (agent/model_override.json) + the guide shown as tooltips."""
+    cur, until = "auto", ""
+    try:
+        o = json.load(open(_model_file(), encoding="utf-8"))
+        cur, until = o.get("model") or "auto", o.get("until") or ""
+        if until and until < dt.datetime.now().isoformat(timespec="seconds"):
+            cur, until = "auto", ""
+    except Exception:
+        pass
+    try:
+        guide = json.load(open(os.path.join(ROOT, "agent", "models.json"), encoding="utf-8"))
+    except Exception:
+        guide = {}
+    return {"current": cur, "until": until, "last": kv("last_model"), "recommend": (json.loads(kv("last_recommend")) if kv("last_recommend") else None),
+            "session_runs": kv("session_runs"), "guide": guide}
+
+
 def action(a):
     kind = a.get("do")
     p = paths()
-    if kind in ("mode", "pause", "resume"):
+    if kind == "model":
+        m = a.get("model", "auto")
+        until = (dt.datetime.now() + dt.timedelta(hours=float(a["hours"]))).isoformat(timespec="seconds") if a.get("hours") else ""
+        json.dump({"model": m, "until": until}, open(_model_file(), "w", encoding="utf-8"))
+        return {"ok": True, "model": m}
+    if kind == "say":  # continue the conversation from the dashboard: a normal message from the owner in the control group
+        text = (a.get("text") or "").strip()
+        if not text:
+            return {"error": "empty"}
+        res = bridge("/send", {"recipient": cfg()["claude_group"], "message": text})
+        return res if "error" in res else {"ok": True}
+    if kind == "group_info":  # the control group's live name (dashboard card)
+        g = cfg().get("claude_group", "")
+        res = bridge("/group_info", {"jid": g}) if g else {"error": "no control group"}
+        res["jid"] = g
+        return res
+    if kind == "group_rename":  # rename the control group (owner asked from the dashboard)
+        name = (a.get("name") or "").strip()
+        if not name or len(name) > 25:
+            return {"error": "שם בין 1 ל-25 תווים"}
+        return bridge("/set_group", {"jid": cfg()["claude_group"], "name": name})
+    if kind == "group_create":  # create a new dedicated control group (only this account) and point the agent at it
+        name = (a.get("name") or "").strip()
+        if not name or len(name) > 25:
+            return {"error": "שם בין 1 ל-25 תווים"}
+        res = bridge("/create_group", {"name": name, "participants": [], "description": "השיחה הפרטית שלך עם Claude"}, timeout=40)
+        if not str(res.get("jid", "")).endswith("@g.us"):
+            return res if "error" in res else {"error": "create failed"}
+        cpath = os.path.join(ROOT, "agent", "config.json")
+        c = json.load(open(cpath, encoding="utf-8"))
+        old = c.get("claude_group", "")
+        c["claude_group"] = res["jid"]
+        json.dump(c, open(cpath, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        pol = bridge("/policy", {"control_group": res["jid"]})
+        if "error" in pol:  # bridge reads the policy file on every send
+            lp = local_policy(); lp["control_group"] = res["jid"]
+            json.dump(lp, open(paths()["policy"], "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        kill("agent.py")  # the agent reads claude_group only at start; run-agent.cmd restarts it
+        return {"ok": True, "jid": res["jid"], "old": old}
+    if kind == "draft_decide":
+        res = bridge("/draft_decide", {"id": int(a["id"]), "approve": bool(a.get("approve"))})
+        if "error" in res and not a.get("approve"):  # bridge down: cancelling needs no bridge
+            return action({"do": "draft", "id": a["id"], "status": "cancelled"})
+        return res
+    if kind in ("pause", "resume"):
         body = {}
-        if kind == "mode":
-            body = {"mode": a["mode"]}
-            if a["mode"] == "auto":
-                body["auto_until"] = (dt.datetime.now().astimezone() + dt.timedelta(hours=float(a.get("hours", 1)))).isoformat(timespec="seconds")
-        elif kind == "pause":
+        if kind == "pause":
             body = {"paused_until": (dt.datetime.now().astimezone() + dt.timedelta(hours=float(a.get("hours", 6)))).isoformat(timespec="seconds"),
                     "pause_reason": "הושהה ידנית מלוח הבקרה"}
         else:
@@ -177,6 +280,8 @@ def action(a):
             res = pol
         return res
     if kind == "draft":
+        if a["status"] not in ("cancelled", "discarded", "sent"):
+            return {"error": "bad status"}
         con = sqlite3.connect(p["msg"], timeout=10)
         con.execute("UPDATE drafts SET status = ? WHERE id = ?", (a["status"], int(a["id"])))
         con.commit()
@@ -208,6 +313,8 @@ def action(a):
         # visible window so the user can follow the update; it stops and restarts the bridge and the agent
         subprocess.Popen(["cmd.exe", "/c", "start", "Update", os.path.join(ROOT, "update.cmd")], cwd=ROOT)
         return {"ok": True}
+    if kind in ("git_status", "git_commit", "release"):
+        return git_action(kind, a)
     if kind == "update_check":
         from dash import updater
         return updater.check()

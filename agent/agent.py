@@ -14,6 +14,7 @@ Runs as one background process (started at logon by Task Scheduler):
 import datetime as dt
 import importlib.util
 import json
+import re
 import os
 import queue
 import shutil
@@ -116,6 +117,8 @@ def adb():
         CREATE TABLE IF NOT EXISTS sent (at TEXT, recipient TEXT, text TEXT, ok INTEGER, detail TEXT);
         CREATE TABLE IF NOT EXISTS commands (id INTEGER PRIMARY KEY AUTOINCREMENT, msg_id TEXT, text TEXT, at TEXT,
             status TEXT DEFAULT 'pending', answered TEXT);
+        CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT DEFAULT 'time', text TEXT,
+            due TEXT, chat_jid TEXT, ref_ts TEXT, status TEXT DEFAULT 'active', created TEXT, fired TEXT);
     """)
     return db
 
@@ -308,8 +311,40 @@ def transcript_of(chat_jid, msg_id, sender, ts):
 
 # ---------- headless Claude ----------
 
-def _run_claude(prompt, model, resume, timeout):
-    cmd = [shutil.which("claude") or "claude", "-p", prompt, "--output-format", "json", "--permission-mode", "auto"]
+def _stage_of(ev):
+    """Human status (Hebrew) for one stream event of Claude Code, or None."""
+    if ev.get("type") != "assistant":
+        return None
+    for part in (ev.get("message") or {}).get("content") or []:
+        if part.get("type") == "tool_use":
+            name, inp = part.get("name", ""), part.get("input") or {}
+            if name == "Read":
+                return "📖 קורא קבצים"
+            if name in ("Edit", "Write", "NotebookEdit"):
+                return "✏️ עורך קוד/קבצים"
+            if name in ("Grep", "Glob"):
+                return "🔎 מחפש בקבצים"
+            if name in ("WebSearch", "WebFetch"):
+                return "🌐 מחפש ברשת"
+            if name in ("Agent", "Workflow"):
+                return "🧩 מפעיל סוכן עזר"
+            if name in ("Bash", "PowerShell"):
+                c = str(inp.get("command", ""))
+                if re.search(r"(^|[\s;&|])git\s", c):
+                    return "🔀 עובד עם גיט"
+                if re.search(r"go build|go vet|release|pyinstaller", c):
+                    return "🛠️ מקמפל/בונה"
+                if "wa_send" in c:
+                    return "📨 מכין טיוטה"
+                return "⚙️ מריץ פקודה"
+            return "⚙️ " + name
+        if part.get("type") == "thinking":
+            return "🧠 חושב"
+    return None
+
+
+def _run_claude(prompt, model, resume, timeout, on_stage=None):
+    cmd = [shutil.which("claude") or "claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "auto"]
     if model:
         cmd += ["--model", model]
     if CFG.get("strict_mcp"):
@@ -317,8 +352,27 @@ def _run_claude(prompt, model, resume, timeout):
     if resume:
         cmd += ["--resume", resume]
     t0 = time.time()
-    out = subprocess.run(cmd, cwd=HOME, capture_output=True, text=True, encoding="utf-8", timeout=timeout)
-    res = json.loads(out.stdout or "{}")
+    proc = subprocess.Popen(cmd, cwd=HOME, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8")
+    killer = threading.Timer(timeout, proc.kill)
+    killer.start()
+    res = {}
+    try:
+        for line in proc.stdout:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("type") == "result":
+                res = ev
+            elif on_stage:
+                st = _stage_of(ev)
+                if st:
+                    on_stage(st)
+        proc.wait()
+    finally:
+        killer.cancel()
+    if not res:
+        raise RuntimeError("claude returned no result")
     usage = res.get("usage", {})
     with adb() as db:
         db.execute("INSERT INTO claude_runs VALUES (?, ?, ?, ?, ?, ?, ?)", (dt.datetime.now().isoformat(), res.get("session_id"),
@@ -339,22 +393,36 @@ def write_handoff(old_sid):
         log("handoff failed", e)
 
 
-def claude(prompt, model=None, session=True, timeout=900):
+DEV_WORDS = ("גשר", "סוכן", "agent.py", "bridge", "whatsapp-mcp", "דשבורד", "לוח הבקרה", "קוד", "סקריפט", "go build", "release", "models.json", "wa_send", "מודל", "אוטומציה")
+
+
+def is_dev_work(text):
+    """True when the message is about the WhatsApp bridge / agent code itself (not the owner's business work) - the 60-message session cap doesn't apply."""
+    t = (text or "").lower()
+    return any(w.lower() in t for w in DEV_WORDS)
+
+
+def claude(prompt, model=None, session=True, timeout=900, on_stage=None):
     """Run Claude Code headless in HOME. The conversation session is resumed until it is rotated (daily, with hand-off)."""
     sid = kv_get("session_id") if session else None
     started = kv_get("session_started")
     if sid and started and dt.datetime.fromisoformat(started).date() != dt.date.today():  # rotate at midnight
         write_handoff(sid)
         sid = None
+    elif sid and not is_dev_work(prompt) and int(kv_get("session_runs") or 0) >= int(CFG.get("session_max_runs", 60)):  # business work only: long sessions get expensive, rotate with hand-off (no cap while working on the bridge/agent code)
+        write_handoff(sid)
+        sid = None
     try:
-        res = _run_claude(prompt, model, sid, timeout)
+        res = _run_claude(prompt, model, sid, timeout, on_stage)
     except Exception as e:
         log("claude failed", e)
         return None
     if session and res.get("session_id"):
         if res["session_id"] != kv_get("session_id"):
             kv_set("session_started", dt.datetime.now().isoformat())
+            kv_set("session_runs", "0")
         kv_set("session_id", res["session_id"])
+        kv_set("session_runs", str(int(kv_get("session_runs") or 0) + 1))
     return res.get("result")
 
 
@@ -388,14 +456,150 @@ def send_outbox(since):
             shutil.move(p, os.path.join(done, f"{dt.datetime.now():%Y%m%d_%H%M%S}_{f}"))
 
 
+MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_override.json")
+MODELS = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "models.json"), encoding="utf-8"))
+
+
+def get_override():
+    """Model forced by the owner (WhatsApp /מודל or the dashboard), or None for automatic routing."""
+    try:
+        o = json.load(open(MODEL_FILE, encoding="utf-8"))
+        if o.get("model") in (None, "", "auto"):
+            return None
+        if o.get("until") and o["until"] < dt.datetime.now().isoformat(timespec="seconds"):
+            return None
+        return o["model"]
+    except Exception:
+        return None
+
+
+def set_override(model, hours=None):
+    until = (dt.datetime.now() + dt.timedelta(hours=hours)).isoformat(timespec="seconds") if hours else ""
+    json.dump({"model": model, "until": until}, open(MODEL_FILE, "w", encoding="utf-8"))
+
+
+def models_guide():
+    cur = get_override() or "auto"
+    lines = [f"*המודל כרגע: {MODELS[cur]['he']}*", ""]
+    for k, m in MODELS.items():
+        lines.append(f"{'👉 ' if k == cur else ''}*{m['he']}* — {m['cost']}\n{m['tip']}\nפקודה: {m['cmd']}")
+    lines.append("\nאפשר להוסיף \"שעה\" כדי שהבחירה תחזור לאוטו אחרי שעה: /מודל opus שעה. מצב הסשן: /סשן, סשן חדש: /סשן חדש.")
+    return "\n".join(lines)
+
+
+def recommend(text, used, failed):
+    """Advice only (never switches by itself): which model fits this kind of request. Returns (model, reason) or None."""
+    t = text.lstrip("!").strip()
+    hard = any(w in t for w in ("ארכיטקטור", "אפיון", "תכנן", "באג", "לא עובד", "נכשל", "שוב לא", "refactor"))
+    code = any(w in t for w in ("קוד", "agent.py", "הגשר", "סקריפט", "קמפל", "גיט", "release"))
+    if failed >= 2 or hard:
+        want, why = "opus", "משימה מורכבת או כמה כישלונות ברצף"
+    elif code:
+        want, why = "sonnet", "עבודה על קוד"
+    elif len(t) < 60 and used in ("opus", "fable"):
+        want, why = "haiku", "שאלה קלה, אין צורך במודל יקר"
+    else:
+        return None
+    if want == used or (want == "sonnet" and used in ("opus", "fable")) or (want == "opus" and used == "fable"):
+        return None
+    return want, why
+
+
 def pick_model(text):
     """Cost routing: Haiku for short lookups/updates, Sonnet for anything heavier (config: light_model / claude_model)."""
+    forced = get_override()
+    if forced:
+        return forced
+    s = text.lstrip()
+    if s.startswith("!!") and not s.startswith("!!!"):  # "!!" = this one message on the strongest model (owner request 07.11)
+        return CFG.get("deep_model") or "opus"
     t = text.lstrip("!").strip()
+    deep_words = ("נתח לעומק", "ניתוח מעמיק", "תכנן", "תכנון", "ארכיטקטורה", "החלטה", "תחליט", "השווה בין", "בדוק לעומק")
+    if CFG.get("deep_model") and any(w in t for w in deep_words):
+        return CFG["deep_model"]
     heavy_words = ("תמלל", "סכם", "סיכום", "נתח", "ניתוח", "דוח", "דו\"ח", "אקסל", "קובץ", "תקן", "קוד", "סקריפט", "הגדרות",
                    "שלח ל", "טיוטה", "מייל", "הצעת", "השווה", "תכנן", "למה", "בדוק לעומק", "ערוך", "תוסיף", "תשנה", "תעדכן את הקוד")
     heavy = len(t) > 140 or T["attached"].split("{")[0] in text or any(w in t for w in heavy_words)
     light, strong = CFG.get("light_model") or "haiku", CFG.get("claude_model") or "sonnet"
     return strong if heavy else light
+
+
+class StatusMsg:
+    """One WhatsApp message that is edited while Claude works (stage + elapsed time), then removed when the answer is sent."""
+    def __init__(self, model):
+        self.model, self.stage, self.mid, self.t0, self.done = model, "🧠 מתחיל", None, time.time(), threading.Event()
+        self.timer = threading.Timer(8, self._start)
+        self.timer.start()
+
+    def set_stage(self, st):
+        self.stage = st
+
+    def _text(self):
+        e = int(time.time() - self.t0)
+        return CFG["reply_prefix"] + italic(f"⏳ {self.stage} · {e // 60}:{e % 60:02d} · {self.model}")
+
+    def _start(self):
+        if self.done.is_set():
+            return
+        text = self._text()
+        send(CFG["claude_group"], text)
+        for _ in range(8):
+            try:
+                with mdb() as db:
+                    r = db.execute("SELECT id FROM messages WHERE chat_jid = ? AND is_from_me = 1 AND content = ? ORDER BY timestamp DESC LIMIT 1",
+                                   (CFG["claude_group"], text)).fetchone()
+                if r:
+                    self.mid = r[0]
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
+        last = text
+        while self.mid and not self.done.wait(10):
+            new = self._text()
+            if new != last:
+                try:
+                    bridge("/edit_message", {"jid": CFG["claude_group"], "id": self.mid, "text": new}, timeout=20)
+                    last = new
+                except Exception as e:
+                    log("status edit failed", e)
+        if self.done.is_set() and self.mid:
+            try:
+                bridge("/delete_message", {"jid": CFG["claude_group"], "id": self.mid}, timeout=20)
+            except Exception as e:
+                log("status delete failed", e)
+
+    def finish(self):
+        self.done.set()
+        self.timer.cancel()
+
+
+def owner_command(text):
+    """Slash commands answered locally (no Claude run, no cost). Returns reply text or None."""
+    m = re.match(r"^/(מודל|model|מודלים|סשן|session)\s*(.*)$", text.strip(), re.S)
+    if not m:
+        return None
+    cmd, arg = m.group(1), m.group(2).strip().lower()
+    if cmd in ("סשן", "session"):
+        sid = kv_get("session_id")
+        if arg in ("חדש", "new", "reset"):
+            if sid:
+                write_handoff(sid)
+            kv_set("session_id", "")
+            kv_set("session_runs", "0")
+            return "🔄 הסשן נסגר (נכתב handoff.md). ההודעה הבאה פותחת שיחה חדשה עם הסיכום."
+        fresh = CFG.get("fresh_sessions")
+        return (f"סשן: {'נקי לכל הודעה (fresh_sessions)' if fresh else 'רציף'} · הודעות בסשן: {kv_get('session_runs') or 0}"
+                f" מתוך {CFG.get('session_max_runs', 60)} (אז מתחלף עם סיכום) · התחיל: {(kv_get('session_started') or '-')[:16]}")
+    if not arg:
+        return models_guide()
+    parts = arg.replace("שעה", "hour").split()
+    name = {"אוטו": "auto"}.get(parts[0], parts[0])
+    if name not in MODELS:
+        return "לא מכיר את המודל הזה. אפשרויות: " + ", ".join(MODELS) + "\n\n" + models_guide()
+    hours = 1 if "hour" in parts[1:] else None
+    set_override(name, hours)
+    return f"✅ המודל הוחלף ל-*{MODELS[name]['he']}*{' לשעה' if hours else ''} ({MODELS[name]['cost']}). חזרה לאוטו: /מודל אוטו"
 
 
 def command_worker():
@@ -408,6 +612,13 @@ def command_worker():
             continue
         cid, mid, text, when = row
         try:
+            local = owner_command(text)
+            if local is not None:
+                reply(local, quoted=mid)
+                react(mid, "✅")
+                with adb() as db:
+                    db.execute("UPDATE commands SET status = 'done', answered = ? WHERE id = ?", (dt.datetime.now().isoformat(), cid))
+                continue
             budget = float(CFG.get("daily_budget_usd", 5))
             spent = spent_today()
             if text.lstrip().startswith("!!!"):  # lift the cap for an hour
@@ -424,13 +635,20 @@ def command_worker():
                 prompt = T["prompt"].format(owner=OWNER, when=when, text=text.lstrip("!").strip())
                 model = pick_model(text)
                 started = time.time()
-                progress = threading.Timer(45, lambda: reply(T["working"]))
-                progress.start()
+                status = StatusMsg(model)
                 try:
-                    answer = claude(prompt, model=model, session=not CFG.get("fresh_sessions"))
+                    answer = claude(prompt, model=model, session=not CFG.get("fresh_sessions"), on_stage=status.set_stage)
                 finally:
-                    progress.cancel()
-                reply(answer or T["failed"], quoted=mid if CFG.get("quote_replies", True) else None)
+                    status.finish()
+                streak = 0 if answer else int(kv_get("fail_streak") or 0) + 1
+                kv_set("fail_streak", str(streak))
+                kv_set("last_model", model)
+                rec = recommend(text, model, streak)
+                kv_set("last_recommend", json.dumps({"model": rec[0], "why": rec[1], "at": dt.datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False) if rec else "")
+                out = answer or T["failed"]
+                if rec:
+                    out += f"\n\n💡 כדאי לעבור ל-{MODELS[rec[0]]['he']} ({rec[1]}). פקודה: {MODELS[rec[0]]['cmd']}"
+                reply(out, quoted=mid if CFG.get("quote_replies", True) else None)
                 send_outbox(started)
                 react(mid, "✅")
         except Exception:
@@ -496,6 +714,25 @@ def update_check():
         reply(T["update"].format(latest=res["latest"], current=res["current"], notes=(res.get("notes") or "")[:800]))
 
 
+def group_check():
+    """Daily: ask WhatsApp for the control group's current name, compare with the bridge's stored name,
+    let the bridge heal the stored name, and tell the owner only if something was wrong or changed."""
+    jid = CFG["claude_group"]
+    try:
+        res = bridge("/group_info", {"jid": jid}, timeout=60)
+    except Exception as e:
+        log("group_check: bridge unreachable", e)
+        return
+    if not res.get("success"):
+        log("group_check failed:", res)
+        reply(f"בדיקה יומית של שם הקבוצה נכשלה: {res.get('error') or res.get('message') or 'שגיאה לא ידועה'}")
+        return
+    name, stored = res.get("name", ""), res.get("stored_name", "")
+    log(f"group_check: live={name!r} stored={stored!r} healed={res.get('healed')}")
+    if res.get("healed"):
+        reply(f"שם הקבוצה השתנה ל-\"{name}\". עדכנתי את הגשר (היה רשום \"{stored}\"). המזהה לא השתנה, והחיבור תקין.")
+
+
 # ---------- plugins ----------
 # A plugin is a Python file with setup(agent). It may register:
 #   agent.on_message(fn(row))                    called for every new message (row as in sweep())
@@ -504,7 +741,7 @@ def update_check():
 #   agent.background(fn)                         long-running thread
 #   agent.manual(name, fn)                       `agent.py <name>` on the command line
 
-_hooks, _periodic, _daily, _threads, _manual = [], [], [], [], {"backup": backup, "update_check": update_check}
+_hooks, _periodic, _daily, _threads, _manual = [], [], [], [], {"backup": backup, "update_check": update_check, "group_check": group_check}
 on_message = _hooks.append
 background = _threads.append
 every = lambda minutes, key, fn: _periodic.append((minutes, key, fn))
@@ -645,16 +882,51 @@ def watchdog():
         time.sleep(60)
 
 
+def reminders_check():
+    """Fires due reminders into the control group (owner only). kind 'time': a plain reminder.
+    kind 'noreply': fires only if nobody wrote in that chat since ref_ts (otherwise it is closed quietly)."""
+    now = dt.datetime.now().astimezone()
+    with adb() as db:
+        rows = db.execute("SELECT id, kind, text, due, chat_jid, ref_ts FROM reminders WHERE status='active' AND due <= ?",
+                          (now.isoformat(timespec="seconds"),)).fetchall()
+    for rid, kind, text, due, chat, ref in rows:
+        late = ""
+        try:
+            mins = int((now - dt.datetime.fromisoformat(due)).total_seconds() // 60)
+            if mins > 10:
+                late = f" (באיחור של {mins} דק')" if LANG == "he" else f" ({mins} min late)"
+        except ValueError:
+            pass
+        if kind == "noreply":
+            try:
+                with mdb() as m:
+                    n = m.execute("SELECT COUNT(*) FROM messages WHERE chat_jid=? AND is_from_me=0 AND datetime(timestamp) > datetime(?)",
+                                  (chat, ref)).fetchone()[0]
+            except Exception:
+                n = 0
+            if n:
+                with adb() as db:
+                    db.execute("UPDATE reminders SET status='answered', fired=? WHERE id=?", (now.isoformat(timespec="seconds"), rid))
+                continue
+        head = "⏰ תזכורת" if LANG == "he" else "⏰ Reminder"
+        reply(f"{head} #{rid}{late}: {text}")
+        with adb() as db:
+            db.execute("UPDATE reminders SET status='done', fired=? WHERE id=?", (now.isoformat(timespec="seconds"), rid))
+
+
 def scheduler():
     while True:
         now = dt.datetime.now()
         today = now.date().isoformat()
         try:
             kv_set("heartbeat", now.isoformat())
-            for at, key, fn in [(CFG["backup_time"], "backup", backup), (CFG.get("update_check_time", "09:00"), "update_check", update_check)] + _daily:
+            for at, key, fn in [(CFG["backup_time"], "backup", backup), (CFG.get("update_check_time", "09:00"), "update_check", update_check), (CFG.get("group_check_time", "10:00"), "group_check", group_check)] + _daily:
                 if now.strftime("%H:%M") >= at and kv_get(f"day:{key}") != today:
                     kv_set(f"day:{key}", today)
                     work.put(fn)
+            if kv_get("at:reminders") != now.strftime("%Y%m%d%H%M"):
+                kv_set("at:reminders", now.strftime("%Y%m%d%H%M"))
+                work.put(reminders_check)
             for minutes, key, fn in _periodic:
                 last = kv_get(f"at:{key}")
                 if not last or now - dt.datetime.fromisoformat(last) > dt.timedelta(minutes=minutes):

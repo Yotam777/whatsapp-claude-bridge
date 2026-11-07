@@ -456,3 +456,15 @@ ctx.addEventListener("click", async e => {
   if (cmd === "copymsg" && ctxBubble) { await copyText(msgText(ctxBubble)); toast(L("ההודעה הועתקה", "Message copied")); }
   if (cmd === "quote" && ctxBubble) { const t = msgText(ctxBubble); say.value = (say.value ? say.value + "\n" : "") + t; grow(); say.focus(); }
 });
+
+// ---- model box: minimize (remembered); chat card height = window below its top, so the input box is always visible ----
+try { if (localStorage.getItem("wa-dash-mb-min") === "1") $("modelBox").classList.add("min"); } catch (e) {}
+const mbLabel = () => { const m = $("modelBox").classList.contains("min"); $("mbToggle").textContent = m ? "▸ הרחב" : "▾ מזער"; $("mbToggle").setAttribute("aria-expanded", !m); };
+$("mbToggle").onclick = () => { $("modelBox").classList.toggle("min"); try { localStorage.setItem("wa-dash-mb-min", $("modelBox").classList.contains("min") ? "1" : "0"); } catch (e) {} mbLabel(); };
+mbLabel();
+function fitChat() {
+  const card = document.querySelector(".chat-card"); if (!card) return;
+  const top = card.getBoundingClientRect().top + window.scrollY;
+  document.documentElement.style.setProperty("--chat-top", Math.round(top) + "px");
+}
+window.addEventListener("resize", fitChat); setTimeout(fitChat, 300); setTimeout(fitChat, 1500);

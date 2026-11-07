@@ -87,7 +87,7 @@ hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0 8px; }
 .rail { display: grid; gap: 10px; }
 
 /* chat card */
-.chat-card { display: flex; flex-direction: column; height: calc(100vh - 168px); min-height: 360px; }
+.chat-card { display: flex; flex-direction: column; height: calc(100vh - var(--chat-top, 260px) - 12px); min-height: 380px; }
 .chat-card .card-head { flex: none; }
 .today-btn { margin-inline-start: auto; display: inline-flex; align-items: center; gap: 8px; font: inherit; font-size: .85rem; font-weight: 700; color: var(--text); background: var(--surface-2); border: 1px solid var(--line); border-radius: 10px; padding: 5px 12px; cursor: pointer; }
 .today-btn:hover { border-color: var(--brand); }
@@ -255,10 +255,15 @@ details.item > summary::-webkit-details-marker { display: none; }
 @media (max-width: 1000px) { .chat-top { flex-direction: column; } .model-box { width: auto; } }
 
 /* chat with the model box on its left (top) */
-.chat-row { flex: 1; min-height: 0; display: grid; grid-template-columns: 1fr 290px; gap: 10px; align-items: start; }
-.chat-row .chat { height: 100%; }
-.chat-row .model-box { align-self: start; }
-@media (max-width: 1000px) { .chat-row { grid-template-columns: 1fr; } .chat-row .model-box { order: -1; } }
+/* the chat fills the whole area (also under the model box); the model box floats over its top-left corner */
+.chat-row { flex: 1; min-height: 0; position: relative; display: flex; }
+.chat-row .chat { flex: 1; min-height: 0; padding-top: 10px; }
+.chat-row .model-box { position: absolute; top: 8px; left: 14px; z-index: 3; box-shadow: 0 6px 18px rgba(16, 24, 40, .14); }
+.model-box .mb-toggle { all: unset; cursor: pointer; color: var(--muted); font-size: .8rem; padding: 0 4px; }
+.model-box.min { width: auto; padding: 4px 10px; }
+.model-box.min > :not(.card-head) { display: none; }
+.model-box.min .card-head { margin: 0; }
+@media (max-width: 1000px) { .chat-row .model-box { position: static; width: auto; margin-bottom: 8px; } .chat-row { flex-direction: column; } }
 /* the status message (thinking / git / running…) stays one compact bubble inside the conversation */
 .bubble.status { font-size: .82rem; padding: 6px 10px 4px; max-width: 60%; }
 .bubble.status .st-head { font-weight: 600; }

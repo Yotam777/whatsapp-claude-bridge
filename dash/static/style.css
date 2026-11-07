@@ -209,3 +209,11 @@ details.more summary { cursor: pointer; font-size: .82rem; font-weight: 600; col
 .item-body { border-inline-start: 3px solid var(--line); }
 .drawer { width: min(560px, 100vw); }
 .meter.hot span { background: var(--bad); }
+
+.search { width: 100%; padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--text); font: inherit; }
+.search:focus { outline: 2px solid var(--focus); outline-offset: 1px; }
+details.item > summary { cursor: pointer; list-style: none; }
+details.item > summary::-webkit-details-marker { display: none; }
+.msg-row { display: grid; grid-template-columns: 42px auto 1fr; gap: 8px; font-size: .86rem; padding: 4px 0; border-top: 1px dashed var(--line); align-items: baseline; }
+.msg-row span:last-child { white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg-row.solo { grid-template-columns: 42px 1fr; }

@@ -128,9 +128,10 @@ def data():
         "policy": b.get("policy") if "policy" in b else local_policy(),
         "conn_log": rows(p["msg"], "SELECT at, event FROM (SELECT at, event FROM conn_log WHERE at <= ? ORDER BY at DESC LIMIT 1) "
                                    "UNION ALL SELECT at, event FROM conn_log WHERE at > ? ORDER BY at", (day0, day0)),
-        "received": [dict(r, sender=label(r["sender"]), chat=label(r["chat_jid"])) for r in
-                     rows(p["msg"], "SELECT chat_jid, sender, timestamp, content, media_type FROM messages WHERE is_from_me = 0 "
-                                    "AND substr(timestamp,1,10) = ? ORDER BY timestamp DESC LIMIT 60", (today,))],
+        "received": [dict(r, sender=label(r["sender"]), chat=nm.get(str(r["chat_jid"]).split("@")[0]) or r["chat_name"] or label(r["chat_jid"]), group=str(r["chat_jid"]).endswith("@g.us")) for r in
+                     rows(p["msg"], "SELECT m.chat_jid, m.sender, m.timestamp, m.content, m.media_type, c.name AS chat_name FROM messages m "
+                                    "LEFT JOIN chats c ON c.jid = m.chat_jid WHERE m.is_from_me = 0 "
+                                    "AND substr(m.timestamp,1,10) = ? ORDER BY m.timestamp DESC LIMIT 300", (today,))],
         "runs_today": rows(p["agent"], "SELECT * FROM claude_runs WHERE substr(at,1,10) = ? ORDER BY at DESC LIMIT 60", (today,)),
         "hourly": hourly,
         "received_today": (rows(p["msg"], "SELECT count(*) n FROM messages WHERE is_from_me = 0 AND substr(timestamp,1,10) = ?", (today,)) or [{"n": 0}])[0]["n"],

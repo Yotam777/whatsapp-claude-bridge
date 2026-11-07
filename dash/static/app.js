@@ -129,7 +129,8 @@ $("todayBtn").onclick = () => setToday(!todayOpen);
 setToday(todayOpen);
 
 // ---- detail drawer ----
-let drawerKind = null, sentAll = false;
+let recvFocus = false;
+let drawerKind = null, sentAll = false, recvQ = "", recvChat = "";
 const DRAWERS = () => ({
   drafts: L("📝 טיוטות", "📝 Drafts"), sent: L("📤 נשלחו", "📤 Sent"), received: L("📥 התקבלו", "📥 Received"),
   tr: L("🎙️ תמלולים", "🎙️ Transcripts"), cost: L("💲 עלות", "💲 Cost"),
@@ -175,10 +176,18 @@ function drawerContent(kind, d) {
       : empty(sentAll ? L("אין שליחות", "Nothing sent") : L("לא נשלחה אף הודעה לאנשים אחרים — הכול טיוטות 👍", "Nothing sent to others — drafts only 👍")));
   }
   if (kind === "received") {
-    const m = d.received || [], MT = { audio: L("הודעה קולית", "voice note"), image: L("תמונה", "image"), document: L("קובץ", "file"), video: L("וידאו", "video") };
-    return m.length ? m.map(r => `<article class="item"><div class="item-head"><strong>${esc(r.sender)}</strong><span class="muted" style="font-size:.78rem">${fmt(r.timestamp)}</span></div>
-      ${r.chat && r.chat !== r.sender ? `<span class="muted" style="font-size:.78rem">${esc(r.chat)}</span>` : ""}
-      <div class="item-body">${esc(r.content || (r.media_type ? "[" + (MT[r.media_type] || r.media_type) + "]" : ""))}</div></article>`).join("") : empty(L("לא התקבלו הודעות היום", "No messages received today"));
+    const MT = { audio: L("🎙️ הודעה קולית", "🎙️ voice note"), image: L("🖼️ תמונה", "🖼️ image"), document: L("📎 קובץ", "📎 file"), video: L("🎬 וידאו", "🎬 video") };
+    const all = d.received || [], q = recvQ.trim().toLowerCase();
+    const txt = r => r.content || (r.media_type ? MT[r.media_type] || r.media_type : "");
+    const hit = r => !q || [r.sender, r.chat, txt(r)].some(x => String(x || "").toLowerCase().includes(q));
+    const chats = {}; all.forEach(r => { const k = r.chat || "?"; (chats[k] = chats[k] || { n: 0, group: r.group, last: r.timestamp, items: [] }).n++; if (hit(r) && (!recvChat || recvChat === k)) chats[k].items.push(r); });
+    const order = Object.entries(chats).sort((x, y) => String(y[1].last).localeCompare(String(x[1].last)));
+    const chips = `<div class="sum-row"><button class="btn small${recvChat ? "" : " primary"}" data-chat="">${L("כל השיחות", "All chats")} · ${all.length}</button>` +
+      order.slice(0, 12).map(([k, v]) => `<button class="btn small${recvChat === k ? " primary" : ""}" data-chat="${esc(k)}">${v.group ? "👥 " : ""}${esc(k)} · ${v.n}</button>`).join("") + `</div>`;
+    const search = `<input id="recvSearch" class="search" type="search" value="${esc(recvQ)}" placeholder="${L("חיפוש לפי שם, שיחה או מילה…", "Search name, chat or word…")}" aria-label="${L("חיפוש בהודעות שהתקבלו", "Search received")}">`;
+    const groups = order.filter(([, v]) => v.items.length).map(([k, v]) => `<details class="item" open><summary class="item-head"><span class="avatar">${v.group ? "👥" : esc(String(k).charAt(0))}</span><div class="who-col"><strong>${esc(k)}</strong><span class="muted" style="font-size:.78rem">${v.items.length} ${L("הודעות", "messages")} · ${L("אחרונה", "last")} ${hhmm(toDate(v.last))}</span></div></summary>
+      ${v.items.map(r => `<div class="msg-row${v.group ? "" : " solo"}"><span class="muted">${hhmm(toDate(r.timestamp))}</span>${v.group ? `<strong>${esc(r.sender)}</strong>` : ""}<span>${esc(txt(r))}</span></div>`).join("")}</details>`).join("");
+    return search + chips + (groups || empty(all.length ? L("אין תוצאות לחיפוש", "No matches") : L("לא התקבלו הודעות היום", "No messages received today")));
   }
   if (kind === "tr") {
     const t = d.transcripts || [];
@@ -203,6 +212,9 @@ function renderDrawer(reset) {
   $("drawerTabs").innerHTML = Object.entries(names).map(([k, n]) => `<button role="tab" aria-selected="${k === drawerKind}" data-k="${k}">${n}</button>`).join("");
   $("drawerTabs").querySelectorAll("button").forEach(b => b.onclick = () => { drawerKind = b.dataset.k; renderDrawer(true); });
   body.innerHTML = drawerContent(drawerKind, last);
+  body.querySelectorAll("[data-chat]").forEach(b => b.onclick = () => { recvChat = b.dataset.chat; renderDrawer(true); });
+  const rs = $("recvSearch"); if (rs) { if (recvFocus) { rs.focus(); rs.setSelectionRange(rs.value.length, rs.value.length); }
+    rs.oninput = () => { recvQ = rs.value; recvFocus = true; renderDrawer(false); }; rs.onblur = () => { recvFocus = false; }; }
   body.querySelectorAll("[data-sent]").forEach(b => b.onclick = () => { sentAll = b.dataset.sent === "1"; renderDrawer(true); });
   body.scrollTop = reset ? 0 : top;
   body.querySelectorAll("[data-approve]").forEach(b => b.onclick = () => {

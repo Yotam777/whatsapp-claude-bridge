@@ -232,3 +232,6 @@ details.item > summary::-webkit-details-marker { display: none; }
 .chat[data-bg="mint"] { background: #e8f5ee; }
 .chat[data-bg="navy"] { background: #032331; }
 .chat[data-bg="dots"] { background: var(--surface-2) radial-gradient(var(--line) 1px, transparent 1px) 0 0 / 14px 14px; }
+
+.bubble.outbox.sending { opacity: .75; }
+.bubble.outbox .meta { font-style: italic; }

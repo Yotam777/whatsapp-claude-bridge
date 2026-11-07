@@ -129,14 +129,29 @@ const say = $("say");
 const grow = () => { say.style.height = "auto"; say.style.height = Math.min(140, say.scrollHeight) + "px"; };
 say.addEventListener("input", grow);
 say.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("composer").requestSubmit(); } });
+let outbox = [];  // messages typed here and not yet seen in the WhatsApp conversation: shown at once as "sending…"
+let sending = false;
 $("composer").onsubmit = async e => {
   e.preventDefault();
-  const text = say.value.trim(); if (!text) return;
-  $("sayBtn").disabled = true;
-  const j = await act({ do: "say", text });
-  $("sayBtn").disabled = false;
-  if (j && !j.error) { say.value = ""; grow(); toast(L("נשלח לשיחה", "Sent to the conversation")); setTimeout(load, 1500); setTimeout(load, 6000); }
+  const text = say.value.trim(); if (!text || sending) return;
+  sending = true;
+  const item = { text, at: new Date().toISOString(), state: "sending" };
+  outbox.push(item); say.value = ""; grow(); drawOutbox(true);
+  try {
+    const j = await (await fetch("/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ do: "say", text }) })).json();
+    item.state = j && !j.error ? "sent" : "failed"; item.err = j && j.error;
+  } catch (err) { item.state = "failed"; item.err = String(err); }
+  sending = false;
+  if (item.state === "failed") { toast(L("השליחה נכשלה — הטקסט חזר לתיבה", "Send failed — text is back in the box")); outbox = outbox.filter(x => x !== item); if (!say.value) { say.value = text; grow(); } }
+  drawOutbox(true); setTimeout(load, 1500); setTimeout(load, 6000);
 };
+function drawOutbox(scroll) {
+  const chat = $("chat"); chat.querySelectorAll(".bubble.outbox").forEach(x => x.remove());
+  const shown = new Set((last && last.conversation || []).filter(m => !m.tool).map(m => (m.content || "").trim()));
+  outbox = outbox.filter(x => !(x.state === "sent" && shown.has(x.text)) && Date.now() - Date.parse(x.at) < 5 * 60000);
+  outbox.forEach(x => chat.insertAdjacentHTML("beforeend", `<div class="bubble me outbox ${x.state}"><span class="who">${L("אתה", "You")}</span>${esc(x.text)}<span class="meta">${x.state === "sending" ? L("⏳ שולח…", "⏳ sending…") : L("✓ נשלח", "✓ sent")}</span></div>`));
+  if (scroll) chat.scrollTop = chat.scrollHeight;
+}
 
 // ---- today panel (collapsed by default; opens at the expense of the chat height) ----
 let todayOpen = false;
@@ -331,6 +346,7 @@ function render(d) {
   const MT = { audio: L("הודעה קולית", "voice note"), image: L("תמונה", "image"), document: L("קובץ", "file"), video: L("וידאו", "video") };
   chat.innerHTML = (d.conversation || []).map(m => `<div class="bubble ${m.tool ? "tool" : "me"}"><span class="who">${m.tool ? L("🤖 הכלי", "🤖 Tool") : L("אתה", "You")}</span>${wa(m.content || (m.media_type ? "[" + (MT[m.media_type] || m.media_type) + "]" : ""))}<span class="meta">${fmt(m.timestamp)}</span></div>`).join("")
     || `<p class="empty">${L("עדיין אין שיחה", "No conversation yet")}</p>`;
+  drawOutbox(false);
   if (atBottom || !chat._init) { chat.scrollTop = chat.scrollHeight; chat._init = true; }
   const pc = $("pendingChip"); pc.hidden = !a.pending; pc.textContent = a.pending ? L(`${a.pending} ממתינות לתשובה`, `${a.pending} awaiting an answer`) : "";
   // send mode: drafts only, no autonomous sending

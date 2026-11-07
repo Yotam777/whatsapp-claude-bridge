@@ -29,7 +29,7 @@ jobs:
           go-version-file: whatsapp-bridge/go.mod
           cache-dependency-path: whatsapp-bridge/go.sum
 
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.3
 
       - name: Bridge — vet, test, build
         working-directory: whatsapp-bridge

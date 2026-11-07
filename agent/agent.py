@@ -131,7 +131,7 @@ def adb():
         for rowid, sess, cost, cum in db.execute("SELECT rowid, session, cost, cum FROM claude_runs ORDER BY at").fetchall():
             if cum is None:
                 p = prev.get(sess)
-                db.execute("UPDATE claude_runs SET cost = ?, cum = ? WHERE rowid = ?", (cost - p if p is not None and cost >= p else cost, cost, rowid))
+                db.execute("UPDATE claude_runs SET cost = ?, cum = ? WHERE rowid = ?", (run_cost(cost, p), cost, rowid))
                 cum = cost
             prev[sess] = cum
         db.commit()
@@ -140,6 +140,12 @@ def adb():
 
 
 _runs_migrated = False
+
+
+def run_cost(cum, prev):
+    """This run's cost from Claude's cumulative session figure and the previous run's figure (None = first run of the session).
+    A lower figure than before means a new count started (e.g. the session was rotated), so it is taken as is."""
+    return cum - prev if prev is not None and cum >= prev else cum
 
 
 def kv_get(k, default=None):
@@ -449,7 +455,7 @@ def _run_claude(prompt, model, resume, timeout, on_stage=None):
         cum = float(res.get("total_cost_usd") or 0)
         prev = db.execute("SELECT cum FROM claude_runs WHERE session = ? AND cum IS NOT NULL ORDER BY at DESC LIMIT 1",
                           (res.get("session_id"),)).fetchone() if resume else None
-        cost = cum - prev[0] if prev and prev[0] is not None and cum >= prev[0] else cum
+        cost = run_cost(cum, prev[0] if prev else None)
         db.execute("INSERT INTO claude_runs (at, session, cost, input_tokens, output_tokens, seconds, ok, model, cum) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                    (dt.datetime.now().isoformat(), res.get("session_id"), cost, usage.get("input_tokens", 0),
                     usage.get("output_tokens", 0), time.time() - t0, 0 if res.get("is_error") else 1, model or CFG.get("claude_model") or "", cum))

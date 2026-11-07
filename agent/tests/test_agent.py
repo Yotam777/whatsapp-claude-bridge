@@ -87,3 +87,31 @@ def test_italic_marks_tool_messages(agent):
     assert mod.italic("שלום\n\n  • נקודה ") == "_שלום_\n\n  _• נקודה_"
     assert mod.italic("https://x.com/a_b") == "https://x.com/a_b"  # underscores: left as is
     assert mod.italic("```code```") == "```code```"
+
+
+def test_run_cost_from_cumulative_session_figure(agent):
+    mod, _ = agent
+    assert mod.run_cost(0.4, None) == 0.4             # first run of a session
+    assert round(mod.run_cost(8.65, 8.63), 2) == 0.02  # resumed session: only this run's share
+    assert mod.run_cost(0.3, 8.0) == 0.3               # lower figure = a new count
+
+
+def test_old_cumulative_rows_are_converted(agent, tmp_path):
+    mod, _ = agent
+    with mod.adb() as db:
+        db.execute("UPDATE claude_runs SET cum = NULL")
+        for at, cost in (("2026-11-07T10:00", 5.0), ("2026-11-07T10:05", 5.5), ("2026-11-07T10:10", 6.0)):
+            db.execute("INSERT INTO claude_runs (at, session, cost, cum) VALUES (?, 's1', ?, NULL)", (at, cost))
+    mod._runs_migrated = False
+    with mod.adb() as db:
+        costs = [round(r[0], 2) for r in db.execute("SELECT cost FROM claude_runs WHERE session = 's1' ORDER BY at")]
+    assert costs == [5.0, 0.5, 0.5]
+
+
+def test_restart_command_and_strong_model_prefix(agent):
+    mod, _ = agent
+    assert mod.owner_command("/הפעל מחדש") and mod.RESTART_REQ.is_set()
+    mod.RESTART_REQ.clear()
+    mod.CFG["deep_model"] = "opus"
+    assert mod.pick_model("!! תבדוק לעומק") == "opus"
+    assert mod.pick_model("!!! מה המצב") != "opus" or mod.get_override() == "opus"

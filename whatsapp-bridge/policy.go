@@ -132,6 +132,35 @@ func looksLikeBlock(err error) bool {
 	return false
 }
 
+// draftCardText is the draft card posted in the control group. The approval hint comes first, so it is the first
+// thing seen on a phone: long-press this message → ✅ (or 👍) sends exactly this one message; ❌ cancels.
+func draftCardText(draftID int64, name string, jid types.JID, message, mediaPath string) string {
+	var card strings.Builder
+	num := ""
+	if draftID > 0 {
+		num = fmt.Sprintf(" #%d", draftID)
+	}
+	card.WriteString(fmt.Sprintf("🤖 📝 *טיוטה%s → %s*\n", num, name))
+	card.WriteString("👆 *לאישור: לחיצה ארוכה על ההודעה הזו ← ✅ או 👍* (הודעה אחת, לנמען הזה בלבד) · ❌ לביטול\n")
+	if jid.Server == types.DefaultUserServer {
+		// %20 instead of '+' (safer in wa.me); long links get cut by WhatsApp's link detection, so skip them
+		q := strings.ReplaceAll(url.QueryEscape(message), "+", "%20")
+		if len(q) <= 1200 && mediaPath == "" {
+			card.WriteString("או לשלוח בעצמך — הקישור פותח את השיחה עם הטקסט מוכן:\n")
+			card.WriteString("https://wa.me/" + jid.User + "?text=" + q + "\n")
+		} else {
+			card.WriteString("הטקסט ארוך / יש קובץ — אין קישור אוטומטי (שיחה: https://wa.me/" + jid.User + ")\n")
+		}
+	} else {
+		card.WriteString("(קבוצה / מזהה ללא מספר — אישור ✅ שולח; לשליחה ידנית העתק את הטקסט)\n")
+	}
+	if mediaPath != "" {
+		card.WriteString("📎 הקובץ המצורף מוצג כאן בהודעה נפרדת.\n")
+	}
+	card.WriteString("━━━━━━━━━━\n" + message + "\n━━━━━━━━━━")
+	return card.String()
+}
+
 // makeDraft turns a send into a draft card in the control group instead of sending it.
 func makeDraft(client *whatsmeow.Client, p SendPolicy, jid types.JID, message, mediaPath, quotedID string) (bool, string) {
 	name := jid.User
@@ -152,26 +181,7 @@ func makeDraft(client *whatsmeow.Client, p SendPolicy, jid types.JID, message, m
 			draftID, _ = r.LastInsertId()
 		}
 	}
-	var card strings.Builder
-	card.WriteString(fmt.Sprintf("🤖 📝 *טיוטה ממתינה לשליחה* → %s\n", name))
-	if jid.Server == types.DefaultUserServer {
-		// %20 instead of '+' (safer in wa.me); long links get cut by WhatsApp's link detection, so skip them
-		q := strings.ReplaceAll(url.QueryEscape(message), "+", "%20")
-		if len(q) <= 1200 && mediaPath == "" {
-			card.WriteString("לחץ על הקישור, ההודעה תיפתח מוכנה בשיחה — בדוק ושלח:\n")
-			card.WriteString("https://wa.me/" + jid.User + "?text=" + q + "\n")
-		} else {
-			card.WriteString("הטקסט ארוך / יש קובץ — אין קישור אוטומטי. העתק את הטקסט שמתחת (ולחץ על שם איש הקשר: https://wa.me/" + jid.User + ")\n")
-		}
-	} else {
-		card.WriteString("(קבוצה / מזהה ללא מספר — העתק את הטקסט ושלח ידנית)\n")
-	}
-	if mediaPath != "" {
-		card.WriteString("📎 קובץ מצורף נשלח בנפרד לכאן — העבר אותו ליעד.\n")
-	}
-	card.WriteString("━━━━━━━━━━\n" + message)
-	card.WriteString("\n━━━━━━━━━\nהגב ✅ על ההודעה הזו כדי לשלוח (הודעה אחת, לנמען הזה בלבד) · ❌ לביטול")
-	ok, res := sendWhatsAppMessage(client, p.ControlGroup, card.String(), "")
+	ok, res := sendWhatsAppMessage(client, p.ControlGroup, draftCardText(draftID, name, jid, message, mediaPath), "")
 	if ok && draftID > 0 && globalStore != nil {
 		// remember the card's message id so a ✅ reaction on it can approve exactly this draft
 		var cardID string

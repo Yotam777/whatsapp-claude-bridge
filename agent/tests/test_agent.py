@@ -606,3 +606,37 @@ def test_auto_update_is_scheduled_and_reports(agent, monkeypatch, tmp_path):
     (tmp_path / "update.log").write_text("[x] \u05de\u05e2\u05d3\u05db\u05df 1.0.8 v1.0.9\n[x] \u21a9 back 1.0.8\n", encoding="utf-8")
     mod.report_auto_update()
     assert "נכשל" in calls[-1]
+
+
+def test_tunnel_command_both_ways(agent):
+    mod, _ = agent
+    cmd = mod.tunnel_cmd({"name": "נייח", "url": "http://127.0.0.1:8781", "tunnel": "ybhw"}, ssh="ssh")
+    assert cmd[0] == "ssh" and cmd[-1] == "ybhw" and "-N" in cmd and "BatchMode=yes" in cmd
+    assert cmd[cmd.index("-L") + 1] == "8781:127.0.0.1:8770" and cmd[cmd.index("-R") + 1] == "8781:127.0.0.1:8770"
+    assert mod.peer_port({"url": "http://127.0.0.1:9001"}) == 9001 and mod.peer_port({}) == 8781
+
+
+def test_paused_conversation_keeps_commands_queued(agent, monkeypatch):
+    mod, _ = agent
+    notes = []
+    monkeypatch.setattr(mod, "reply", lambda t, *a, **k: notes.append((mod._ctx.chat, t)))
+    started = []
+    monkeypatch.setattr(mod, "conversation_worker", lambda chat: started.append(chat))
+    mod.enqueue_command("m1", "hello", "2026-11-08 10:00", chat=mod.PRIMARY)
+    mod.kv_set("listen_paused", "2026-11-08T10:00:00")
+    assert mod.listening_paused(mod.PRIMARY)
+    # one dispatcher round, by hand (the loop body)
+    with mod.adb() as db:
+        chats = [r[0] for r in db.execute("SELECT DISTINCT coalesce(chat_jid, ?) FROM commands WHERE status = 'pending'", (mod.PRIMARY,))]
+    for chat in chats:
+        p = mod.listening_paused(chat)
+        if p:
+            mod.pause_notice(chat, p)
+            continue
+        started.append(chat)
+    mod.pause_notice(mod.PRIMARY, "2026-11-08T10:00:00")  # second time: no second note
+    assert started == [] and len(notes) == 1 and "מושהית" in notes[0][1]
+    with mod.adb() as db:
+        assert db.execute("SELECT status FROM commands").fetchall() == [("pending",)], "nothing is lost while paused"
+    mod.kv_set("listen_paused", "")
+    assert not mod.listening_paused(mod.PRIMARY)

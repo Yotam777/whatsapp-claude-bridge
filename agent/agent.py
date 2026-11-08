@@ -1497,9 +1497,35 @@ def conversation_worker(chat):
         _command_signal.set()
 
 
+PAUSE_NOTE_HE = "⏸ ההאזנה מושהית מלוח הבקרה — ההודעה נשמרה ותטופל כשתחודש."
+PAUSE_NOTE_EN = "⏸ Listening is paused from the dashboard — your message is kept and will be handled on resume."
+
+
+def listening_paused(chat):
+    """The owner paused listening in the dashboard: everywhere (kv listen_paused) or in one conversation
+    (kv listen_paused:<chat>). Value = when it was paused ('' = not paused). Commands stay queued, nothing is lost."""
+    return kv_get("listen_paused") or kv_get(K("listen_paused", chat)) or ""
+
+
+def pause_notice(chat, since):
+    """One short note per conversation per pause, so the owner knows why there is no answer yet."""
+    key = K("pause_notice", chat)
+    if kv_get(key) == since:
+        return
+    kv_set(key, since)
+    _ctx.chat, _ctx.src, _ctx.sync = chat, "wa", 0
+    try:
+        reply(PAUSE_NOTE_HE if LANG == "he" else PAUSE_NOTE_EN)
+    except Exception as e:
+        log("pause notice failed", chat, e)
+    finally:
+        _ctx.chat = None
+
+
 def command_worker():
     """Dispatcher: one worker thread per conversation with pending commands (serial within a conversation, parallel
-    across conversations). A requested restart waits until every running answer has been sent."""
+    across conversations). A requested restart waits until every running answer has been sent. Conversations the owner
+    paused in the dashboard are skipped (their commands wait in the queue)."""
     while True:
         try:
             reason = restart_wanted()
@@ -1518,6 +1544,10 @@ def command_worker():
                 with adb() as db:
                     chats = [r[0] for r in db.execute("SELECT DISTINCT coalesce(chat_jid, ?) FROM commands WHERE status = 'pending'", (PRIMARY,))]
                 for chat in chats:
+                    paused = listening_paused(chat)
+                    if paused:
+                        pause_notice(chat, paused)
+                        continue
                     with _workers_lock:
                         if chat in _workers:
                             continue
@@ -1527,6 +1557,83 @@ def command_worker():
             log("dispatcher error", traceback.format_exc())
         _command_signal.wait(3)  # short: the dashboard (a separate process) queues PC messages straight into the table
         _command_signal.clear()
+
+
+# ---------- the other machine: one ssh tunnel both ways (its dashboard here, ours there) ----------
+
+def peer_port(peer):
+    """Local port of a peer's dashboard URL (default 8781)."""
+    m = re.search(r":(\d+)", str(peer.get("url") or "").split("//")[-1])
+    return int(m.group(1)) if m else 8781
+
+
+def tunnel_cmd(peer, ssh="ssh"):
+    """ssh -L <port>→the peer's dashboard, -R <port>→ours, so each machine reaches the other on 127.0.0.1:<port>."""
+    port = peer_port(peer)
+    return [ssh, "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=15",
+            "-L", f"{port}:127.0.0.1:8770", "-R", f"{port}:127.0.0.1:8770", str(peer["tunnel"])]
+
+
+def _kill_old_tunnels():
+    """An ssh left over from a previous agent still holds the ports: stop it (only our tunnels, matched by the forward)."""
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='ssh.exe'\" | Where-Object { $_.CommandLine -like '*127.0.0.1:8770*' -and "
+          "$_.CommandLine -like '* -N *' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
+    try:
+        subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps], capture_output=True, timeout=30, creationflags=NO_WINDOW)
+    except Exception as e:
+        log("old tunnels", e)
+
+
+def tunnel_keeper():
+    """Keeps one ssh tunnel per peer that has "tunnel" (restart with backoff; kv tunnel_off:<name> = switched off from the
+    dashboard). State for the dashboard in kv tunnel:<name>."""
+    peers = [p for p in CFG.get("peers") or [] if p.get("tunnel")]
+    if not peers:
+        return
+    ssh = shutil.which("ssh") or r"C:\Windows\System32\OpenSSH\ssh.exe"
+    _kill_old_tunnels()
+    procs, wait, next_try = {}, {}, {}
+    while True:
+        for p in peers:
+            name = p.get("name") or p["tunnel"]
+            proc = procs.get(name)
+            off = kv_get(f"tunnel_off:{name}") == "1"
+            if off:
+                if proc and proc.poll() is None:
+                    _kill_tree(proc)
+                procs[name] = None
+                kv_set(f"tunnel:{name}", json.dumps({"state": "off", "at": dt.datetime.now().isoformat(timespec="seconds")}))
+                continue
+            if proc and proc.poll() is None:
+                continue
+            if proc is not None:  # it died
+                err = ""
+                try:
+                    err = (proc.stderr.read() or b"").decode("utf-8", "replace")[-200:]
+                except Exception:
+                    pass
+                wait[name] = min(120, max(5, wait.get(name, 5) * 2))
+                next_try[name] = time.time() + wait[name]
+                kv_set(f"tunnel:{name}", json.dumps({"state": "down", "error": err.strip(), "retry_in": wait[name],
+                                                     "at": dt.datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False))
+                procs[name] = None
+                log("tunnel down", name, err.strip()[:120])
+                continue
+            if time.time() < next_try.get(name, 0):
+                continue
+            try:
+                procs[name] = subprocess.Popen(tunnel_cmd(p, ssh), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                               stderr=subprocess.PIPE, creationflags=NO_WINDOW)
+                kv_set(f"tunnel:{name}", json.dumps({"state": "up", "since": dt.datetime.now().isoformat(timespec="seconds")}))
+                wait[name] = 5 if wait.get(name, 5) <= 5 else wait[name]
+            except Exception as e:
+                kv_set(f"tunnel:{name}", json.dumps({"state": "down", "error": str(e)[:200]}, ensure_ascii=False))
+                next_try[name] = time.time() + 60
+        for name, proc in procs.items():  # a tunnel that stayed up a minute resets the backoff
+            if proc and proc.poll() is None:
+                wait[name] = 5
+        time.sleep(10)
 
 
 # ---------- backup ----------
@@ -2227,7 +2334,7 @@ if __name__ == "__main__":
             threading.Thread(target=notify_interrupted, args=(cut,), daemon=True).start()
     except Exception:
         log("mark_interrupted failed", traceback.format_exc())
-    for target in [worker, slow_worker, command_worker, scheduler, event_listener, watchdog] + _threads:
+    for target in [worker, slow_worker, command_worker, scheduler, event_listener, watchdog, tunnel_keeper] + _threads:
         threading.Thread(target=target, daemon=True).start()
     sys.path.insert(0, ROOT)
     from dash import server as dash_server  # control panel, also on http://127.0.0.1:8770

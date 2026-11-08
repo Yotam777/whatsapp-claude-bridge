@@ -36,6 +36,7 @@ def dash(tmp_path, monkeypatch):
     import dash.server as srv
     srv = importlib.reload(srv)
     monkeypatch.setattr(srv, "bridge", lambda path, body=None, timeout=8: {"members": 1, "name": "x"} if path == "/group_info" else {})
+    monkeypatch.setattr(srv, "services", lambda force=False: {"bridge_loop": True, "agent_loop": True, "bridge_proc": True, "agent_proc": True})
     return srv, tmp_path
 
 
@@ -85,3 +86,107 @@ def test_budget_can_be_set_per_group(dash):
     assert srv.conversations()[DEV]["budget_usd"] == 12.5
     assert srv.action({"do": "group_budget", "jid": DEV, "budget": "-1"})["error"]
 
+
+
+def _agent_db(root):
+    return sqlite3.connect(root / "agent" / "agent.db")
+
+
+def test_listening_pause_and_resume(dash):
+    srv, root = dash
+    assert srv.action({"do": "listen_pause"})["ok"] and srv.kv("listen_paused")
+    assert srv.action({"do": "listen_pause", "chat": DEV})["ok"] and srv.kv("listen_paused:" + DEV)
+    srv.action({"do": "listen_resume"})
+    srv.action({"do": "listen_resume", "chat": DEV})
+    assert not srv.kv("listen_paused") and not srv.kv("listen_paused:" + DEV)
+    assert srv.data()["listen_paused"] == ""
+
+
+def test_queue_cancel_retry_clear(dash):
+    srv, root = dash
+    srv.agent_db_rw().close()
+    con = _agent_db(root)
+    con.executemany("INSERT INTO commands (msg_id, text, at, status, chat_jid) VALUES (?, ?, '2026-11-08 10:00', ?, ?)",
+                    [("a", "x", "pending", PRIM), ("b", "y", "interrupted", PRIM), ("c", "z", "running", PRIM), ("d", "w", "waiting_limit", DEV)])
+    con.commit(); con.close()
+    q = {r["id"]: r for r in srv.data()["queue"]}
+    assert {r["status"] for r in q.values()} == {"pending", "interrupted", "running", "waiting_limit"}
+    assert srv.action({"do": "cmd_retry", "id": 2})["ok"]           # interrupted -> pending
+    assert srv.action({"do": "cmd_cancel", "id": 3}).get("error")   # running: use stop
+    assert srv.action({"do": "cmd_cancel", "id": 1})["ok"]
+    assert srv.action({"do": "cmd_clear", "chat": DEV})["cancelled"] == 1
+    st = dict(_agent_db(root).execute("SELECT id, status FROM commands").fetchall())
+    assert st == {1: "cancelled", 2: "pending", 3: "running", 4: "cancelled"}
+
+
+def test_scheduled_and_reminders(dash):
+    srv, root = dash
+    srv.agent_db_rw().close()
+    con = _agent_db(root)
+    con.execute("CREATE TABLE IF NOT EXISTS scheduled_drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id INTEGER, send_at TEXT, status TEXT DEFAULT 'scheduled', chat TEXT, created TEXT, done TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT DEFAULT 'time', text TEXT, due TEXT, chat_jid TEXT, ref_ts TEXT, status TEXT DEFAULT 'active', created TEXT, fired TEXT)")
+    con.execute("INSERT INTO scheduled_drafts (draft_id, send_at) VALUES (7, '2026-11-09T08:00:00')")
+    con.executemany("INSERT INTO reminders (text, due) VALUES (?, '2026-11-09T08:00:00+02:00')", [("a",), ("b",)])
+    con.commit(); con.close()
+    d = srv.data()
+    assert len(d["scheduled"]) == 1 and len(d["reminders"]) == 2
+    assert srv.action({"do": "sched_cancel", "id": 1})["ok"] and srv.data()["scheduled"] == []
+    assert srv.action({"do": "rem_cancel", "id": 1})["ok"]
+    assert srv.action({"do": "rem_snooze", "id": 2, "minutes": 30})["ok"]
+    assert [r["id"] for r in srv.data()["reminders"]] == [2]
+    assert srv.action({"do": "rem_snooze", "id": 2, "minutes": 0}).get("error")
+
+
+def test_settings_validated_and_saved_atomically(dash):
+    srv, root = dash
+    r = srv.action({"do": "settings_save", "values": {"backup_time": "25:00"}})
+    assert r.get("error")
+    r = srv.action({"do": "settings_save", "values": {"backup_time": "02:30", "voice_replies": False, "daily_budget_usd": "15",
+                                                      "permission_mode": "bypassPermissions", "unknown_key": 1}, "restart": True})
+    assert r["ok"]
+    c = json.load(open(root / "agent" / "config.json", encoding="utf-8"))
+    assert c["backup_time"] == "02:30" and c["voice_replies"] is False and c["daily_budget_usd"] == 15.0
+    assert c["permission_mode"] == "bypassPermissions" and "unknown_key" not in c
+    assert (root / "agent" / "restart.request").exists()
+    assert srv.action({"do": "settings_save", "values": {"permission_mode": "everything"}}).get("error")
+    v = srv.data()["settings"]["values"]
+    assert v["backup_time"] == "02:30" and v["total_daily_budget_usd"] == 30.0
+
+
+def test_plugins_toggle_and_disabled_groups(dash):
+    srv, root = dash
+    c = srv.cfg(); c["plugins"] = ["C:/x/p1.py"]; srv.save_cfg(c)
+    assert srv.action({"do": "plugin_toggle", "path": "C:/x/p1.py", "on": False})["ok"]
+    c = srv.cfg()
+    assert c["plugins"] == [] and c["plugins_disabled"] == ["C:/x/p1.py"]
+    assert srv.action({"do": "plugin_toggle", "path": "C:/x/p1.py", "on": True})["ok"] and srv.cfg()["plugins"] == ["C:/x/p1.py"]
+    srv.save_groups_raw({DEV: {"name": "dev", "enabled": False}})
+    assert srv.data()["disabled_groups"] == [{"jid": DEV, "name": "dev"}]
+    assert srv.action({"do": "group_enable", "jid": DEV, "on": True})["ok"] and DEV in srv.conversations()
+
+
+def test_session_new_is_queued_for_the_agent(dash):
+    srv, root = dash
+    assert srv.action({"do": "session_new", "chat": "local"})["ok"]
+    assert _agent_db(root).execute("SELECT text, chat_jid, source FROM commands").fetchall() == [("/סשן חדש", "local", "pc")]
+    assert srv.action({"do": "session_new", "chat": "nope@g.us"}).get("error")
+
+
+def test_peers_save_validate_and_offline_proxy(dash):
+    srv, root = dash
+    assert srv.action({"do": "peers_save", "peers": [{"name": "x", "url": "http://evil.com:80"}]}).get("error")
+    assert srv.action({"do": "peers_save", "peers": [{"name": "נייח", "url": "http://127.0.0.1:59999", "tunnel": "ybhw"}]})["ok"]
+    assert srv.peers() == [{"name": "נייח", "url": "http://127.0.0.1:59999", "tunnel": "ybhw"}]
+    r = srv.peer_call(0, "/brief", timeout=1)
+    assert r["offline"]
+    st = srv.peers_status()
+    assert st["self"]["groups"] and st["peers"][0]["online"] is False
+    assert srv.peer_call(5, "/brief")["offline"]  # unknown peer index
+    assert "already running" in srv.ssh_start_script("C:/t") and "run-agent.cmd" in srv.ssh_start_script("C:/t")
+
+
+def test_tunnel_switch_and_service_validation(dash):
+    srv, root = dash
+    assert srv.action({"do": "tunnel", "name": "נייח", "on": False})["ok"] and srv.kv("tunnel_off:נייח") == "1"
+    assert srv.action({"do": "tunnel", "name": "נייח", "on": True})["ok"] and srv.kv("tunnel_off:נייח") == ""
+    assert srv.action({"do": "service", "what": "everything", "op": "stop"}).get("error")

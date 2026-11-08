@@ -115,6 +115,28 @@
 
     <!-- side rail: compact tools -->
     <aside class="rail" aria-label="כלים">
+      <section class="card compact" aria-labelledby="h-machines">
+        <div class="card-head"><h2 id="h-machines" data-en="Computers">מחשבים</h2></div>
+        <div id="machines" class="machines"><p class="note tight">…</p></div>
+      </section>
+
+      <section class="card compact" aria-labelledby="h-ctl">
+        <div class="card-head"><h2 id="h-ctl" data-en="Control">שליטה</h2><span class="chip warn-chip" id="pausedChip" hidden>⏸</span></div>
+        <div class="row tight">
+          <button class="btn small" id="listenAllBtn">⏸ השהה האזנה (הכול)</button>
+        </div>
+        <p class="note tight" id="ctlMeta"></p>
+        <div class="row tight">
+          <button class="btn small" id="listenOneBtn">⏸ השהה שיחה זו</button>
+          <button class="btn small" id="sessNewBtn" title="סוגר את הסשן של השיחה הזו עם סיכום; ההודעה הבאה פותחת סשן חדש">🔄 סשן חדש</button>
+        </div>
+        <div class="row tight">
+          <button class="btn small" data-detail="queue">📋 תור פקודות</button>
+          <button class="btn small" data-detail="sched">🕗 מתוזמן</button>
+          <button class="btn small" data-detail="settings">⚙️ הגדרות</button>
+        </div>
+      </section>
+
       <section class="card compact" aria-labelledby="h-grp">
         <div class="card-head"><h2 id="h-grp" data-en="This conversation">השיחה הנוכחית</h2></div>
         <p class="note tight"><strong id="grpName">—</strong></p>

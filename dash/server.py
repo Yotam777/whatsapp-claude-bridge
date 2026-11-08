@@ -13,7 +13,9 @@ import subprocess
 import sys
 import re
 import shutil
+import socket
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -153,7 +155,14 @@ def agent_db_rw():
         if "chat" not in [r[1] for r in con.execute("PRAGMA table_info(claude_runs)")]:
             con.execute("ALTER TABLE claude_runs ADD COLUMN chat TEXT")
     have = [r[1] for r in con.execute("PRAGMA table_info(commands)")]
-    for col, ddl in (("chat_jid", "TEXT"), ("source", "TEXT DEFAULT 'wa'"), ("sync", "INTEGER DEFAULT 0")):
+    con.executescript("""
+        CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT DEFAULT 'time', text TEXT,
+            due TEXT, chat_jid TEXT, ref_ts TEXT, status TEXT DEFAULT 'active', created TEXT, fired TEXT);
+        CREATE TABLE IF NOT EXISTS scheduled_drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id INTEGER, send_at TEXT,
+            status TEXT DEFAULT 'scheduled', chat TEXT, created TEXT, done TEXT);
+    """)
+    for col, ddl in (("chat_jid", "TEXT"), ("source", "TEXT DEFAULT 'wa'"), ("sync", "INTEGER DEFAULT 0"), ("attempts", "INTEGER DEFAULT 0"),
+                     ("retry_at", "TEXT")):
         if col not in have:
             con.execute(f"ALTER TABLE commands ADD COLUMN {col} {ddl}")
     return con
@@ -162,6 +171,234 @@ def agent_db_rw():
 def kv(k):
     r = rows(paths()["agent"], "SELECT v FROM kv WHERE k = ?", (k,))
     return r[0]["v"] if r else None
+
+
+def kv_put(k, v):
+    con = agent_db_rw()
+    try:
+        con.execute("INSERT OR REPLACE INTO kv VALUES (?, ?)", (k, v))
+        con.commit()
+    finally:
+        con.close()
+
+
+def save_cfg(c):
+    dump_json(c, os.path.join(ROOT, "agent", "config.json"), ensure_ascii=False, indent=2)
+
+
+NW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+TASKS = {"bridge": "WhatsApp bridge", "agent": "WhatsApp agent"}
+_svc_cache = {"at": 0, "v": None}
+
+
+def _ps(cmd, timeout=40):
+    return subprocess.run(["powershell.exe", "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=timeout, creationflags=NW)
+
+
+def services(force=False):
+    """Is each run-*.cmd loop / process alive (cached 15 s: the dashboard polls every 10 s)."""
+    if not force and _svc_cache["v"] is not None and time.time() - _svc_cache["at"] < 15:
+        return _svc_cache["v"]
+    out = {"bridge_loop": None, "agent_loop": None, "bridge_proc": None, "agent_proc": None}
+    try:
+        r = _ps("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*run-bridge.cmd*' -or $_.CommandLine -like '*run-agent.cmd*' "
+                "-or $_.Name -eq 'whatsapp-bridge.exe' -or $_.CommandLine -like '*agent.py*' } | ForEach-Object { $_.Name + '|' + $_.CommandLine }", 20)
+        lines = r.stdout.splitlines()
+        out = {"bridge_loop": any("run-bridge.cmd" in l and l.lower().startswith("cmd") for l in lines),
+               "agent_loop": any("run-agent.cmd" in l and l.lower().startswith("cmd") for l in lines),
+               "bridge_proc": any(l.lower().startswith("whatsapp-bridge.exe") for l in lines),
+               "agent_proc": any("agent.py" in l and "python" in l.lower() for l in lines)}
+    except Exception:
+        pass
+    _svc_cache.update(at=time.time(), v=out)
+    return out
+
+
+def svc_stop(name):
+    """Really stop the bridge / agent: end its Task Scheduler task, its run-*.cmd loop, then the process."""
+    subprocess.run(["schtasks", "/end", "/tn", TASKS[name]], capture_output=True, timeout=20, creationflags=NW)
+    _ps(f"Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object {{ $_.CommandLine -like '*run-{name}.cmd*' }} | "
+        f"ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}")
+    if name == "bridge":
+        _ps("Get-Process whatsapp-bridge -ErrorAction SilentlyContinue | Stop-Process -Force")
+    else:
+        _ps("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*agent.py*' -and $_.CommandLine -notlike '*update.py*' } | "
+            "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
+    _svc_cache["v"] = None
+
+
+def svc_start(name):
+    """Start the run-*.cmd loop: through its Task Scheduler task when it exists, otherwise a hidden console."""
+    r = subprocess.run(["schtasks", "/run", "/tn", TASKS[name]], capture_output=True, timeout=20, creationflags=NW)
+    if r.returncode != 0:
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        for f in (flags | 0x01000000, flags):  # break away from our job when allowed, so it outlives this process
+            try:
+                subprocess.Popen(["conhost.exe", "--headless", "cmd.exe", "/c", os.path.join(ROOT, f"run-{name}.cmd")], cwd=ROOT,
+                                 creationflags=f, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+                break
+            except OSError:
+                continue
+    _svc_cache["v"] = None
+
+
+HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+PERM_MODES = ["default", "acceptEdits", "auto", "bypassPermissions", "plan"]
+# every setting the agent reads from config.json that the owner may want to change: key -> (type, default, extra)
+SETTINGS = {
+    "backup_time": ("time", "03:00", None), "update_check_time": ("time", "09:00", None), "group_check_time": ("time", "10:00", None),
+    "selftest_time": ("time", "04:30", None), "morning_summary_time": ("time", "07:30", None), "signin_check_time": ("time", "09:30", None),
+    "auto_update_time": ("time", "23:50", None),
+    "auto_update": ("bool", True, None), "morning_summary": ("bool", True, None), "voice_replies": ("bool", True, None),
+    "transcribe": ("bool", True, None), "transcribe_all_chats": ("bool", True, None), "fresh_sessions": ("bool", False, None),
+    "reply_italic": ("bool", True, None), "quote_replies": ("bool", True, None), "strict_mcp": ("bool", True, None),
+    "daily_budget_usd": ("num", 20, (0, 1000)), "total_daily_budget_usd": ("num", None, (0, 5000)),
+    "session_max_runs": ("int", 60, (1, 1000)), "disconnect_alert_minutes": ("int", 10, (1, 1440)),
+    "backup_keep_days": ("int", 14, (1, 365)), "backup_media_days": ("int", 90, (0, 3650)), "reconnect_settle_seconds": ("int", 45, (0, 600)),
+    "light_model": ("model", "haiku", None), "claude_model": ("model", "sonnet", None), "deep_model": ("model", "opus", None),
+    "permission_mode": ("choice", "auto", PERM_MODES), "voice_name": ("text", "he-IL-AvriNeural", None),
+}
+
+
+def settings_view():
+    c = cfg()
+    try:
+        models = [k for k in json.load(open(os.path.join(ROOT, "agent", "models.json"), encoding="utf-8")) if k != "auto"]
+    except Exception:
+        models = []
+    models = list(dict.fromkeys(models + ["haiku", "sonnet", "opus"]))
+    vals = {k: c.get(k, d) for k, (t, d, x) in SETTINGS.items()}
+    if vals.get("total_daily_budget_usd") is None:
+        vals["total_daily_budget_usd"] = 2 * float(c.get("daily_budget_usd", 20))
+    return {"values": vals, "types": {k: t for k, (t, d, x) in SETTINGS.items()}, "models": models, "perm_modes": PERM_MODES,
+            "plugins": [{"path": x, "name": os.path.basename(x), "on": True} for x in c.get("plugins", [])] +
+                       [{"path": x, "name": os.path.basename(x), "on": False} for x in c.get("plugins_disabled", [])],
+            "peers": c.get("peers", [])}
+
+
+def validate_setting(k, v):
+    t, d, x = SETTINGS[k]
+    if t == "time":
+        if not HHMM.match(str(v)):
+            raise ValueError(f"{k}: שעה בפורמט HH:MM")
+        return str(v)
+    if t == "bool":
+        return bool(v)
+    if t in ("num", "int"):
+        try:
+            n = float(v) if t == "num" else int(float(v))
+        except (TypeError, ValueError):
+            raise ValueError(f"{k}: מספר")
+        if not x[0] <= n <= x[1]:
+            raise ValueError(f"{k}: בין {x[0]} ל-{x[1]}")
+        return n
+    if t == "choice":
+        if v not in x:
+            raise ValueError(f"{k}: אחד מ-{', '.join(x)}")
+        return v
+    if t == "model":
+        if not re.fullmatch(r"[a-z0-9.\-\[\]]{2,40}", str(v)):
+            raise ValueError(f"{k}: שם מודל")
+        return str(v)
+    v = str(v).strip()
+    if not 0 < len(v) <= 80:
+        raise ValueError(f"{k}: טקסט")
+    return v
+
+
+def peers():
+    return cfg().get("peers") or []
+
+
+def ssh_start_script(root):
+    """PowerShell for the other machine: start its agent loop (which also hosts its dashboard) unless one already runs.
+    Win32_Process.Create puts it outside the ssh session, so it keeps running after ssh disconnects."""
+    cmd = os.path.join(root, "run-agent.cmd")
+    return ("if (Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*run-agent.cmd*' }) { 'already running' } else { "
+            f"Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='conhost.exe --headless cmd.exe /c \"{cmd}\"'}} "
+            "| Out-Null; 'started' }")
+
+
+def peer_ssh_start(i):
+    import base64
+    ps = peers()
+    if not (0 <= i < len(ps)) or not ps[i].get("tunnel"):
+        return {"error": "no ssh connection configured for this computer"}
+    enc = base64.b64encode(ssh_start_script(ps[i].get("root") or ROOT).encode("utf-16-le")).decode()
+    ssh = shutil.which("ssh") or r"C:\Windows\System32\OpenSSH\ssh.exe"
+    try:
+        r = subprocess.run([ssh, "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", ps[i]["tunnel"], f"powershell -NoProfile -EncodedCommand {enc}"],
+                           capture_output=True, text=True, timeout=60, creationflags=NW)
+    except Exception as e:
+        return {"error": str(e)[:200]}
+    out = (r.stdout or "").strip().splitlines()
+    return {"ok": r.returncode == 0, "result": out[-1] if out else (r.stderr or "")[-200:]}
+
+
+def peer_url(i):
+    ps = peers()
+    if not (0 <= i < len(ps)) or not str(ps[i].get("url", "")).startswith("http://127.0.0.1:"):
+        raise ValueError("unknown peer")
+    return ps[i]["url"].rstrip("/")
+
+
+def peer_call(i, path, body=None, raw=None, ctype="application/json", timeout=5):
+    """Forward a request to the other machine's dashboard (through the ssh tunnel). Unreachable -> {"offline": true}."""
+    try:
+        url = peer_url(i) + path
+    except ValueError as e:
+        return {"offline": True, "error": str(e)}
+    data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": ctype})
+    try:
+        return json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode() or "{}")
+    except Exception as e:
+        return {"offline": True, "error": str(e)[:200]}
+
+
+def brief():
+    """Small status of this machine for the other machine's dashboard (tabs + the "computers" card)."""
+    c, p = cfg(), paths()
+    b = bridge("/status", timeout=3)
+    hb = kv("heartbeat")
+    alive = bool(hb) and (dt.datetime.now() - dt.datetime.fromisoformat(hb)).total_seconds() < 180
+    gl = []
+    for jid, g in conversations().items():
+        lv = kv(K("live_steps", jid))
+        try:
+            lvj = json.loads(lv) if lv else None
+        except ValueError:
+            lvj = None
+        gl.append({"jid": jid, "name": g.get("name") or jid, "purpose": g.get("purpose", ""), "live": bool(lvj and not lvj.get("done")),
+                   "paused": bool(kv(K("listen_paused", jid))),
+                   "pending": (rows(p["agent"], "SELECT count(*) n FROM commands WHERE status IN ('pending','running') AND coalesce(chat_jid, ?) = ?",
+                                    (c["claude_group"], jid)) or [{"n": 0}])[0]["n"]})
+    tunnels = {}
+    for pr in c.get("peers") or []:
+        nm = pr.get("name") or pr.get("tunnel") or ""
+        try:
+            tunnels[nm] = json.loads(kv(f"tunnel:{nm}") or "null")
+        except ValueError:
+            tunnels[nm] = None
+    return {"machine": socket.gethostname(), "tool_version": (open(os.path.join(ROOT, "VERSION")).read().strip() if os.path.exists(os.path.join(ROOT, "VERSION")) else "?"),
+            "dash_version": VERSION, "bridge": {k: b.get(k) for k in ("connected", "version", "paused", "error", "connected_since")},
+            "agent_alive": alive, "heartbeat": hb, "listen_paused": kv("listen_paused") or "", "groups": gl, "tunnels": tunnels,
+            "services": services()}
+
+
+def peers_status():
+    """This machine + every configured peer (fetched in parallel, short timeout)."""
+    ps = peers()
+    out = [None] * len(ps)
+
+    def one(i):
+        r = peer_call(i, "/brief", timeout=4)
+        out[i] = {"i": i, "name": ps[i].get("name") or f"peer {i}", "tunnel": ps[i].get("tunnel") or "", "online": not r.get("offline"),
+                  "brief": None if r.get("offline") else r, "error": r.get("error")}
+    th = [threading.Thread(target=one, args=(i,)) for i in range(len(ps))]
+    [t.start() for t in th]
+    [t.join(6) for t in th]
+    return {"self": brief(), "peers": [x for x in out if x]}
 
 
 def names():
@@ -233,6 +470,8 @@ def data(chat=None):
         sp = rows(p["agent"], "SELECT coalesce(sum(cost),0) s FROM claude_runs WHERE substr(at,1,10) = ? AND (chat = ?" +
                   (" OR chat IS NULL)" if jid == c["claude_group"] else ")"), (today0, jid))
         glist.append({"jid": jid, "name": (nm.get(jid.split("@")[0]) if jid != LOCAL else None) or g.get("name") or jid, "purpose": g.get("purpose", ""),
+                      "paused": kv(K("listen_paused", jid)) or "", "session": (kv(K("session_id", jid)) or "")[:8],
+                      "session_started": kv(K("session_started", jid)), "session_runs": kv(K("session_runs", jid)) or "0",
                       "budget": float(g.get("budget_usd") or c.get("daily_budget_usd", 5)), "spent": round(sp[0]["s"], 2) if sp else 0,
                       "model": model_info(jid)["current"], "primary": jid == c["claude_group"],
                       "live": (json.loads(kv(K("live_steps", jid))) if kv(K("live_steps", jid)) else None),
@@ -279,6 +518,19 @@ def data(chat=None):
         "transcribed_today": (rows(p["agent"], "SELECT count(*) n FROM transcripts WHERE substr(ts,1,10) = ?", (today,)) or [{"n": 0}])[0]["n"],
         "costs": rows(p["agent"], "SELECT substr(at,1,10) day, round(sum(cost),2) cost, count(*) runs FROM claude_runs GROUP BY 1 ORDER BY 1 DESC LIMIT 14")[::-1],
         "log": open(p["log"], encoding="utf-8").read().splitlines()[-60:] if os.path.exists(p["log"]) else [],
+        "machine": socket.gethostname(),
+        "listen_paused": kv("listen_paused") or "",
+        "limit_until": kv("limit_until") or "", "signin_ends": kv("signin_ends") or "",
+        "queue": rows(p["agent"], "SELECT id, substr(text, 1, 240) AS text, at, status, coalesce(chat_jid, ?) AS chat, source, retry_at, attempts "
+                                  "FROM commands WHERE status IN ('pending','running','waiting_limit','interrupted') ORDER BY id DESC LIMIT 60",
+                      (c["claude_group"],)),
+        "scheduled": rows(p["agent"], "SELECT id, draft_id, send_at, status, chat FROM scheduled_drafts WHERE status = 'scheduled' ORDER BY send_at"),
+        "reminders": rows(p["agent"], "SELECT id, kind, text, due, chat_jid, status FROM reminders WHERE status = 'active' ORDER BY due LIMIT 60"),
+        "disabled_groups": [{"jid": j, "name": v.get("name") or j} for j, v in load_groups_raw().items() if j != LOCAL and not v.get("enabled", True)],
+        "settings": settings_view(),
+        "services": services(),
+        "jobs": {k: kv(f"day:{k}") for k in ("backup", "update_check", "group_check", "selftest", "morning_summary", "signin_check", "auto_update")},
+        "selftest": (json.load(open(os.path.join(ROOT, "agent", "selftest.json"), encoding="utf-8")) if os.path.exists(os.path.join(ROOT, "agent", "selftest.json")) else []),
     }
 
 
@@ -586,6 +838,134 @@ def action(a):
         raw.setdefault(jid, {})["budget_usd"] = b
         save_groups_raw(raw)
         return {"ok": True}
+    if kind in ("listen_pause", "listen_resume"):  # everything (no chat) or one conversation
+        chat = a.get("chat")
+        key = K("listen_paused", chat) if chat else "listen_paused"
+        kv_put(key, dt.datetime.now().isoformat(timespec="seconds") if kind == "listen_pause" else "")
+        return {"ok": True}
+    if kind in ("cmd_cancel", "cmd_retry"):
+        con = agent_db_rw()
+        try:
+            if kind == "cmd_cancel":
+                n = con.execute("UPDATE commands SET status = 'cancelled', answered = ? WHERE id = ? AND status IN ('pending','waiting_limit','interrupted')",
+                                (dt.datetime.now().isoformat(timespec="seconds"), int(a["id"]))).rowcount
+            else:
+                n = con.execute("UPDATE commands SET status = 'pending', retry_at = NULL WHERE id = ? AND status IN ('interrupted','waiting_limit','cancelled')",
+                                (int(a["id"]),)).rowcount
+            con.commit()
+        finally:
+            con.close()
+        return {"ok": n == 1} if n == 1 else {"error": "לא ניתן (ייתכן שהפקודה כבר רצה — השתמש בעצור)"}
+    if kind == "cmd_clear":  # cancel everything still waiting in one conversation (a running answer is stopped with ⛔)
+        chat = a.get("chat") or primary()
+        con = agent_db_rw()
+        try:
+            n = con.execute("UPDATE commands SET status = 'cancelled', answered = ? WHERE status IN ('pending','waiting_limit','interrupted') "
+                            "AND coalesce(chat_jid, ?) = ?", (dt.datetime.now().isoformat(timespec="seconds"), primary(), chat)).rowcount
+            con.commit()
+        finally:
+            con.close()
+        return {"ok": True, "cancelled": n}
+    if kind == "sched_cancel":
+        con = agent_db_rw()
+        try:
+            n = con.execute("UPDATE scheduled_drafts SET status = 'cancelled', done = ? WHERE id = ? AND status = 'scheduled'",
+                            (dt.datetime.now().isoformat(timespec="seconds"), int(a["id"]))).rowcount
+            con.commit()
+        finally:
+            con.close()
+        return {"ok": True} if n else {"error": "not scheduled"}
+    if kind in ("rem_cancel", "rem_snooze"):
+        con = agent_db_rw()
+        try:
+            if kind == "rem_cancel":
+                n = con.execute("UPDATE reminders SET status = 'cancelled' WHERE id = ? AND status = 'active'", (int(a["id"]),)).rowcount
+            else:
+                m = int(float(a["minutes"] if a.get("minutes") not in (None, "") else 60))
+                if not 1 <= m <= 7 * 1440:
+                    return {"error": "1-10080"}
+                due = (dt.datetime.now().astimezone() + dt.timedelta(minutes=m)).isoformat(timespec="seconds")
+                n = con.execute("UPDATE reminders SET due = ?, status = 'active' WHERE id = ?", (due, int(a["id"]))).rowcount
+            con.commit()
+        finally:
+            con.close()
+        return {"ok": True} if n else {"error": "not found"}
+    if kind == "session_new":  # the agent closes the session locally (summary to handoff), like "/סשן חדש" in WhatsApp
+        chat = a.get("chat") or primary()
+        if chat not in conversations():
+            return {"error": "unknown conversation"}
+        now = dt.datetime.now()
+        con = agent_db_rw()
+        try:
+            con.execute("INSERT INTO commands (msg_id, text, at, chat_jid, source, sync) VALUES (?, '/סשן חדש', ?, ?, 'pc', 0)",
+                        (f"pc-{int(now.timestamp() * 1000)}", now.strftime("%Y-%m-%d %H:%M"), chat))
+            con.commit()
+        finally:
+            con.close()
+        return {"ok": True}
+    if kind == "group_enable":  # a connected group switched off (enabled: false) is not listened to; switch it back on
+        raw = load_groups_raw()
+        if a.get("jid") not in raw:
+            return {"error": "unknown group"}
+        raw[a["jid"]]["enabled"] = bool(a.get("on", True))
+        save_groups_raw(raw)
+        sync_policy_groups()
+        return {"ok": True}
+    if kind == "settings_save":
+        c = cfg()
+        try:
+            for k, v in (a.get("values") or {}).items():
+                if k in SETTINGS:
+                    c[k] = validate_setting(k, v)
+        except ValueError as e:
+            return {"error": str(e)}
+        save_cfg(c)
+        if a.get("restart"):
+            open(os.path.join(ROOT, "agent", "restart.request"), "w", encoding="utf-8").write("settings changed in the dashboard")
+        return {"ok": True}
+    if kind == "plugin_toggle":
+        c = cfg()
+        on, off, x = list(c.get("plugins", [])), list(c.get("plugins_disabled", [])), a.get("path")
+        if x not in on + off:
+            return {"error": "unknown plugin"}
+        on, off = ([y for y in on if y != x] + ([x] if a.get("on") else [])), ([y for y in off if y != x] + ([] if a.get("on") else [x]))
+        c["plugins"], c["plugins_disabled"] = on, off
+        save_cfg(c)
+        open(os.path.join(ROOT, "agent", "restart.request"), "w", encoding="utf-8").write("plugin switched in the dashboard")
+        return {"ok": True}
+    if kind == "peers_save":
+        out = []
+        for pr in a.get("peers") or []:
+            name, url, tun = str(pr.get("name", "")).strip()[:40], str(pr.get("url", "")).strip(), str(pr.get("tunnel", "") or "").strip()
+            if not name or not re.fullmatch(r"http://127\.0\.0\.1:\d{2,5}", url) or (tun and not re.fullmatch(r"[\w.@\-]{1,64}", tun)):
+                return {"error": "שם, כתובת http://127.0.0.1:<פורט> ושם חיבור ssh (לא חובה)"}
+            out.append({"name": name, "url": url, **({"tunnel": tun} if tun else {})})
+        c = cfg()
+        c["peers"] = out
+        save_cfg(c)
+        open(os.path.join(ROOT, "agent", "restart.request"), "w", encoding="utf-8").write("computers list changed in the dashboard")
+        return {"ok": True}
+    if kind == "tunnel":
+        kv_put(f"tunnel_off:{a.get('name', '')}", "" if a.get("on") else "1")
+        return {"ok": True}
+    if kind == "service":  # really stop / start the bridge or the agent (restart = "restart")
+        what, op = a.get("what"), a.get("op")
+        if what not in TASKS or op not in ("stop", "start"):
+            return {"error": "bad service"}
+        if op == "stop" and what == "agent":  # this server may live inside the agent: answer first
+            threading.Timer(1.0, svc_stop, args=("agent",)).start()
+        elif op == "stop":
+            svc_stop(what)
+        else:
+            svc_start(what)
+        return {"ok": True}
+    if kind == "peer_ssh_start":
+        return peer_ssh_start(int(a.get("i", -1)))
+    if kind == "selftest_now":
+        uv = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe")
+        subprocess.Popen([uv, "run", "-q", "--no-sync", "python", "-X", "utf8", os.path.join(ROOT, "tools", "selftest.py"), "--quiet"],
+                         cwd=os.path.join(ROOT, "agent"), creationflags=NW, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return {"ok": True}
     if kind == "search":
         return search(a.get("q"))
     if kind == "context":
@@ -700,9 +1080,36 @@ class Handler(BaseHTTPRequestHandler):
     def send_json(self, obj, code=200):
         self.send_bytes(json.dumps(obj, ensure_ascii=False, default=str).encode(), "application/json; charset=utf-8", code)
 
+    def _peer_index(self, path):
+        m = re.match(r"^/peer/(\d+)(/.*)$", path)
+        return (int(m.group(1)), m.group(2)) if m else (None, None)
+
     def do_GET(self):
         path = self.path.split("?")[0]
         qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        if path == "/brief":
+            try:
+                return self.send_json(brief())
+            except Exception as e:
+                return self.send_json({"error": str(e)}, 500)
+        if path == "/peers":
+            try:
+                return self.send_json(peers_status())
+            except Exception as e:
+                return self.send_json({"error": str(e)}, 500)
+        pi, rest = self._peer_index(path)
+        if pi is not None:  # the other machine's dashboard, through the tunnel (data / brief / its files)
+            q = urllib.parse.urlsplit(self.path).query
+            if rest.startswith("/lf/"):
+                try:
+                    r = urllib.request.urlopen(peer_url(pi) + rest, timeout=15)
+                    body = r.read()
+                    return self.send_bytes(body, r.headers.get("Content-Type", "application/octet-stream"))
+                except Exception:
+                    return self.send_bytes(b"not found", "text/plain", 404)
+            if rest not in ("/data", "/brief"):
+                return self.send_json({"error": "not allowed"}, 404)
+            return self.send_json(peer_call(pi, rest + (("?" + q) if q else ""), timeout=8))
         if path == "/data":
             try:
                 return self.send_json(data((qs.get("chat") or [None])[0]))
@@ -736,6 +1143,15 @@ class Handler(BaseHTTPRequestHandler):
         if origin and origin not in (f"http://{host}",):  # same-origin only
             return self.send_json({"error": "forbidden"}, 403)
         n = int(self.headers.get("Content-Length", 0))
+        pi, rest = self._peer_index(self.path.split("?")[0])
+        if pi is not None:  # actions / uploads for the other machine
+            body = self.rfile.read(n) if n else b""
+            if rest == "/action":
+                return self.send_json(peer_call(pi, "/action", raw=body or b"{}", timeout=60))
+            if rest == "/upload":
+                q = urllib.parse.urlsplit(self.path).query
+                return self.send_json(peer_call(pi, "/upload" + (("?" + q) if q else ""), raw=body, ctype="application/octet-stream", timeout=60))
+            return self.send_json({"error": "not allowed"}, 404)
         if self.path.startswith("/upload"):  # a file pasted / chosen in the chat box -> agent/home/inbox
             name = os.path.basename(urllib.parse.unquote((urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("name") or ["file"])[0])) or "file"
             if n > 25 * 1024 * 1024:

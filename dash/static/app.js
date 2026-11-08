@@ -1,6 +1,7 @@
 // Dashboard front-end: renders /data, sends actions to /action. Hebrew (default) and English.
 const $ = id => document.getElementById(id);
 const post = a => fetch("/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(a) }).then(r => r.json());
+const isLocalChat = c => c === "local" || String(c).endsWith("::local");
 let curChat = ""; try { curChat = localStorage.getItem("wa-dash-chat") || ""; } catch (e) {}
 let syncMap = {}; try { syncMap = JSON.parse(localStorage.getItem("wa-dash-sync") || "{}"); } catch (e) {}
 const PURPOSE = { dev: "פיתוח הגשר והכלי", general: "כללית", "4m": "עבודת 4M", local: "מקומית (בלי ווצאפ)" };
@@ -159,7 +160,7 @@ dropZone.addEventListener("drop", e => { if (e.dataTransfer.files.length) { e.pr
 $("syncChk").onchange = e => { syncMap[curChat] = e.target.checked; try { localStorage.setItem("wa-dash-sync", JSON.stringify(syncMap)); } catch (er) {} sendHint(); };
 $("stopBtn").onclick = () => { $("stopBtn").disabled = true; act({ do: "stop", chat: curChat }, L("עוצר את העבודה…", "Stopping…")).then(() => setTimeout(() => { $("stopBtn").disabled = false; load(); }, 2500)); };
 function sendHint() {
-  const local = curChat === "local", sync = $("syncChk").checked;
+  const local = isLocalChat(curChat), sync = $("syncChk").checked;
   $("syncLbl").hidden = local;
   $("sendHint").textContent = local ? L("שיחה מקומית — התשובות מוצגות כאן בלבד, בלי ווצאפ.", "Local chat — answers show here only, no WhatsApp.")
     : sync ? L("ההודעה והתשובה נשלחות גם לקבוצה בווצאפ.", "Message and answer are also posted to the WhatsApp group.")
@@ -168,7 +169,7 @@ function sendHint() {
 $("composer").onsubmit = async e => {
   e.preventDefault();
   const text = say.value.trim(); if ((!text && !attached.length) || sending) return;
-  const isLocal = curChat === "local", sync = !isLocal && $("syncChk").checked;
+  const isLocal = isLocalChat(curChat), sync = !isLocal && $("syncChk").checked;
   if (sync && attached.length > 1) { toast(L("בשליחה לווצאפ אפשר לצרף קובץ אחד", "Only one file when posting to WhatsApp")); return; }
   sending = true;
   const files = attached, shown = (text + files.map(f => "\n📎 " + baseName(f.path)).join("")).trim();
@@ -278,7 +279,7 @@ function drawerContent(kind, d) {
     return `<div class="sum-row"><span class="stat">${L("היום", "Today")}: $${(a.spent_today ?? 0).toFixed(2)}</span><span class="stat">${L("תקרה", "Cap")}: $${a.budget}</span><span class="stat">${L("ריצות היום", "Runs today")}: ${runs.length}</span></div>
       <div class="item"><div class="item-head"><strong>${L("ניצול התקרה היומית", "Daily cap used")}</strong><span class="muted">${Math.round(pct)}%</span></div><span class="meter${pct > 80 ? " hot" : ""}"><span style="width:${pct}%"></span></span></div>
       ${Object.keys(byModel).length ? `<div class="item"><div class="item-head"><strong>${L("היום לפי מודל", "Today by model")}</strong></div>${Object.entries(byModel).sort((x, y) => y[1].cost - x[1].cost).map(([m, v]) => `<div class="bar-row" style="grid-template-columns:90px 1fr 120px"><span>${m === "?" ? L("לא נרשם", "not recorded") : esc(m)}</span><span class="meter"><span style="width:${100 * v.cost / mmax}%"></span></span><span>$${v.cost.toFixed(2)} · ${v.n} ${L("ריצות", "runs")}</span></div>`).join("")}</div>` : ""}
-      <div class="item"><div class="item-head"><strong>${L("לפי שיחה — היום", "By conversation — today")}</strong></div>${(d.groups || []).map(g => `<div class="conv-row"><span>${g.jid === "local" ? "💻" : "👥"} ${esc(g.name)} · <span class="muted">${esc(MODEL_HE(g.model))}</span></span><span>$${g.spent} / $${g.budget}</span><span class="meter${g.spent >= g.budget ? " hot" : ""}"><span style="width:${Math.min(100, 100 * g.spent / (g.budget || 1))}%"></span></span></div>`).join("")}<p class="note tight">${L("תקרה לכל שיחה בנפרד — לשינוי: בכרטיס \"השיחה הנוכחית\" ← 💲 תקרה", "Each conversation has its own cap — change it in the 'This conversation' card")}</p></div>
+      <div class="item"><div class="item-head"><strong>${L("לפי שיחה — היום", "By conversation — today")}</strong></div>${(d.groups || []).map(g => `<div class="conv-row"><span>${isLocalChat(g.jid) ? "💻" : "👥"} ${esc(g.name)} · <span class="muted">${esc(MODEL_HE(g.model))}</span></span><span>$${g.spent} / $${g.budget}</span><span class="meter${g.spent >= g.budget ? " hot" : ""}"><span style="width:${Math.min(100, 100 * g.spent / (g.budget || 1))}%"></span></span></div>`).join("")}<p class="note tight">${L("תקרה לכל שיחה בנפרד — לשינוי: בכרטיס \"השיחה הנוכחית\" ← 💲 תקרה", "Each conversation has its own cap — change it in the 'This conversation' card")}</p></div>
       <div class="item"><div class="item-head"><strong>${L("לפי יום", "By day")}</strong></div>${c.slice().reverse().map(r => `<div class="bar-row"><span class="muted">${r.day.slice(8, 10)}.${r.day.slice(5, 7)}</span><span class="meter"><span style="width:${100 * r.cost / max}%"></span></span><span>$${r.cost}</span></div>`).join("")}</div>
       <div class="item"><div class="item-head"><strong>${L("ריצות Claude היום", "Claude runs today")}</strong></div>${runs.length ? runs.map(r => `<div class="bar-row" style="grid-template-columns:52px 70px 1fr 70px"><span class="muted">${hhmm(toDate(r.at))}</span><span class="muted">${esc(r.model || "")}</span><span class="${r.ok ? "" : "bad"}">${r.ok ? "" : "✖ "}${Math.round(r.seconds)} ${L("שנ'", "s")}</span><span>$${(r.cost || 0).toFixed(3)}</span></div>`).join("") : `<span class="muted">—</span>`}</div>`;
   }
@@ -459,15 +460,17 @@ function renderTabs(d) {
     return `<button class="tab" role="tab" aria-selected="${g.jid === d.chat}" data-chat="${esc(g.jid)}" title="${esc(PURPOSE[g.purpose] || "")} · ${L("תקרה", "cap")} $${g.budget}">` +
       `<span aria-hidden="true">${g.jid === "local" ? "💻" : "👥"}</span><span class="t-name">${esc(g.name)}</span>` +
       `${run ? `<span class="t-dot" title="${L("עובד עכשיו", "working now")}"></span>` : ""}${g.pending ? `<span class="t-badge">${g.pending}</span>` : ""}` +
-      `<span class="t-meta">${esc(MODEL_HE(g.model))} · $${g.spent}</span></button>`;
-  }).join("");
+      `<span class="t-meta">${esc(MODEL_HE(g.model))} · $${g.spent}</span>` +
+      `${d.peers && g.host ? `<span class="t-host" title="${L("המחשב ומנוי Claude שמריצים את הקבוצה", "Machine and Claude subscription running this group")}">🖥 ${esc(g.host)}${g.account ? " · " + esc(g.account) : ""}</span>` : ""}</button>`;
+  }).join("") + (d.peers || []).filter(p => !p.ok).map(p => `<span class="tab t-off" title="${esc(p.error)}">⚠ ${esc(p.host)} ${L("לא זמין", "offline")}</span>`).join("");
   $("tabAdd").textContent = "➕ " + L("חבר קבוצה", "Connect a group");
   const pr = d.presence || {}, pcL = pr.pc_last ? toDate(pr.pc_last).getTime() : 0, phL = pr.phone_last ? toDate(pr.phone_last).getTime() : 0, recent = Math.max(pcL, phL);
   $("presence").innerHTML = !recent || Date.now() - recent > 30 * 60000 ? "🕑 " + L("לא פעיל לאחרונה", "idle")
     : pcL >= phL ? `💻 <b>${L("אתה במחשב", "You are at the PC")}</b>` : `📱 <b>${L("אתה בנייד", "You are on the phone")}</b>`;
-  const g = groupOf(d.chat), local = d.chat === "local";
+  const g = groupOf(d.chat), local = isLocalChat(d.chat);
   $("grpName").textContent = g.name || "—";
-  $("grpMeta").textContent = `${PURPOSE[g.purpose] || ""} · ${L("תקרה", "cap")} $${g.budget ?? "—"} · ${L("היום", "today")} $${g.spent ?? 0}`;
+  $("grpMeta").textContent = `${PURPOSE[g.purpose] || ""} · ${L("תקרה", "cap")} $${g.budget ?? "—"} · ${L("היום", "today")} $${g.spent ?? 0}` +
+    (g.host ? ` · 🖥 ${g.host}${g.account ? " / " + g.account : ""}` : "");
   $("grpEdit").hidden = local; $("grpOff").hidden = !!g.primary;
   $("h-chat").textContent = local ? L("שיחה מקומית עם Claude", "Local chat with Claude") : L("השיחה בקבוצה", "Conversation in group") + " · " + (g.name || "");
   $("syncChk").checked = !!syncMap[d.chat]; sendHint();

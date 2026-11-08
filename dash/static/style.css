@@ -286,6 +286,8 @@ details.item > summary::-webkit-details-marker { display: none; }
 .tab:focus-visible { outline: 3px solid #fff; outline-offset: 2px; }
 .tab[aria-selected="true"] { background: #fff; color: #032331; border-color: #fff; box-shadow: 0 -3px 0 #fc5b3a inset; font-weight: 800; }
 .tab .t-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tab .t-host { font-size: .68rem; font-weight: 500; padding: 1px 7px; border-radius: 8px; background: rgba(255,255,255,.14); white-space: nowrap; }
+.tab.t-off { opacity: .55; cursor: default; font-size: .8rem; }
 .tab .t-meta { font-size: .72rem; font-weight: 500; opacity: .75; white-space: nowrap; }
 .tab .t-dot { width: 9px; height: 9px; border-radius: 50%; background: #fc5b3a; animation: pulse-dot 1.2s ease-in-out infinite; flex: none; }
 .tab .t-badge { background: #fc5b3a; color: #fff; border-radius: 10px; padding: 0 7px; font-size: .72rem; font-weight: 700; }

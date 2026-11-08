@@ -85,3 +85,49 @@ def test_budget_can_be_set_per_group(dash):
     assert srv.conversations()[DEV]["budget_usd"] == 12.5
     assert srv.action({"do": "group_budget", "jid": DEV, "budget": "-1"})["error"]
 
+
+
+def test_federation_merges_peer_groups_and_forwards_actions(dash):
+    import threading
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+    srv, root = dash
+    srv_http = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+    threading.Thread(target=srv_http.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv_http.server_address[1]}"
+    cfgp = root / "agent" / "config.json"
+    c = json.load(open(cfgp, encoding="utf-8"))
+    c.update({"host_label": "DESK", "claude_account": "private"})
+    cfgp.write_text(json.dumps(c), encoding="utf-8")
+    (root / "agent" / "peers.json").write_text(json.dumps(
+        {"token": "t0k", "peers": [{"name": "LAP", "url": base, "host": "LAPTOP", "account": "work"}]}), encoding="utf-8")
+
+    d = srv.data(None)
+    jids = [g["jid"] for g in d["groups"]]
+    assert PRIM in jids and "LAP::" + PRIM in jids
+    own = next(g for g in d["groups"] if g["jid"] == PRIM)
+    remote = next(g for g in d["groups"] if g["jid"] == "LAP::" + PRIM)
+    assert (own["host"], own["account"]) == ("DESK", "private")
+    assert (remote["host"], remote["account"], remote["remote"]) == ("LAPTOP", "work", True)
+    assert d["peers"][0]["ok"] is True
+
+    r = srv.data("LAP::" + PRIM)
+    assert r["chat"] == "LAP::" + PRIM and "LAP::" + PRIM in [g["jid"] for g in r["groups"]]
+
+    assert srv.forward_action({"do": "model", "chat": "LAP::" + PRIM, "model": "opus"}) == {"ok": True, "model": "opus"}
+    assert srv.forward_action({"do": "model", "chat": PRIM, "model": "auto"}) is None
+
+    def call(token):
+        req = urllib.request.Request(base + "/data", headers={"X-Peer-Token": token})
+        try:
+            return urllib.request.urlopen(req, timeout=5).status
+        except urllib.error.HTTPError as e:
+            return e.code
+    assert call("wrong") == 403 and call("t0k") == 200
+    srv_http.shutdown()
+
+
+def test_without_peers_nothing_changes(dash):
+    srv, _ = dash
+    d = srv.data(None)
+    assert "peers" not in d and all(not g.get("remote") for g in d["groups"])

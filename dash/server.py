@@ -13,7 +13,9 @@ import subprocess
 import sys
 import re
 import shutil
+import socket
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -209,7 +211,7 @@ def conversation_of(chat, c, p):
 _schema_ok = False
 
 
-def data(chat=None):
+def _local_data(chat=None):
     global _schema_ok
     if not _schema_ok:
         try:
@@ -237,6 +239,9 @@ def data(chat=None):
                       "model": model_info(jid)["current"], "primary": jid == c["claude_group"],
                       "live": (json.loads(kv(K("live_steps", jid))) if kv(K("live_steps", jid)) else None),
                       "pending": (rows(p["agent"], "SELECT count(*) n FROM commands WHERE status IN ('pending','running') AND coalesce(chat_jid, ?) = ?", (c["claude_group"], jid)) or [{"n": 0}])[0]["n"]})
+    ident = identity()
+    for g in glist:
+        g.update(host=ident["host"], account=ident["account"])
     pc_last = (rows(p["agent"], "SELECT max(at) m FROM local_messages WHERE role = 'me'") or [{"m": None}])[0]["m"]
     phone_last = (rows(p["msg"], "SELECT max(timestamp) m FROM messages WHERE is_from_me = 1 AND chat_jid IN (%s) AND content NOT LIKE ?" %
                        ",".join("?" * len([j for j in convs if j != LOCAL])), [j for j in convs if j != LOCAL] + [c["reply_prefix"].strip() + "%"]) or [{"m": None}])[0]["m"]
@@ -244,6 +249,7 @@ def data(chat=None):
     spent = rows(p["agent"], "SELECT coalesce(sum(cost),0) s FROM claude_runs WHERE substr(at,1,10) = ?", (today,))
     return {
         "version": VERSION,
+        "identity": ident,
         "tool_version": (open(os.path.join(ROOT, "VERSION")).read().strip() if os.path.exists(os.path.join(ROOT, "VERSION")) else "?"),
         "maintainer": bool(c.get("maintainer")),
         "now": dt.datetime.now().isoformat(timespec="seconds"),
@@ -280,6 +286,126 @@ def data(chat=None):
         "costs": rows(p["agent"], "SELECT substr(at,1,10) day, round(sum(cost),2) cost, count(*) runs FROM claude_runs GROUP BY 1 ORDER BY 1 DESC LIMIT 14")[::-1],
         "log": open(p["log"], encoding="utf-8").read().splitlines()[-60:] if os.path.exists(p["log"]) else [],
     }
+
+
+
+# ---- federation: one dashboard over several machines (each keeps its own bridge, agent and Claude account) ----
+SEP = "::"
+_peer_cache = {}
+_tunnels = {}
+
+
+def identity():
+    c = cfg()
+    return {"host": c.get("host_label") or socket.gethostname(), "account": c.get("claude_account") or ""}
+
+
+def peers_cfg():
+    try:
+        return json.load(open(os.path.join(ROOT, "agent", "peers.json"), encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _port_open(port):
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=0.4).close()
+        return True
+    except OSError:
+        return False
+
+
+def _ensure_tunnel(peer):
+    """Peers are reached through an SSH port-forward (their dashboard listens on localhost only)."""
+    ssh, lport = peer.get("ssh"), peer.get("local_port")
+    if not ssh or not lport or _port_open(lport):
+        return
+    proc = _tunnels.get(peer["name"])
+    if proc and proc.poll() is None:
+        return
+    flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+    fwd = ["-L", f"127.0.0.1:{lport}:127.0.0.1:{peer.get('remote_port', 8770)}"]
+    if peer.get("reverse_port"):  # the same connection also lets the peer reach this machine's dashboard
+        fwd += ["-R", f"127.0.0.1:{peer['reverse_port']}:127.0.0.1:{peer.get('own_port', 8770)}"]
+    _tunnels[peer["name"]] = subprocess.Popen(
+        ["ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15", *fwd, ssh],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+    for _ in range(30):
+        if _port_open(lport):
+            return
+        time.sleep(0.2)
+
+
+def peer_call(peer, path, body=None, timeout=6):
+    _ensure_tunnel(peer)
+    headers = {"X-Peer-Token": peers_cfg().get("token", ""), "Content-Type": "application/json"}
+    req = urllib.request.Request(peer["url"].rstrip("/") + path, data=json.dumps(body).encode() if body is not None else None,
+                                 headers=headers)
+    return json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode() or "{}")
+
+
+def _peer_summary(peer):
+    """Groups of one peer (cached ~5 s so the 10-second refresh of two dashboards does not double the load)."""
+    hit = _peer_cache.get(peer["name"])
+    if hit and time.time() - hit[0] < 5:
+        return hit[1]
+    try:
+        d = peer_call(peer, "/data")
+        res = {"ok": True, "groups": d.get("groups") or [], "identity": d.get("identity") or {}}
+    except Exception as e:
+        res = {"ok": False, "error": str(e)[:120], "groups": [], "identity": {}}
+    _peer_cache[peer["name"]] = (time.time(), res)
+    return res
+
+
+def _merged_groups(local_groups):
+    groups, status = list(local_groups), []
+    for peer in peers_cfg().get("peers", []):
+        r = _peer_summary(peer)
+        ident = r["identity"]
+        host, account = peer.get("host") or ident.get("host") or peer["name"], peer.get("account") or ident.get("account", "")
+        status.append({"name": peer["name"], "host": host, "account": account, "ok": r["ok"], "error": r.get("error", "")})
+        for g in r["groups"]:
+            groups.append(dict(g, jid=peer["name"] + SEP + g["jid"], host=host, account=account, remote=True, primary=False))
+    return groups, status
+
+
+def data(chat=None):
+    """Own data (+ every peer's groups as extra tabs). A tab 'peer::jid' shows that peer's conversation and bridge data."""
+    peers = peers_cfg().get("peers", [])
+    if chat and SEP in chat:
+        name, jid = chat.split(SEP, 1)
+        peer = next((x for x in peers if x["name"] == name), None)
+        if not peer:
+            return {"error": "unknown peer " + name}
+        d = peer_call(peer, "/data?chat=" + urllib.parse.quote(jid))
+        mine = _local_data(None)["groups"]
+        d["groups"], d["peers"] = _merged_groups(mine)
+        d["chat"] = chat
+        return d
+    d = _local_data(chat)
+    if peers:
+        d["groups"], d["peers"] = _merged_groups(d["groups"])
+    return d
+
+
+def forward_action(a):
+    """An action aimed at a peer's conversation runs on that peer; None when it is a local action."""
+    for key in ("chat", "jid"):
+        v = str(a.get(key) or "")
+        if SEP in v:
+            name, raw = v.split(SEP, 1)
+            peer = next((x for x in peers_cfg().get("peers", []) if x["name"] == name), None)
+            if not peer:
+                return {"error": "unknown peer " + name}
+            _peer_cache.pop(name, None)
+            return peer_call(peer, "/", dict(a, **{key: raw}), timeout=30)
+    return None
+
+
+def peer_authorized(headers):
+    tok = peers_cfg().get("token") or ""
+    return bool(tok) and headers.get("X-Peer-Token") == tok
 
 
 def kill(name_like):
@@ -705,7 +831,12 @@ class Handler(BaseHTTPRequestHandler):
         qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if path == "/data":
             try:
-                return self.send_json(data((qs.get("chat") or [None])[0]))
+                chat = (qs.get("chat") or [None])[0]
+                if self.headers.get("X-Peer-Token"):  # another machine asking: local data only (no ping-pong)
+                    if not peer_authorized(self.headers):
+                        return self.send_json({"error": "forbidden"}, 403)
+                    return self.send_json(_local_data(chat))
+                return self.send_json(data(chat))
             except Exception as e:
                 return self.send_json({"error": str(e)}, 500)
         if path.startswith("/lf/"):  # files Claude returned in a PC-only conversation
@@ -753,12 +884,29 @@ class Handler(BaseHTTPRequestHandler):
                     left -= len(chunk)
             return self.send_json({"ok": True, "path": dst, "name": name})
         try:
-            return self.send_json(action(json.loads(self.rfile.read(n) or b"{}")))
+            a = json.loads(self.rfile.read(n) or b"{}")
+            if self.headers.get("X-Peer-Token"):
+                if not peer_authorized(self.headers):
+                    return self.send_json({"error": "forbidden"}, 403)
+                return self.send_json(action(a))
+            fwd = forward_action(a)
+            return self.send_json(fwd if fwd is not None else action(a))
         except Exception as e:
             return self.send_json({"error": str(e)}, 500)
 
 
+def _keep_tunnels():
+    while True:
+        for peer in peers_cfg().get("peers", []):
+            try:
+                _ensure_tunnel(peer)
+            except Exception:
+                pass
+        time.sleep(20)
+
+
 def serve(port=8770):
+    threading.Thread(target=_keep_tunnels, daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     srv.serve_forever()
 

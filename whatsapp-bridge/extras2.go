@@ -218,6 +218,38 @@ func registerExtras2API(client *whatsmeow.Client) {
 		return map[string]any{"id": resp.ID}, err
 	})
 
+	// {"jid","kind":"event|mention|location", event: name,text,start,end,guests,address,lat,lng; mention: text,mentions[];
+	// location: lat,lng,name,address} — same draft/approval path as polls
+	adminHandler("/api/send_rich", func(ctx context.Context, b map[string]any) (map[string]any, error) {
+		to, err := types.ParseJID(str(b, "jid"))
+		if err != nil {
+			return nil, err
+		}
+		kind := str(b, "kind")
+		if kind != "event" && kind != "mention" && kind != "location" {
+			return nil, errString("kind must be event, mention or location")
+		}
+		raw, _ := json.Marshal(b)
+		var sp specialPayload
+		json.Unmarshal(raw, &sp)
+		msg, desc, err := buildSpecial(client, kind, sp)
+		if err != nil {
+			return nil, err
+		}
+		if err := textOK(desc); err != nil {
+			return nil, err
+		}
+		ok, res, err := gate(to, desc, kind, sp)
+		if !ok {
+			return res, err
+		}
+		resp, err := client.SendMessage(ctx, to, msg)
+		if err == nil {
+			recordSent(to, resp.ID, desc, "", "", true, kind)
+		}
+		return map[string]any{"id": resp.ID}, err
+	})
+
 	// {"jid","name","phone":"9725..."} — share a contact card
 	adminHandler("/api/send_contact", func(ctx context.Context, b map[string]any) (map[string]any, error) {
 		to, err := types.ParseJID(str(b, "jid"))
@@ -289,6 +321,14 @@ type specialPayload struct {
 	Name     string   `json:"name,omitempty"`
 	Phone    string   `json:"phone,omitempty"`
 	Text     string   `json:"text,omitempty"`
+	// event / mention / location
+	Start    int64    `json:"start,omitempty"`
+	End      int64    `json:"end,omitempty"`
+	Guests   bool     `json:"guests,omitempty"`
+	Address  string   `json:"address,omitempty"`
+	Lat      float64  `json:"lat,omitempty"`
+	Lng      float64  `json:"lng,omitempty"`
+	Mentions []string `json:"mentions,omitempty"`
 }
 
 // buildSpecial builds the WhatsApp message for a special kind and its human-readable description (cards / log).
@@ -322,5 +362,5 @@ func buildSpecial(client *whatsmeow.Client, kind string, sp specialPayload) (*wa
 			Text: proto.String(sp.Text), ContextInfo: &waE2E.ContextInfo{IsForwarded: proto.Bool(true), ForwardingScore: proto.Uint32(1)},
 		}}, sp.Text, nil
 	}
-	return nil, "", errString("unknown kind " + kind)
+	return buildRich(kind, sp)
 }

@@ -161,7 +161,10 @@ def main():
     ok = False
     try:
         git("fetch", "--tags", "--quiet", "origin", check=False)
-        git("checkout", "--quiet", target)
+        if old_branch:  # stay on the branch (developer machines keep working on it): fast-forward only
+            git("merge", "--ff-only", "--quiet", target)
+        else:
+            git("checkout", "--quiet", target)
         new_bridge(assets)
         sync_deps()
         update_dashboard(assets)
@@ -176,7 +179,11 @@ def main():
         return 0
     log("↩ הבדיקה נכשלה — חוזר לגרסה הקודמת / self-test failed — rolling back")
     stop_services()
-    git("checkout", "--quiet", old_branch or old_ref)
+    if old_branch:
+        git("checkout", "--quiet", old_branch)
+        git("reset", "--hard", "--quiet", old_ref)  # undo the fast-forward (tracked files were clean before the update)
+    else:
+        git("checkout", "--quiet", old_ref)
     if os.path.exists(BRIDGE_EXE + ".bak"):
         os.replace(BRIDGE_EXE + ".bak", BRIDGE_EXE)
     try:

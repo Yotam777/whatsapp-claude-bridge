@@ -587,3 +587,22 @@ def test_tts_text_cleaning(agent):
     assert "סיכום" in t and "קישור" in t
     c = mod.tts_clean("משפט ארוך שחוזר על עצמו. " * 100)
     assert len(c) < 900 and c.endswith("ההמשך בהודעה הכתובה.")
+
+
+def test_auto_update_is_scheduled_and_reports(agent, monkeypatch, tmp_path):
+    mod, _ = agent
+    calls = []
+    monkeypatch.setattr(mod, "reply", lambda t, *a, **k: calls.append(t))
+    monkeypatch.setattr(mod, "wait_bridge", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "HERE", str(tmp_path))  # never touch the real update.log
+    mod.report_auto_update()
+    assert calls == [], "nothing pending -> silent"
+    mod.kv_set("auto_update_pending", '{"from": "1.0.8", "to": "1.0.9"}')
+    (tmp_path / "update.log").write_text("[x] \u05de\u05e2\u05d3\u05db\u05df 1.0.8 v1.0.9\n[x] ok 1.0.9\n", encoding="utf-8")
+    mod.report_auto_update()
+    assert calls and "עודכן אוטומטית" in calls[-1]
+    assert mod.kv_get("auto_update_pending") == ""
+    mod.kv_set("auto_update_pending", '{"from": "1.0.8", "to": "1.0.9"}')
+    (tmp_path / "update.log").write_text("[x] \u05de\u05e2\u05d3\u05db\u05df 1.0.8 v1.0.9\n[x] \u21a9 back 1.0.8\n", encoding="utf-8")
+    mod.report_auto_update()
+    assert "נכשל" in calls[-1]

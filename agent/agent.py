@@ -276,6 +276,78 @@ def restart_now(reason):
     os._exit(0)
 
 
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def report_auto_update():
+    """The nightly update stopped and restarted us: tell the owner how it ended (read from agent/update.log)."""
+    raw = kv_get("auto_update_pending")
+    if not raw:
+        return
+    kv_set("auto_update_pending", "")
+    try:
+        info = json.loads(raw)
+    except Exception:
+        info = {}
+    wait_bridge(300)
+    tail = ""
+    try:
+        tail = open(os.path.join(HERE, "update.log"), encoding="utf-8", errors="replace").read()[-3000:]
+    except OSError:
+        pass
+    cur = open(os.path.join(ROOT, "VERSION")).read().strip()
+    if "↩" in tail.split("מעדכן")[-1]:
+        msg = f"↩ העדכון האוטומטי ל-{info.get('to', '?')} נכשל בבדיקה — הכלי חזר לגרסה {cur}. הגשר והסוכן פועלים."
+    else:
+        msg = f"✅ עודכן אוטומטית לגרסה {cur} ({dt.datetime.now():%H:%M}). הגשר והסוכן הופעלו מחדש."
+    _ctx.chat = PRIMARY
+    try:
+        reply(msg)
+    finally:
+        _ctx.chat = None
+
+
+def auto_update():
+    """Nightly (config auto_update_time, default 23:50): if a newer release exists, tell the owner and run tools/update.py
+    detached — it stops the bridge and the agent, updates, restarts both, self-tests and rolls back on failure. The new
+    agent reports the result (report_auto_update). Personal files (config, home, store, databases) are never touched."""
+    if not CFG.get("auto_update", True):
+        return
+    upd = os.path.join(ROOT, "tools", "update.py")
+    uvx = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe")
+    try:
+        out = subprocess.run([uvx, "run", "-q", "--no-project", "python", "-X", "utf8", upd, "--check"], cwd=ROOT,
+                             capture_output=True, text=True, encoding="utf-8", timeout=90, creationflags=NO_WINDOW)
+        res = json.loads(out.stdout.strip().splitlines()[-1])
+    except Exception as e:
+        log("auto_update check failed", e)
+        return
+    if not res.get("available"):
+        log("auto_update: up to date", res.get("current"))
+        return
+    dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+    _ctx.chat = PRIMARY
+    try:
+        if dirty:
+            reply(f"⚠️ עדכון אוטומטי לגרסה {res.get('latest')} לא בוצע: יש שינויים לא שמורים בקבצי הכלי במחשב הזה. שמור אותם בגיט ואעדכן מחר (או עכשיו מהלוח).")
+            return
+        reply(f"🔄 עדכון אוטומטי: גרסה {res.get('current')} ← {res.get('latest')}. הגשר והסוכן יופעלו מחדש בעוד רגע; אודיע כשסיימתי.")
+    finally:
+        _ctx.chat = None
+    kv_set("auto_update_pending", json.dumps({"from": res.get("current"), "to": res.get("latest"),
+                                              "at": dt.datetime.now().isoformat(timespec="seconds")}))
+    # the updater stops this agent and its run-agent loop, so it must not live in our process tree / Task Scheduler job
+    base = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    for flags in (base | 0x01000000, base):  # 0x01000000 = CREATE_BREAKAWAY_FROM_JOB (not always allowed)
+        try:
+            subprocess.Popen([uvx, "run", "-q", "--no-project", "python", "-X", "utf8", upd], cwd=ROOT, creationflags=flags,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
+            break
+        except OSError as e:
+            log("auto_update launch retry", e)
+    log("auto_update started", res.get("latest"))
+
+
 def report_restart():
     """After a requested restart: confirm in the group with the settings actually loaded."""
     raw = kv_get("restart_pending")
@@ -2112,7 +2184,8 @@ def scheduler():
                      (CFG.get("group_check_time", "10:00"), "group_check", group_check),
                      (CFG.get("selftest_time", "04:30"), "selftest", nightly_selftest),
                      (CFG.get("morning_summary_time", "07:30"), "morning_summary", morning_summary),
-                     (CFG.get("signin_check_time", "09:30"), "signin_check", signin_check)]
+                     (CFG.get("signin_check_time", "09:30"), "signin_check", signin_check),
+                     (CFG.get("auto_update_time", "23:50"), "auto_update", auto_update)]
             for at, key, fn in daily + _daily:
                 if now.strftime("%H:%M") >= at and kv_get(f"day:{key}") != today:
                     kv_set(f"day:{key}", today)
@@ -2143,6 +2216,7 @@ if __name__ == "__main__":
     if os.path.exists(RESTART_FILE):  # a request left over from before this start is already fulfilled
         os.remove(RESTART_FILE)
     threading.Thread(target=report_restart, daemon=True).start()
+    threading.Thread(target=report_auto_update, daemon=True).start()
     try:
         cut = mark_interrupted()  # synchronous, before the dispatcher can mark anything 'running'
         if cut:

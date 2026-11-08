@@ -100,6 +100,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Extract text content
 	content := extractTextContent(msg.Message)
+	if content == "" {
+		content = eventResponseText(client, messageStore, msg)
+	}
 
 	// Extract media info
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg.Message)

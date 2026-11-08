@@ -2,6 +2,8 @@
   "bridge_url": "http://127.0.0.1:8765/api",
   "store_dir": "whatsapp-bridge/store",
   "claude_group": "<control group JID, e.g. 120363000000000000@g.us — written by setup>",
+  "host_label": "",
+  "claude_account": "",
   "owner_name": "<your first name>",
   "reply_prefix": "🤖 ",
   "backup_dir": "~/WhatsApp-Backup",

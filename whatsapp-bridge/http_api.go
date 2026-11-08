@@ -32,6 +32,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 func registerAllAPI(client *whatsmeow.Client, messageStore *MessageStore) {
 	registerExtraAPI(client)
 	registerSyncAPI(client)
+	registerExperimentAPI(client)
 
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {

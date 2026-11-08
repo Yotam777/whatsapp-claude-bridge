@@ -181,8 +181,7 @@ func extractTextContent(msg *waProto.Message) string {
 		return c
 	}
 
-	// For now, we're ignoring non-text messages
-	return ""
+	return describeRich(msg)
 }
 
 // Store additional media info in the database

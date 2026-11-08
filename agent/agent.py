@@ -1885,12 +1885,26 @@ def scheduled_check():
             db.execute("UPDATE scheduled_drafts SET status = ?, done = ? WHERE id = ?", (status, dt.datetime.now().isoformat(timespec="seconds"), sid))
 
 
+def sent_special(mid):
+    try:
+        db = mdb()
+        try:
+            return bool(db.execute("SELECT 1 FROM send_log WHERE message_id = ? AND detail IN "
+                                   "('poll','contact','forward','event','mention','location','experiment')", (mid,)).fetchone())
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return False
+
+
 def handle(row):
     mid, cj, sender, ts, content, me, mtype = row
     content = (content or "").strip()
     if cj != LOCAL and cj in load_groups() and me:  # the owner's own message in a connected group (others' messages stay plain information)
         if content.startswith(CFG["reply_prefix"].strip()):
             return  # our own reply
+        if sent_special(mid):
+            return  # an event / poll / location the tool itself sent (has no reply prefix)
         try:
             kv_set(K("last_owner_msg", cj), json.dumps({"ts": ts[:19], "text": content[:300] or f"[{mtype}]"}, ensure_ascii=False))
         except Exception as e:

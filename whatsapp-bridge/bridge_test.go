@@ -2,11 +2,13 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -28,15 +30,28 @@ func TestMediaFilenameIsUniquePerMessage(t *testing.T) {
 }
 
 func TestLooksLikeBlock(t *testing.T) {
-	for _, s := range []string{"server returned error 463", "rate-overlimit", "429 too many requests", "account blocked"} {
+	for _, s := range []string{"server returned error 463", "server returned error 475", "server returned error 429",
+		"rate-overlimit", "429 too many requests"} {
 		if !looksLikeBlock(errors.New(s)) {
 			t.Errorf("%q should be treated as throttling", s)
 		}
 	}
-	for _, s := range []string{"context deadline exceeded", "websocket closed"} {
+	// per-chat errors must not pause every send
+	for _, s := range []string{"context deadline exceeded", "websocket closed", "account blocked", "contact blocked you",
+		"not-authorized", "403 forbidden", "server returned error 403", "server returned error 406", "not in group",
+		"info query returned status 404"} {
 		if looksLikeBlock(errors.New(s)) {
 			t.Errorf("%q should not pause sending", s)
 		}
+	}
+	if !looksLikeBlock(fmt.Errorf("send: %w", whatsmeow.ErrIQRateOverLimit)) {
+		t.Error("typed rate-overlimit IQ error must pause")
+	}
+	if looksLikeBlock(whatsmeow.ErrIQForbidden) || looksLikeBlock(whatsmeow.ErrIQNotAuthorized) || looksLikeBlock(nil) {
+		t.Error("forbidden / not-authorized / nil must not pause")
+	}
+	if !looksLikeBlock(fmt.Errorf("%w %d", whatsmeow.ErrServerReturnedError, 463)) {
+		t.Error("typed server error 463 must pause")
 	}
 }
 

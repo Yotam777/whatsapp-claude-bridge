@@ -79,14 +79,14 @@ func registerExtraAPI(client *whatsmeow.Client) {
 			"connected_since": fmtT(since),
 			"last_disconnect": fmtT(lastDisc),
 			"disconnects":     discs,
-			"connected":      client.IsConnected(),
-			"logged_in":      client.IsLoggedIn(),
-			"started":        bridgeStarted.Format(time.RFC3339),
-			"policy":         p,
-			"paused":         paused,
-			"sent_today":     sentToday,
-			"drafts_pending": draftsPending,
-			"daily_cap":      envInt("WA_DAILY_CAP", 150),
+			"connected":       client.IsConnected(),
+			"logged_in":       client.IsLoggedIn(),
+			"started":         bridgeStarted.Format(time.RFC3339),
+			"policy":          p,
+			"paused":          paused,
+			"sent_today":      sentToday,
+			"drafts_pending":  draftsPending,
+			"daily_cap":       envInt("WA_DAILY_CAP", 150),
 		})
 	})
 
@@ -231,11 +231,6 @@ func registerExtraAPI(client *whatsmeow.Client) {
 				derr = client.SetGroupDescription(ctx, jid, *req.Description)
 			}
 			if derr != nil {
-				res["success"], res["description_error"] = false, derr.Error()
-			}
-		}
-		if false {
-			if derr := client.SetGroupDescription(ctx, jid, *req.Description); derr != nil {
 				res["success"], res["description_error"] = false, derr.Error()
 			}
 		}

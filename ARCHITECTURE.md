@@ -29,10 +29,11 @@
 
 ## 2. הגשר (Go)
 
-**קבצים:** `main.go` (חיבור, אירועים, שמירת הודעות, `/api/send`, `/api/download`), `enhanced.go` (סכמה + הגירות, טיוטות, conn_log),
-`policy.go` (מדיניות שליחה + כרטיס טיוטה), `approvals.go` (✅/❌ על כרטיס), `api_extra.go` (status, policy, create/leave_group, group_info, set_group, events SSE),
+**קבצים:** `main.go` (רק main), `events.go` (מטפל אירועים, handleMessage), `store.go` (MessageStore), `send.go` (sendCore, מדיה),
+`media.go` (הורדה), `history.go` (סנכרון היסטוריה), `http_api.go` (/api/send, /api/download, רישום כל ה-API), `enhanced.go` (סכמה + הגירות, טיוטות, קצב),
+`policy.go` (מדיניות שליחה + כרטיס טיוטה, זיהוי חסימה), `approvals.go` (✅/❌ על כרטיס), `api_extra.go` (status, policy, create/leave_group, group_info, set_group, events SSE),
 `group_admin.go` (ניהול קבוצות, עריכה/מחיקה, חסימה), `extras2.go` (אודות, סטטוס, הצמדה, כוכב, נקרא, סקר, איש קשר, העברה כולל מדיה),
-`sync_extras.go` (react, typing), `quote_phone.go`.
+`sync_extras.go` (react, typing, quoted_id), `gate.go` (owner_token — סיסמה נוספת, אותן הרשאות), `quote_phone.go`.
 
 **Endpoints** (כולם POST JSON, `Authorization: Bearer <store/api_token>`, רק 127.0.0.1):
 `send` `download` `react` `typing` `status` `policy` `events`(SSE) `draft_decide` · קבוצות: `create_group` `leave_group` `join_group` `list_groups`
@@ -71,6 +72,10 @@
 7. תשובה → `reply` (🤖 + נטוי + ציטוט), קבצי outbox נשלחים, ✅ על ההודעה, המלצת מודל 💡 אם רלוונטי.
 8. `restart.request` קיים / `/הפעל מחדש` → יציאה נקייה אחרי התשובה; הלולאה מעלה; "✅ עליתי מחדש" עם ההגדרות.
 
+**עוד בסוכן (08.11):** עובד לכל שיחה במקביל; פקודה שנקטעה → `interrupted` + הודעה; מכסת שימוש → `waiting_limit` והמשך אוטומטי בזמן האיפוס;
+התראת פקיעת התחברות (`signin_check_time`); דוח חזרת חיבור (סיבה, משך, הודעות שלא נקלטו מטופלות); בדיקה עצמית לילית (`selftest_time`, מדווח רק כשל);
+שליחה מתוזמנת (תשובה לכרטיס עם שעה → `scheduled_drafts` → draft_decide); סיכום בוקר (`morning_summary_time`); תשובה קולית להקלטה (edge-tts → ogg);
+מודל דביק לסשן; תקרה כוללת `total_daily_budget_usd`.
 **סשן:** `fresh_sessions:false` = רציף (`kv session_id`), מתחלף בחצות או אחרי `session_max_runs` (60) בעבודה שאינה פיתוח (`is_dev_work`), עם `write_handoff`.
 **עלות:** `claude_runs.cost` = עלות הריצה בלבד; `cum` = המצטבר ש-Claude מדווח בסשן רציף (`run_cost`).
 **תוספים:** `config.plugins` — קבצי Python עם hooks (למשל קליטת טפסים), נטענים ב-`load_plugins`.

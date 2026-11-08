@@ -379,3 +379,211 @@ def test_conversations_run_in_parallel(multi, monkeypatch):
     assert done_dev.wait(8), "the dev group was blocked by the 4M group's run"
     release.set()
     assert _wait_done(mod, 2)
+
+
+# ---------- 12:49 approvals: limit, sign-in, reconnect, schedule, morning summary, voice ----------
+
+def test_usage_limit_parsing(agent):
+    mod, _ = agent
+    now = mod.dt.datetime(2026, 11, 8, 10, 17)
+    r = mod.parse_limit("You've hit your 5-hour limit · resets 11:30am (Asia/Jerusalem)", now)
+    assert r == mod.dt.datetime(2026, 11, 8, 11, 30)
+    assert mod.parse_limit("You've hit your limit · resets 3pm", now) == mod.dt.datetime(2026, 11, 8, 15, 0)
+    assert mod.parse_limit("You've hit your weekly limit · resets 9am", now) == mod.dt.datetime(2026, 11, 9, 9, 0), "a past hour = tomorrow"
+    assert mod.parse_limit("Usage limit reached", now) == now + mod.dt.timedelta(minutes=60), "no time given → +60 min"
+    assert mod.parse_limit("הנה סיכום של הדוח", now) is None and mod.parse_limit("", now) is None
+
+
+def test_usage_limit_parks_and_requeues_commands(agent, monkeypatch):
+    mod, _ = agent
+    sent = []
+    monkeypatch.setattr(mod, "send", lambda chat, text, media=None, quoted=None: sent.append(text) or True)
+    monkeypatch.setattr(mod, "react", lambda *a: None)
+    until = mod.dt.datetime.now() + mod.dt.timedelta(minutes=30)
+    mod.kv_set("limit_until", until.isoformat(timespec="seconds"))
+    for i in (1, 2):
+        mod.enqueue_command(f"L{i}", "מה המצב", "2026-11-08 10:20")
+    called = []
+    monkeypatch.setattr(mod, "claude", lambda *a, **k: called.append(1) or "x")
+    for _ in (1, 2):
+        mod.run_command(mod.claim_next(mod.PRIMARY))
+    with mod.adb() as db:
+        st = [r[0] for r in db.execute("SELECT status FROM commands ORDER BY id")]
+    assert st == ["waiting_limit", "waiting_limit"] and not called, "no Claude run while the limit is on"
+    assert sum("מכסת השימוש" in t for t in sent) == 1, "one notice per window, not per command"
+    assert mod.release_limit_waiters() == 0, "still waiting"
+    mod.kv_set("limit_until", (mod.dt.datetime.now() - mod.dt.timedelta(minutes=1)).isoformat(timespec="seconds"))
+    assert mod.release_limit_waiters() == 2
+    with mod.adb() as db:
+        assert [r[0] for r in db.execute("SELECT status FROM commands ORDER BY id")] == ["pending", "pending"]
+
+
+def test_limit_hit_during_a_run_parks_the_command(agent, monkeypatch):
+    mod, _ = agent
+    sent = []
+    monkeypatch.setattr(mod, "send", lambda chat, text, media=None, quoted=None: sent.append(text) or True)
+    monkeypatch.setattr(mod, "react", lambda *a: None)
+    until = mod.dt.datetime.now() + mod.dt.timedelta(minutes=40)
+
+    def hit(*a, **k):
+        raise mod.LimitHit(until)
+    monkeypatch.setattr(mod, "_run_claude", hit)
+    mod.enqueue_command("L9", "תסכם לי את היום", "2026-11-08 10:20")
+    mod.run_command(mod.claim_next(mod.PRIMARY))
+    with mod.adb() as db:
+        assert db.execute("SELECT status FROM commands").fetchone()[0] == "waiting_limit"
+    assert any(until.strftime("%H:%M") in t for t in sent)
+
+
+def test_background_runs_skip_quietly_during_the_limit(agent, monkeypatch):
+    mod, _ = agent
+    import pytest as _pt
+    mod.kv_set("limit_until", (mod.dt.datetime.now() + mod.dt.timedelta(minutes=5)).isoformat(timespec="seconds"))
+
+    def boom(*a, **k):
+        raise AssertionError("must not run")
+    monkeypatch.setattr(mod, "_run_claude", boom)
+    assert mod.claude("x", session=False) is None
+    with _pt.raises(mod.LimitHit):
+        mod.claude("x", on_stage=lambda *a: None)
+
+
+def test_signin_expiry_parsing_and_warning(agent, monkeypatch):
+    mod, _ = agent
+    err = "Warning: this sign-in ends between 2026-11-11 and 2026-11-14 (in 3 days at the earliest). Renewing it does not move those dates."
+    assert mod.parse_signin(err) == ("2026-11-11", "2026-11-14")
+    assert mod.parse_signin("nothing here") is None
+    sent = []
+    monkeypatch.setattr(mod, "send", lambda chat, text, media=None, quoted=None: sent.append(text) or True)
+    soon = (mod.dt.date.today() + mod.dt.timedelta(days=2)).isoformat()
+    mod.kv_set("signin_ends", f"{soon}|{soon}")
+    mod.signin_check()
+    assert sent and "claude auth login" in sent[-1]
+    sent.clear()
+    far = (mod.dt.date.today() + mod.dt.timedelta(days=20)).isoformat()
+    mod.kv_set("signin_ends", f"{far}|{far}")
+    mod.signin_check()
+    assert not sent
+
+
+def test_reconnect_finds_missed_owner_messages(multi, monkeypatch):
+    mod, db = multi
+    db.execute("CREATE TABLE IF NOT EXISTS conn_log (at TIMESTAMP, event TEXT)")
+    now = mod.dt.datetime.now().replace(microsecond=0)
+    start = now - mod.dt.timedelta(minutes=20)
+    db.execute("INSERT INTO conn_log VALUES (?, 'disconnected')", ((start - mod.dt.timedelta(seconds=40)).strftime("%Y-%m-%d %H:%M:%S"),))
+    db.execute("INSERT INTO conn_log VALUES (?, 'logged_out')", ((start - mod.dt.timedelta(seconds=30)).strftime("%Y-%m-%d %H:%M:%S"),))
+
+    def ts(m):
+        return (now - mod.dt.timedelta(minutes=m)).astimezone().isoformat(sep=" ", timespec="seconds")
+    rows = [("O1", DEV, "me", "מה המצב עם הגשר", ts(15), 1, ""),       # owner, during the outage, never handled -> missed
+            ("O2", mod.PRIMARY, "me", "🤖 _תשובה_", ts(10), 1, ""),     # the bot's own reply -> ignored
+            ("O3", DEV, "x", "הודעה של מישהו אחר", ts(12), 0, ""),      # not the owner -> ignored
+            ("O4", DEV, "me", "לפני הניתוק", ts(60), 1, ""),             # before the outage -> ignored
+            ("O5", mod.PRIMARY, "me", "כבר טופלה", ts(5), 1, "")]       # already handled -> ignored
+    db.executemany("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, '')", rows)
+    db.commit()
+    with mod.adb() as a:
+        a.execute("INSERT INTO handled VALUES ('O5', ?, 'x')", (mod.PRIMARY,))
+    s, e = mod.outage_window(start, now)
+    assert s < start, "the bridge's own 'disconnected' time is used when it is earlier"
+    assert [r[0] for r in mod.missed_owner_messages(s, e)] == ["O1"]
+    assert "QR" in mod.outage_reason(s, e)
+    handled, sent = [], []
+    monkeypatch.setattr(mod, "handle", lambda r: handled.append(r[0]))
+    monkeypatch.setattr(mod, "send", lambda chat, text, media=None, quoted=None: sent.append((chat, text)) or True)
+    mod.report_reconnect(start, now, False, settle=0)
+    assert handled == ["O1"]
+    assert sent and sent[-1][0] == mod.PRIMARY and "נמצאו 1" in sent[-1][1] and "20" in sent[-1][1]
+    # a short blip with nothing missed stays quiet
+    sent.clear()
+    mod.report_reconnect(now - mod.dt.timedelta(seconds=50), now, False, settle=0)
+    assert not sent
+
+
+def test_schedule_time_parsing(agent):
+    mod, _ = agent
+    now = mod.dt.datetime(2026, 11, 8, 13, 0)
+    d = mod.dt.datetime
+    assert mod.parse_send_time("08:00", now) == d(2026, 11, 9, 8, 0), "a passed hour today = tomorrow"
+    assert mod.parse_send_time("ב-17:30", now) == d(2026, 11, 8, 17, 30)
+    assert mod.parse_send_time("מחר 08:00", now) == d(2026, 11, 9, 8, 0)
+    assert mod.parse_send_time("שלח ב 8", now) == d(2026, 11, 9, 8, 0)
+    assert mod.parse_send_time("מחר ב-9", now) == d(2026, 11, 9, 9, 0)
+    assert mod.parse_send_time("15:00.", now) == d(2026, 11, 8, 15, 0)
+    for no in ("תשנה את השעה ל-08:00 בטיוטה", "25:00", "שלום", "", "8 קסדות"):
+        assert mod.parse_send_time(no, now) is None, no
+
+
+def test_reply_to_card_schedules_and_sends(agent, monkeypatch):
+    mod, db = agent
+    db.execute("ALTER TABLE messages ADD COLUMN quoted_id TEXT")
+    db.execute("CREATE TABLE drafts (id INTEGER PRIMARY KEY, recipient TEXT, status TEXT, card_id TEXT)")
+    db.execute("INSERT INTO drafts VALUES (7, '972500000009@s.whatsapp.net', 'pending', 'CARD7')")
+    db.execute("INSERT INTO messages VALUES ('R1', ?, 'me', '20:00', '2026-11-08 13:00:00+02:00', 1, '', '', 'CARD7')", (mod.PRIMARY,))
+    db.commit()
+    sent, decided = [], []
+    monkeypatch.setattr(mod, "send", lambda chat, text, media=None, quoted=None: sent.append(text) or True)
+    monkeypatch.setattr(mod, "react", lambda *a: None)
+    monkeypatch.setattr(mod, "bridge", lambda path, body=None, **k: decided.append((path, body)) or {"success": True})
+    assert mod.schedule_from_reply(mod.PRIMARY, "R1", "20:00")
+    assert "טיוטה #7" in sent[-1]
+    with mod.adb() as a:
+        a.execute("UPDATE scheduled_drafts SET send_at = '2000-01-01T00:00:00'")
+    mod.scheduled_check()
+    assert decided == [("/draft_decide", {"id": 7, "approve": True})]
+    mod.scheduled_check()
+    assert len(decided) == 1, "a schedule fires once"
+    # cancel on a card whose schedule already fired: nothing to cancel -> ordinary message
+    assert not mod.schedule_from_reply(mod.PRIMARY, "R1", "בטל")
+    # not a reply to a card -> an ordinary message
+    db.execute("INSERT INTO messages VALUES ('R2', ?, 'me', '20:00', '2026-11-08 13:01:00+02:00', 1, '', '', NULL)", (mod.PRIMARY,))
+    db.commit()
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    assert not mod.schedule_from_reply(mod.PRIMARY, "R2", "20:00")
+
+
+def test_schedule_skips_a_draft_that_is_no_longer_pending(agent, monkeypatch):
+    mod, db = agent
+    db.execute("CREATE TABLE drafts (id INTEGER PRIMARY KEY, recipient TEXT, status TEXT, card_id TEXT)")
+    db.execute("INSERT INTO drafts VALUES (8, 'x', 'sent', 'CARD8')")
+    db.commit()
+    sent, decided = [], []
+    monkeypatch.setattr(mod, "send", lambda chat, text, media=None, quoted=None: sent.append(text) or True)
+    monkeypatch.setattr(mod, "bridge", lambda path, body=None, **k: decided.append(body) or {"success": True})
+    with mod.adb() as a:
+        a.execute("INSERT INTO scheduled_drafts (draft_id, send_at, chat) VALUES (8, '2000-01-01T00:00:00', ?)", (mod.PRIMARY,))
+    mod.scheduled_check()
+    assert not decided and "כבר לא ממתינה" in sent[-1]
+
+
+def test_morning_summary_extract(multi):
+    mod, db = multi
+    db.execute("CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP)")
+    db.execute("INSERT INTO chats VALUES ('972500000002@s.whatsapp.net', 'דנה', NULL)")
+    db.execute("INSERT INTO chats VALUES ('972500000003@s.whatsapp.net', 'רון', NULL)")
+    now = mod.dt.datetime.now().astimezone().replace(microsecond=0)
+
+    def ts(m):
+        return (now - mod.dt.timedelta(minutes=m)).isoformat(sep=" ")
+    db.executemany("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, '')", [
+        ("a", "972500000002@s.whatsapp.net", "972500000002", "אתה מגיע מחר?", ts(50), 0, ""),   # Dana waits for an answer
+        ("b", "972500000003@s.whatsapp.net", "972500000003", "תודה", ts(40), 0, ""),
+        ("c", "972500000003@s.whatsapp.net", "me", "בשמחה", ts(30), 1, ""),                      # Ron was answered
+        ("d", mod.PRIMARY, "me", "הודעה בקבוצת הבקרה", ts(20), 1, ""),                            # control group -> excluded
+        ("e", "120363777@g.us", "972500000004", "", ts(10), 0, "sticker"),                         # sticker-only chat -> skipped
+    ])
+    db.commit()
+    lines, waiting = mod.summary_extract(now - mod.dt.timedelta(hours=2), now)
+    text = "\n".join(lines)
+    assert "## דנה" in text and "## רון" in text and "קבוצת הבקרה" not in text and "120363777" not in text
+    assert [w[0] for w in waiting] == ["דנה"]
+
+
+def test_tts_text_cleaning(agent):
+    mod, _ = agent
+    t = mod.tts_clean("*סיכום:* _הכול_ תקין ✅🙂\nראה https://example.com/x\n`code`")
+    assert "*" not in t and "_" not in t and "✅" not in t and "http" not in t and "code" not in t
+    assert "סיכום" in t and "קישור" in t
+    c = mod.tts_clean("משפט ארוך שחוזר על עצמו. " * 100)
+    assert len(c) < 900 and c.endswith("ההמשך בהודעה הכתובה.")

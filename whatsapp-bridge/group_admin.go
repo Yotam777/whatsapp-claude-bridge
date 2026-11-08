@@ -5,7 +5,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -215,8 +214,6 @@ func registerAdminAPI(client *whatsmeow.Client) {
 		_, err = client.UpdateBlocklist(ctx, j, events.BlocklistChangeAction(act), "")
 		return nil, err
 	})
-
-	_ = base64.StdEncoding
 }
 
 type errString string

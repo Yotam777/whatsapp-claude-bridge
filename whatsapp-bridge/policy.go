@@ -11,10 +11,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -134,16 +136,36 @@ func pauseSends(client *whatsmeow.Client, d time.Duration, reason string) {
 	}
 }
 
-// looksLikeBlock recognises send errors that mean WhatsApp is throttling or restricting the account.
+// blockSendCodes: send-ack error codes WhatsApp uses when it throttles or restricts the ACCOUNT (not one chat):
+// 429 rate limit, 463 reach-out time-lock (too many messages to new contacts), 475 account restricted.
+var blockSendCodes = map[int]bool{429: true, 463: true, 475: true}
+
+// looksLikeBlock recognises send errors that mean WhatsApp is throttling or restricting the account. Ordinary
+// per-chat errors (a contact blocked us, we are not in that group, forbidden / not-authorized for one chat, timeouts)
+// do NOT count — they used to pause every send for 6 hours.
 func looksLikeBlock(err error) bool {
+	if err == nil {
+		return false
+	}
+	var iq *whatsmeow.IQError
+	if errors.As(err, &iq) {
+		return iq.Code == 429 || iq.Text == "rate-overlimit"
+	}
 	s := strings.ToLower(err.Error())
-	for _, k := range []string{"463", "475", "429", "rate-overlimit", "rate overlimit", "too many", "blocked", "spam", "not-authorized", "403"} {
-		if strings.Contains(s, k) {
-			return true
+	if strings.Contains(s, "rate-overlimit") || strings.Contains(s, "rate overlimit") || strings.Contains(s, "too many requests") {
+		return true
+	}
+	// "server returned error 463" (whatsmeow.ErrServerReturnedError + code)
+	if errors.Is(err, whatsmeow.ErrServerReturnedError) || strings.Contains(s, "server returned error") {
+		if m := serverCodeRe.FindStringSubmatch(s); m != nil {
+			code, _ := strconv.Atoi(m[1])
+			return blockSendCodes[code]
 		}
 	}
 	return false
 }
+
+var serverCodeRe = regexp.MustCompile(`server returned error (\d+)`)
 
 // draftCardText is the draft card posted in the control group. The approval hint comes first, so it is the first
 // thing seen on a phone: long-press this message → ✅ (or 👍) sends exactly this one message; ❌ cancels.
@@ -155,6 +177,7 @@ func draftCardText(draftID int64, name string, jid types.JID, message, mediaPath
 	}
 	card.WriteString(fmt.Sprintf("🤖 📝 *טיוטה%s → %s*\n", num, name))
 	card.WriteString("👆 *לאישור: לחיצה ארוכה על ההודעה הזו ← ✅ או 👍* (הודעה אחת, לנמען הזה בלבד) · ❌ לביטול\n")
+	card.WriteString("🕗 או השב לכרטיס עם שעה (08:00) — שליחה מתוזמנת\n")
 	if jid.Server == types.DefaultUserServer {
 		// %20 instead of '+' (safer in wa.me); long links get cut by WhatsApp's link detection, so skip them
 		q := strings.ReplaceAll(url.QueryEscape(message), "+", "%20")

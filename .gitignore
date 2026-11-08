@@ -33,3 +33,4 @@ agent/tmp/
 agent/*.request
 agent/*.tmp
 agent/stop.request
+agent/voice_tmp/

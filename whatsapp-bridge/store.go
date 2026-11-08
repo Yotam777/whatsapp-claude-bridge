@@ -1,0 +1,209 @@
+package main
+
+// SQLite message store: chats, messages (upsert keeps edits/deletes), media info.
+
+import (
+	"database/sql"
+	"fmt"
+	"os"
+	"time"
+
+	_ "github.com/mattn/go-sqlite3"
+
+	waProto "go.mau.fi/whatsmeow/binary/proto"
+)
+
+// Message represents a chat message for our client
+type Message struct {
+	Time      time.Time
+	Sender    string
+	Content   string
+	IsFromMe  bool
+	MediaType string
+	Filename  string
+}
+
+// Database handler for storing message history
+type MessageStore struct {
+	db *sql.DB
+}
+
+// Initialize message store
+func NewMessageStore() (*MessageStore, error) {
+	// Create directory for database if it doesn't exist
+	if err := os.MkdirAll("store", 0755); err != nil {
+		return nil, fmt.Errorf("failed to create store directory: %v", err)
+	}
+
+	// Open SQLite database for messages
+	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on&_journal_mode=WAL&_busy_timeout=10000")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open message database: %v", err)
+	}
+
+	// Create tables if they don't exist
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS chats (
+			jid TEXT PRIMARY KEY,
+			name TEXT,
+			last_message_time TIMESTAMP
+		);
+		
+		CREATE TABLE IF NOT EXISTS messages (
+			id TEXT,
+			chat_jid TEXT,
+			sender TEXT,
+			content TEXT,
+			timestamp TIMESTAMP,
+			is_from_me BOOLEAN,
+			media_type TEXT,
+			filename TEXT,
+			url TEXT,
+			media_key BLOB,
+			file_sha256 BLOB,
+			file_enc_sha256 BLOB,
+			file_length INTEGER,
+			PRIMARY KEY (id, chat_jid),
+			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
+		);
+	`)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to create tables: %v", err)
+	}
+
+	return &MessageStore{db: db}, nil
+}
+
+// Close the database connection
+func (store *MessageStore) Close() error {
+	return store.db.Close()
+}
+
+// Store a chat in the database
+func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
+	_, err := store.db.Exec(
+		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		jid, name, lastMessageTime,
+	)
+	return err
+}
+
+// Store a message in the database
+func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	// Only store if there's actual content or media
+	if content == "" && mediaType == "" {
+		return nil
+	}
+
+	_, err := store.db.Exec(
+		// upsert: a re-delivered message (history sync, retry) must not undo an edit/delete we already recorded
+		`INSERT INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id, chat_jid) DO UPDATE SET
+			sender = excluded.sender,
+			content = CASE WHEN COALESCE(messages.edited,0) = 1 OR COALESCE(messages.deleted,0) = 1 THEN messages.content ELSE excluded.content END,
+			timestamp = excluded.timestamp, is_from_me = excluded.is_from_me,
+			media_type = excluded.media_type, filename = excluded.filename, url = excluded.url,
+			media_key = excluded.media_key, file_sha256 = excluded.file_sha256,
+			file_enc_sha256 = excluded.file_enc_sha256, file_length = excluded.file_length`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+	)
+	return err
+}
+
+// Get messages from a chat
+func (store *MessageStore) GetMessages(chatJID string, limit int) ([]Message, error) {
+	rows, err := store.db.Query(
+		"SELECT sender, content, timestamp, is_from_me, media_type, filename FROM messages WHERE chat_jid = ? ORDER BY timestamp DESC LIMIT ?",
+		chatJID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var messages []Message
+	for rows.Next() {
+		var msg Message
+		var timestamp time.Time
+		err := rows.Scan(&msg.Sender, &msg.Content, &timestamp, &msg.IsFromMe, &msg.MediaType, &msg.Filename)
+		if err != nil {
+			return nil, err
+		}
+		msg.Time = timestamp
+		messages = append(messages, msg)
+	}
+
+	return messages, nil
+}
+
+// Get all chats
+func (store *MessageStore) GetChats() (map[string]time.Time, error) {
+	rows, err := store.db.Query("SELECT jid, last_message_time FROM chats ORDER BY last_message_time DESC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	chats := make(map[string]time.Time)
+	for rows.Next() {
+		var jid string
+		var lastMessageTime time.Time
+		err := rows.Scan(&jid, &lastMessageTime)
+		if err != nil {
+			return nil, err
+		}
+		chats[jid] = lastMessageTime
+	}
+
+	return chats, nil
+}
+
+// Extract text content from a message
+func extractTextContent(msg *waProto.Message) string {
+	if msg == nil {
+		return ""
+	}
+
+	// Try to get text content
+	if text := msg.GetConversation(); text != "" {
+		return text
+	} else if extendedText := msg.GetExtendedTextMessage(); extendedText != nil {
+		return extendedText.GetText()
+	} else if c := msg.GetImageMessage().GetCaption(); c != "" {
+		return c
+	} else if c := msg.GetVideoMessage().GetCaption(); c != "" {
+		return c
+	} else if c := msg.GetDocumentMessage().GetCaption(); c != "" {
+		return c
+	}
+
+	// For now, we're ignoring non-text messages
+	return ""
+}
+
+// Store additional media info in the database
+func (store *MessageStore) StoreMediaInfo(id, chatJID, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	_, err := store.db.Exec(
+		"UPDATE messages SET url = ?, media_key = ?, file_sha256 = ?, file_enc_sha256 = ?, file_length = ? WHERE id = ? AND chat_jid = ?",
+		url, mediaKey, fileSHA256, fileEncSHA256, fileLength, id, chatJID,
+	)
+	return err
+}
+
+// Get media info from the database
+func (store *MessageStore) GetMediaInfo(id, chatJID string) (string, string, string, []byte, []byte, []byte, uint64, error) {
+	var mediaType, filename, url string
+	var mediaKey, fileSHA256, fileEncSHA256 []byte
+	var fileLength uint64
+
+	err := store.db.QueryRow(
+		"SELECT media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length FROM messages WHERE id = ? AND chat_jid = ?",
+		id, chatJID,
+	).Scan(&mediaType, &filename, &url, &mediaKey, &fileSHA256, &fileEncSHA256, &fileLength)
+
+	return mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err
+}

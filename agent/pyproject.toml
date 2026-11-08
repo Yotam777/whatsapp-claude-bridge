@@ -8,6 +8,8 @@ dependencies = []
 [project.optional-dependencies]
 # local voice-note transcription (faster-whisper, ~1.6 GB Hebrew model downloaded on first use)
 voice = ["faster-whisper>=1.1", "av>=12", "edge-tts>=7"]
+# transcription on an NVIDIA GPU (config whisper_device "auto"/"cuda"): the CUDA 12 libraries ctranslate2 needs
+gpu = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12>=9,<10"]
 # project plugins may need these (e.g. reading QR codes, decrypting submissions)
 plugins = ["opencv-python-headless>=4.10", "cryptography>=42"]
 

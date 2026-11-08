@@ -1,3 +1,4 @@
+import os
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -17,6 +18,15 @@ from whatsapp import (
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
+
+# WA_MCP_READONLY=1 (the agent's read-only assistant mode): tools that send, react or change anything are not registered
+# at all, so a Claude run reading other people's messages has nothing to act with.
+READONLY = os.environ.get("WA_MCP_READONLY") == "1"
+
+
+def write_tool():
+    """@mcp.tool() for tools that act on WhatsApp — skipped in read-only mode."""
+    return (lambda fn: fn) if READONLY else mcp.tool()
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -154,7 +164,7 @@ def get_message_context(
     context = whatsapp_get_message_context(message_id, before, after)
     return context
 
-@mcp.tool()
+@write_tool()
 def send_message(
     recipient: str,
     message: str,
@@ -188,7 +198,7 @@ def send_message(
         "message": status_message
     }
 
-@mcp.tool()
+@write_tool()
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
     
@@ -208,7 +218,7 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
         "message": status_message
     }
 
-@mcp.tool()
+@write_tool()
 def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
     
@@ -263,7 +273,7 @@ def get_status() -> Dict[str, Any]:
 
 @mcp.tool()
 def search_all(query: str, limit: int = 30) -> List[Dict[str, Any]]:
-    """Search text in all messages AND in transcripts of voice notes, newest first."""
+    """Search text in all messages AND in transcripts of voice notes, newest first. Use "a|b" for any of several words — Hebrew has many forms of a word (e.g. "ביצה|ביצים|ביצי")."""
     return extras.search(query, limit)
 
 
@@ -285,11 +295,25 @@ def list_drafts(status: str = "pending", limit: int = 20) -> List[Dict[str, Any]
     return extras.drafts(status, limit)
 
 
-@mcp.tool()
+@write_tool()
 def react_to_message(chat_jid: str, message_id: str, emoji: str, sender: str = "") -> Dict[str, Any]:
     """React to a message with an emoji (empty emoji removes the reaction). sender: author of that message (empty = me)."""
     return extras.react(chat_jid, message_id, emoji, sender)
 
+
+
+@mcp.tool()
+def chat_history(chat: str, after: Optional[str] = None, before: Optional[str] = None, limit: int = 200) -> Dict[str, Any]:
+    """One conversation in order, oldest first, with every voice note already transcribed into text — the tool for
+    "what did X ask me today", "how many eggs did my wife want", "summarize the group since yesterday".
+
+    Args:
+        chat: a contact or group name (or part of it, e.g. "אמא"), a phone number, or a chat JID
+        after: ISO date/time, only messages after it (default: the last 24 hours)
+        before: ISO date/time, only messages before it
+        limit: most recent N messages in the window (default 200)
+    """
+    return extras.chat_history(chat, after, before, limit)
 
 
 if __name__ == "__main__":

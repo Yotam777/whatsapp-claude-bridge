@@ -90,6 +90,8 @@ def sync_deps():
     except Exception:
         pass
     extras = ["--extra", "plugins"] + (["--extra", "voice"] if cfg.get("transcribe", True) else [])
+    if cfg.get("transcribe", True) and cfg.get("whisper_device") == "cuda":
+        extras += ["--extra", "gpu"]
     subprocess.run([uv(), "sync", "-q"] + extras, cwd=os.path.join(ROOT, "agent"), check=True)
     subprocess.run([uv(), "sync", "-q"], cwd=os.path.join(ROOT, "whatsapp-mcp-server"), check=True)
 

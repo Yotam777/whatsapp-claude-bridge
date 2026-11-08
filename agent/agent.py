@@ -63,6 +63,9 @@ T = {
         "prompt": "[הודעה מ{owner} {where}, {when}]\n{text}\n\n"
                   "ענה בשפה של {owner}, קצר ולעניין. התשובה שלך תישלח אוטומטית {dest} — אל תשלח אותה בעצמך. "
                   "אם צריך להחזיר קובץ (אקסל, תמונה, PDF) — שמור אותו בתיקייה outbox והוא יישלח אחרי התשובה.",
+        "prompt_ro": "[הודעה מ{owner} {where}, {when}]\n{text}\n\n"
+                     "ענה בשפה של {owner}, קצר ולעניין. התשובה שלך תישלח אוטומטית {dest}. "
+                     "לשאלות על הודעות והקלטות בווצאפ השתמש בכלי whatsapp (chat_history, search_all) — לתמלולי הקלטות כבר יש טקסט.",
     },
     "en": {
         "budget_stop": "💸 Daily cost cap reached (${spent:.2f} of ${budget:.0f}). Start the message with ! to continue anyway (or !!! for a whole hour).",
@@ -82,6 +85,9 @@ T = {
         "prompt": "[Message from {owner} {where}, {when}]\n{text}\n\n"
                   "Answer briefly in {owner}'s language. Your answer is posted {dest} automatically — do not send it yourself. "
                   "To return a file (spreadsheet, image, PDF) save it in the outbox folder; it is sent after your answer.",
+        "prompt_ro": "[Message from {owner} {where}, {when}]\n{text}\n\n"
+                     "Answer briefly in {owner}'s language. Your answer is posted {dest} automatically. "
+                     "For questions about WhatsApp messages and voice notes use the whatsapp tools (chat_history, search_all) — voice notes already have transcripts.",
     },
 }[LANG]
 MSG_DB = os.path.join(STORE, "messages.db")
@@ -557,14 +563,58 @@ def voice_enabled():
     return _voice_ok
 
 
+def _cuda_dll_dirs():
+    """Windows: the CUDA libraries from the pip wheels (nvidia-cublas-cu12, nvidia-cudnn-cu12 — the `gpu` extra) live in
+    site-packages/nvidia/*/bin, which is not on the DLL search path. Add them so ctranslate2 finds cuBLAS / cuDNN."""
+    if os.name != "nt":
+        return
+    try:
+        import nvidia  # namespace package of the nvidia-* wheels
+    except ImportError:
+        return
+    for base in getattr(nvidia, "__path__", []):
+        for sub in os.listdir(base):
+            b = os.path.join(base, sub, "bin")
+            if os.path.isdir(b):
+                os.add_dll_directory(b)
+                os.environ["PATH"] = b + os.pathsep + os.environ.get("PATH", "")
+
+
+def _load_whisper():
+    """config whisper_device: "auto" (default — the GPU when CUDA works, else the CPU), "cuda" or "cpu".
+    GPU = float16 (an RTX card transcribes a minute of speech in about a second); CPU = int8."""
+    from faster_whisper import WhisperModel
+    want = (CFG.get("whisper_device") or "auto").lower()
+    name = CFG["whisper_model"]
+    if want in ("auto", "cuda"):
+        try:
+            _cuda_dll_dirs()
+            import ctranslate2
+            if ctranslate2.get_cuda_device_count() > 0:
+                m = WhisperModel(name, device="cuda", compute_type=CFG.get("whisper_compute_type") or "float16")
+                log("whisper model loaded on the GPU:", name)
+                return m, "cuda"
+            if want == "cuda":
+                log("whisper_device=cuda but no CUDA device was found — using the CPU")
+        except Exception as e:
+            log("whisper on the GPU failed, using the CPU:", e)
+    m = WhisperModel(name, device="cpu", compute_type="int8")
+    log("whisper model loaded on the CPU:", name)
+    return m, "cpu"
+
+
+_whisper_device = None
+
+
 def transcribe(path):
-    global _whisper
+    global _whisper, _whisper_device
     with _whisper_lock:
         if _whisper is None:
-            from faster_whisper import WhisperModel
             log("loading whisper model", CFG["whisper_model"])
-            _whisper = WhisperModel(CFG["whisper_model"], device="cpu", compute_type="int8")
-        segs, _ = _whisper.transcribe(decode_audio(path), language=CFG.get("whisper_language", "he"), vad_filter=True, beam_size=1)
+            _whisper, _whisper_device = _load_whisper()
+        # on the GPU a wider beam costs almost nothing and gives better Hebrew; on the CPU keep it greedy (fast)
+        beam = int(CFG.get("whisper_beam_size") or (5 if _whisper_device == "cuda" else 1))
+        segs, _ = _whisper.transcribe(decode_audio(path), language=CFG.get("whisper_language", "he"), vad_filter=True, beam_size=beam)
         return " ".join(s.text.strip() for s in segs).strip()
 
 
@@ -737,18 +787,41 @@ def stop_applies(target, chat, active):
     return chat == PRIMARY or len(active) <= 1
 
 
-def _run_claude(prompt, model, resume, timeout, on_stage=None, append=None, chat=None, tools=None, max_budget=None, stoppable=None):
-    """One headless Claude Code run; the prompt goes in on stdin (no command-line length limit, no cmd.exe quoting).
-    tools="" = a restricted run: no tools and no MCP servers at all (for classifying other people's text)."""
+READONLY_TOOLS = "Read,Glob,Grep,WebSearch"  # built-in tools of an assistant_mode=readonly run: nothing that runs, writes or sends
+
+
+def readonly():
+    """config assistant_mode "readonly": Claude answers and searches WhatsApp but cannot run commands, edit files or send
+    anything. Reading other people's messages is then safe: an instruction hidden in a message has no tool to act with."""
+    return (CFG.get("assistant_mode") or "full") == "readonly"
+
+
+def readonly_mcp_config():
+    """MCP config (JSON string) for the read-only WhatsApp server: the same server the plugin uses, started with
+    WA_MCP_READONLY=1 so its send / react tools are not even registered."""
+    uvx = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe")
+    return json.dumps({"mcpServers": {"whatsapp": {
+        "command": uvx, "args": ["--directory", os.path.join(ROOT, "whatsapp-mcp-server"), "run", "main.py"],
+        "env": {"WA_TOOL_ROOT": ROOT, "WA_MCP_READONLY": "1"}}}}, ensure_ascii=False)
+
+
+def claude_cmd(model, resume, append=None, tools=None, max_budget=None):
+    """The `claude -p` command line of one run."""
+    ro = readonly() and tools != ""
     # config "permission_mode" (default "auto"; e.g. "bypassPermissions" on a PC where nothing should wait for a click);
-    # restricted runs over other people's text never get more than "auto"
-    mode = "auto" if tools == "" else CFG.get("permission_mode", "auto")
+    # restricted runs over other people's text never get more than "auto"; a read-only run allows only its listed tools
+    mode = "dontAsk" if ro else "auto" if tools == "" else CFG.get("permission_mode", "auto")
     cmd = [shutil.which("claude") or "claude", "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", mode]
     if model:
         cmd += ["--model", model]
     if append:
         cmd += ["--append-system-prompt", append]
-    if tools is not None:
+    if ro:
+        builtin = CFG.get("readonly_tools") or READONLY_TOOLS
+        cmd += ["--tools", builtin, "--mcp-config", readonly_mcp_config(), "--strict-mcp-config",
+                "--allowedTools", builtin + ",mcp__whatsapp",
+                "--disallowedTools", "Bash,PowerShell,Edit,Write,NotebookEdit,WebFetch"]
+    elif tools is not None:
         cmd += ["--tools", tools, "--strict-mcp-config"]  # --tools alone still loads MCP connector tools (e.g. Gmail send)
     elif CFG.get("strict_mcp"):
         cmd += ["--strict-mcp-config"]  # skip the heavy connector tool lists (Gmail, Shopify...) to cut tokens
@@ -756,6 +829,13 @@ def _run_claude(prompt, model, resume, timeout, on_stage=None, append=None, chat
         cmd += ["--max-budget-usd", f"{float(max_budget):.2f}"]
     if resume:
         cmd += ["--resume", resume]
+    return cmd
+
+
+def _run_claude(prompt, model, resume, timeout, on_stage=None, append=None, chat=None, tools=None, max_budget=None, stoppable=None):
+    """One headless Claude Code run; the prompt goes in on stdin (no command-line length limit, no cmd.exe quoting).
+    tools="" = a restricted run: no tools and no MCP servers at all (for classifying other people's text)."""
+    cmd = claude_cmd(model, resume, append=append, tools=tools, max_budget=max_budget)
     chat = chat or PRIMARY
     if stoppable is None:
         stoppable = on_stage is not None  # only the owner's interactive runs; plugin / hand-off runs never eat a stop request
@@ -1353,7 +1433,7 @@ def run_command(row):
             where, dest = (f'מהמחשב (לוח הבקרה) לקבוצה "{gname}"', "גם לקבוצה בווצאפ") if LANG == "he" else (f'from the PC (dashboard) for group "{gname}"', "to the WhatsApp group too")
         else:
             where, dest = (f'בקבוצה "{gname}" בווצאפ', "לקבוצה") if LANG == "he" else (f'in the WhatsApp group "{gname}"', "to the group")
-        prompt = T["prompt"].format(owner=OWNER, when=when, text=text.lstrip("!").strip(), where=where, dest=dest)
+        prompt = T["prompt_ro" if readonly() else "prompt"].format(owner=OWNER, when=when, text=text.lstrip("!").strip(), where=where, dest=dest)
         if src == "wa" and came_back_from_pc(chat, cid):
             prompt = (T_BACK_HE if LANG == "he" else T_BACK_EN) + prompt
         model, how = pick_model_info(text, chat)

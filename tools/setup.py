@@ -136,11 +136,14 @@ def main():
                       else "👋 This is your chat with Claude. Write any request here."})
     home = os.path.join(AGENT, "home")
     if not os.path.exists(os.path.join(home, "CLAUDE.md")):
-        shutil.copytree(os.path.join(AGENT, "home.example"), home, dirs_exist_ok=True)
+        tpl = "home.readonly.example" if cfg.get("assistant_mode") == "readonly" else "home.example"
+        shutil.copytree(os.path.join(AGENT, tpl), home, dirs_exist_ok=True)
     say("✔ נשמר (מצב שליחה: טיוטות בלבד)", "✔ saved (send mode: drafts only)")
 
     step(5, "התקנת רכיבים", "Installing components")
     extras = ["--extra", "voice"] if cfg["transcribe"] else []
+    if cfg["transcribe"] and cfg.get("whisper_device") == "cuda":
+        extras += ["--extra", "gpu"]  # NVIDIA GPU transcription: the CUDA 12 libraries
     subprocess.run([uv(), "sync", "-q"] + extras + ["--extra", "plugins"], cwd=AGENT, check=True)
     subprocess.run([uv(), "sync", "-q"], cwd=os.path.join(ROOT, "whatsapp-mcp-server"), check=True)
     run_agent = os.path.join(ROOT, "run-agent.cmd")

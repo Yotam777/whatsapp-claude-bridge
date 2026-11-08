@@ -640,3 +640,55 @@ def test_paused_conversation_keeps_commands_queued(agent, monkeypatch):
         assert db.execute("SELECT status FROM commands").fetchall() == [("pending",)], "nothing is lost while paused"
     mod.kv_set("listen_paused", "")
     assert not mod.listening_paused(mod.PRIMARY)
+
+
+def test_readonly_mode_command_line(agent, monkeypatch):
+    mod, _ = agent
+    monkeypatch.setitem(mod.CFG, "assistant_mode", "readonly")
+    cmd = mod.claude_cmd("sonnet", "sid1", append="x")
+    assert cmd[cmd.index("--permission-mode") + 1] == "dontAsk"
+    tools = cmd[cmd.index("--tools") + 1].split(",")
+    assert "Bash" not in tools and "Edit" not in tools and "Write" not in tools and "WebFetch" not in tools
+    assert "--strict-mcp-config" in cmd
+    mcp = json.loads(cmd[cmd.index("--mcp-config") + 1])["mcpServers"]["whatsapp"]
+    assert mcp["env"]["WA_MCP_READONLY"] == "1"
+    assert "Bash" in cmd[cmd.index("--disallowedTools") + 1]
+    assert cmd[-2:] == ["--resume", "sid1"]
+    # a restricted classification run stays restricted (no MCP at all)
+    r = mod.claude_cmd(None, None, tools="")
+    assert r[r.index("--tools") + 1] == "" and "--mcp-config" not in r
+
+
+def test_full_mode_command_line_unchanged(agent, monkeypatch):
+    mod, _ = agent
+    monkeypatch.setitem(mod.CFG, "assistant_mode", "full")
+    cmd = mod.claude_cmd("sonnet", None)
+    assert cmd[cmd.index("--permission-mode") + 1] == mod.CFG.get("permission_mode", "auto")
+    assert "--mcp-config" not in cmd and "--tools" not in cmd
+
+
+def test_readonly_prompt_has_no_outbox(agent, monkeypatch):
+    mod, _ = agent
+    assert "outbox" not in mod.T["prompt_ro"] and "{text}" in mod.T["prompt_ro"]
+
+
+def test_whisper_uses_gpu_and_falls_back_to_cpu(agent, monkeypatch):
+    import types
+    mod, _ = agent
+    made = []
+
+    class WM:
+        def __init__(self, name, device, compute_type):
+            if device == "cuda" and fail["gpu"]:
+                raise RuntimeError("cudnn missing")
+            made.append((device, compute_type))
+    fail = {"gpu": False}
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.SimpleNamespace(WhisperModel=WM))
+    monkeypatch.setitem(sys.modules, "ctranslate2", types.SimpleNamespace(get_cuda_device_count=lambda: 1))
+    monkeypatch.setitem(mod.CFG, "whisper_model", "m")
+    assert mod._load_whisper()[1] == "cuda" and made[-1] == ("cuda", "float16")
+    fail["gpu"] = True
+    assert mod._load_whisper()[1] == "cpu" and made[-1] == ("cpu", "int8")
+    monkeypatch.setitem(mod.CFG, "whisper_device", "cpu")
+    fail["gpu"] = False
+    assert mod._load_whisper()[1] == "cpu"

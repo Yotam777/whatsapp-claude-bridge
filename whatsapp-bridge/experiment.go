@@ -63,6 +63,14 @@ func buildExperiment(client *whatsmeow.Client, kind string) (*waE2E.Message, err
 			Sections: []*waE2E.ListMessage_Section{{Title: proto.String("סטטוס"), Rows: []*waE2E.ListMessage_Row{
 				{RowID: proto.String("1"), Title: proto.String("טופל")}, {RowID: proto.String("2"), Title: proto.String("בטיפול")}}}},
 		}}, nil
+	case "footer":
+		return &waE2E.Message{ViewOnceMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{
+			InteractiveMessage: &waE2E.InteractiveMessage{
+				Body:   &waE2E.InteractiveMessage_Body{Text: proto.String("ניסוי footer בלבד (בלי כפתורים): תודה, תשובתך נרשמה 🙏")},
+				Footer: &waE2E.InteractiveMessage_Footer{Text: proto.String("לשינוי: השב עם מספר המגיעים")},
+			},
+			MessageContextInfo: &waE2E.MessageContextInfo{DeviceListMetadataVersion: proto.Int32(2)},
+		}}}, nil
 	case "interactive":
 		qr := func(id, t string) *waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton {
 			return &waE2E.InteractiveMessage_NativeFlowMessage_NativeFlowButton{Name: proto.String("quick_reply"),
@@ -97,6 +105,9 @@ func registerExperimentAPI(client *whatsmeow.Client) {
 			return nil, err
 		}
 		resp, err := client.SendMessage(ctx, to, msg)
+		if err == nil {
+			recordSent(to, resp.ID, "experiment "+str(b, "kind"), "", "", true, "experiment")
+		}
 		return map[string]any{"id": resp.ID}, err
 	})
 }

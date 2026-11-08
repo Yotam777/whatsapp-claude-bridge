@@ -1783,7 +1783,7 @@ def sent_special(mid):
         db = mdb()
         try:
             return bool(db.execute("SELECT 1 FROM send_log WHERE message_id = ? AND detail IN "
-                                   "('poll','contact','forward','event','mention','location')", (mid,)).fetchone())
+                                   "('poll','contact','forward','event','mention','location','experiment')", (mid,)).fetchone())
         finally:
             db.close()
     except sqlite3.Error:

@@ -73,6 +73,9 @@ func initEnhancedSchema(store *MessageStore) error {
 	// ✅-approval support (ignore "duplicate column" errors on an already migrated db)
 	store.db.Exec("ALTER TABLE drafts ADD COLUMN card_id TEXT")
 	store.db.Exec("ALTER TABLE drafts ADD COLUMN quoted_id TEXT")
+	// special drafts (poll / contact / forward): ✅ rebuilds and sends the real message, not its text description
+	store.db.Exec("ALTER TABLE drafts ADD COLUMN kind TEXT")
+	store.db.Exec("ALTER TABLE drafts ADD COLUMN payload TEXT")
 	return nil
 }
 
@@ -210,35 +213,73 @@ func knownChat(jid string) bool {
 	return n > 0
 }
 
+// todaySends rebuilds today's counters from send_log, so a bridge restart does not reset the daily caps.
+// Only sends to OTHER people count (the owner's chats and control groups are exempt).
+func todaySends() (int, map[string]bool) {
+	n, fresh := 0, map[string]bool{}
+	if globalStore == nil {
+		return n, fresh
+	}
+	rows, err := globalStore.db.Query("SELECT recipient FROM send_log WHERE ok = 1 AND substr(timestamp,1,10) = date('now','localtime')")
+	if err != nil {
+		return n, fresh
+	}
+	var recips []string
+	for rows.Next() {
+		var r string
+		if rows.Scan(&r) == nil {
+			recips = append(recips, r)
+		}
+	}
+	rows.Close()
+	for _, r := range recips {
+		j, err := types.ParseJID(r)
+		if err != nil || isOwnTarget(j) {
+			continue
+		}
+		n++
+		if !fresh[r] && !knownChat(r) {
+			fresh[r] = true
+		}
+	}
+	return n, fresh
+}
+
 // wait blocks until it is reasonable to send to this recipient, or returns an error when a daily cap is hit.
 // Defaults: 3–7 s between any two sends, 20 s between sends to the same chat, 150 sends/day,
 // 15/day to chats that never wrote to us. Override with WA_* environment variables.
+// The owner's own chats and the control groups are exempt from the caps, the same-chat gap and "typing"
+// (replies, draft cards and alerts must never be blocked by a busy day); they keep only the short global gap.
 func (p *pacer) wait(client *whatsmeow.Client, jid types.JID, textLen int) error {
+	own := isOwnTarget(jid)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	today := time.Now().Format("2006-01-02")
 	if p.day != today {
-		p.day, p.sentDay, p.newToday = today, 0, map[string]bool{}
-	}
-	if p.sentDay >= envInt("WA_DAILY_CAP", 150) {
-		return fmt.Errorf("daily send cap reached (%d)", p.sentDay)
+		p.day = today
+		p.sentDay, p.newToday = todaySends()
 	}
 	key := jid.String()
-	if !knownChat(key) && !p.newToday[key] {
-		if len(p.newToday) >= envInt("WA_NEW_CHATS_PER_DAY", 15) {
-			return fmt.Errorf("daily cap for new chats reached")
+	if !own {
+		if p.sentDay >= envInt("WA_DAILY_CAP", 150) {
+			return fmt.Errorf("daily send cap reached (%d)", p.sentDay)
 		}
-		p.newToday[key] = true
+		if !knownChat(key) && !p.newToday[key] {
+			if len(p.newToday) >= envInt("WA_NEW_CHATS_PER_DAY", 15) {
+				return fmt.Errorf("daily cap for new chats reached")
+			}
+			p.newToday[key] = true
+		}
 	}
 	gap := time.Duration(envInt("WA_MIN_GAP_MS", 3000)+rand.Intn(envInt("WA_JITTER_MS", 4000))) * time.Millisecond
 	if d := time.Until(p.last.Add(gap)); d > 0 {
 		time.Sleep(d)
 	}
-	if d := time.Until(p.lastTo[key].Add(time.Duration(envInt("WA_SAME_CHAT_GAP_MS", 20000)) * time.Millisecond)); d > 0 && jid.Server != types.GroupServer {
+	if d := time.Until(p.lastTo[key].Add(time.Duration(envInt("WA_SAME_CHAT_GAP_MS", 20000)) * time.Millisecond)); !own && d > 0 && jid.Server != types.GroupServer {
 		time.Sleep(d)
 	}
 	// look human: show "typing…" for a moment proportional to the text length
-	if textLen > 0 {
+	if textLen > 0 && !own {
 		client.SendChatPresence(context.Background(), jid, types.ChatPresenceComposing, types.ChatPresenceMediaText)
 		typing := time.Duration(min(800+textLen*25, 4000)) * time.Millisecond
 		time.Sleep(typing)
@@ -246,6 +287,8 @@ func (p *pacer) wait(client *whatsmeow.Client, jid types.JID, textLen int) error
 	}
 	p.last = time.Now()
 	p.lastTo[key] = p.last
-	p.sentDay++
+	if !own {
+		p.sentDay++
+	}
 	return nil
 }

@@ -78,13 +78,24 @@ func inList(list []string, jid types.JID) bool {
 	return false
 }
 
+// ownIn: the owner's own chats and the control groups (where Claude talks to the owner).
+func ownIn(p SendPolicy, jid types.JID) bool {
+	return inList(p.Owner, jid) || jid.String() == p.ControlGroup || inList(p.ControlGroups, jid) || isOwnChat(jid)
+}
+
+// isOwnTarget: ownIn with the current policy file (takes policyMu — do not call while holding it).
+func isOwnTarget(jid types.JID) bool {
+	policyMu.Lock()
+	defer policyMu.Unlock()
+	return ownIn(loadPolicy(), jid)
+}
+
 // checkPolicy decides how a send to jid is handled: "send", "draft", or "paused".
 func checkPolicy(jid types.JID) (string, SendPolicy) {
 	policyMu.Lock()
 	defer policyMu.Unlock()
 	p := loadPolicy()
-	own := inList(p.Owner, jid) || jid.String() == p.ControlGroup || inList(p.ControlGroups, jid) || isOwnChat(jid)
-	if own {
+	if ownIn(p, jid) {
 		return "send", p
 	}
 	if t, err := time.Parse(time.RFC3339, p.PausedUntil); err == nil && time.Now().Before(t) {
@@ -164,6 +175,12 @@ func draftCardText(draftID int64, name string, jid types.JID, message, mediaPath
 
 // makeDraft turns a send into a draft card in the control group instead of sending it.
 func makeDraft(client *whatsmeow.Client, p SendPolicy, jid types.JID, message, mediaPath, quotedID string) (bool, string) {
+	return makeDraftKind(client, p, jid, message, mediaPath, quotedID, "", "")
+}
+
+// makeDraftKind: like makeDraft, for special messages — kind ("poll" / "contact" / "forward") + JSON payload are stored
+// so the approval sends the real thing.
+func makeDraftKind(client *whatsmeow.Client, p SendPolicy, jid types.JID, message, mediaPath, quotedID, kind, payload string) (bool, string) {
 	name := jid.User
 	if globalStore != nil {
 		var n string
@@ -177,8 +194,8 @@ func makeDraft(client *whatsmeow.Client, p SendPolicy, jid types.JID, message, m
 	}
 	var draftID int64
 	if globalStore != nil {
-		if r, err := globalStore.db.Exec(`INSERT INTO drafts (recipient, name, message, media_path, created, status, quoted_id) VALUES (?, ?, ?, ?, ?, 'pending', ?)`,
-			jid.String(), name, message, mediaPath, time.Now(), quotedID); err == nil {
+		if r, err := globalStore.db.Exec(`INSERT INTO drafts (recipient, name, message, media_path, created, status, quoted_id, kind, payload) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
+			jid.String(), name, message, mediaPath, time.Now(), quotedID, kind, payload); err == nil {
 			draftID, _ = r.LastInsertId()
 		}
 	}

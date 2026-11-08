@@ -123,9 +123,17 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		// upsert: a re-delivered message (history sync, retry) must not undo an edit/delete we already recorded
+		`INSERT INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id, chat_jid) DO UPDATE SET
+			sender = excluded.sender,
+			content = CASE WHEN COALESCE(messages.edited,0) = 1 OR COALESCE(messages.deleted,0) = 1 THEN messages.content ELSE excluded.content END,
+			timestamp = excluded.timestamp, is_from_me = excluded.is_from_me,
+			media_type = excluded.media_type, filename = excluded.filename, url = excluded.url,
+			media_key = excluded.media_key, file_sha256 = excluded.file_sha256,
+			file_enc_sha256 = excluded.file_enc_sha256, file_length = excluded.file_length`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
@@ -1023,8 +1031,17 @@ func main() {
 			markDisconnected()
 
 		case *events.LoggedOut:
-			logger.Warnf("Device logged out, please scan QR code to log in again")
+			// the session is gone (removed from "Linked devices"): exit so the run-bridge loop restarts into the QR flow
+			logger.Warnf("Device logged out, please scan QR code to log in again — restarting")
 			logConn("logged_out")
+			go func() { time.Sleep(3 * time.Second); os.Exit(1) }()
+
+		case *events.StreamReplaced:
+			// another client took over this session; whatsmeow does not reconnect by itself. Wait (to avoid a
+			// tug-of-war with a second copy) then exit so the loop starts a fresh connection.
+			logger.Warnf("Stream replaced by another client — restarting in 2 minutes")
+			logConn("stream_replaced")
+			go func() { time.Sleep(2 * time.Minute); os.Exit(1) }()
 		}
 	})
 
@@ -1217,17 +1234,15 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 		// Process messages
 		messages := conversation.Messages
 		if len(messages) > 0 {
-			// Update chat with latest message timestamp
-			latestMsg := messages[0]
-			if latestMsg == nil || latestMsg.Message == nil {
-				continue
-			}
-
-			// Get timestamp from message info
+			// Update chat with the latest message timestamp (first message that has one; nil entries are skipped)
 			timestamp := time.Time{}
-			if ts := latestMsg.Message.GetMessageTimestamp(); ts != 0 {
-				timestamp = time.Unix(int64(ts), 0)
-			} else {
+			for _, m := range messages {
+				if m != nil && m.Message != nil && m.Message.GetMessageTimestamp() != 0 {
+					timestamp = time.Unix(int64(m.Message.GetMessageTimestamp()), 0)
+					break
+				}
+			}
+			if timestamp.IsZero() {
 				continue
 			}
 
@@ -1240,14 +1255,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				content := extractTextContent(msg.Message.Message) // includes image/video/document captions
 
 				// Extract media info
 				var mediaType, filename, url string
@@ -1274,7 +1282,11 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 						isFromMe = *msg.Message.Key.FromMe
 					}
 					if !isFromMe && msg.Message.Key.Participant != nil && *msg.Message.Key.Participant != "" {
+						// same format as live messages: bare user, LID mapped to phone when known
 						sender = *msg.Message.Key.Participant
+						if pj, perr := types.ParseJID(sender); perr == nil {
+							sender = normalizeUser(client, pj.User)
+						}
 					} else if isFromMe {
 						sender = client.Store.ID.User
 					} else {

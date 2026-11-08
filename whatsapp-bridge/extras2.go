@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"time"
@@ -170,12 +171,13 @@ func registerExtras2API(client *whatsmeow.Client) {
 	})
 
 	// policy check + pacing; non-send decisions become a text draft describing the item
-	gate := func(to types.JID, describe string) (bool, map[string]any, error) {
+	gate := func(to types.JID, describe, kind string, sp specialPayload) (bool, map[string]any, error) {
 		switch d, pol := checkPolicy(to); d {
 		case "paused":
 			return false, nil, errString("paused: " + pol.PauseReason)
 		case "draft":
-			_, info := makeDraft(client, pol, to, describe, "", "")
+			pj, _ := json.Marshal(sp)
+			_, info := makeDraftKind(client, pol, to, describe, "", "", kind, string(pj))
 			return false, map[string]any{"draft": info}, nil
 		}
 		return true, nil, sendPacer.wait(client, to, len(describe))
@@ -203,15 +205,13 @@ func registerExtras2API(client *whatsmeow.Client) {
 		if m, ok := b["max"].(float64); ok && m >= 1 {
 			max = int(m)
 		}
-		desc := "📊 " + q
-		for _, o := range opts {
-			desc += "\n▫️ " + o
-		}
-		ok, res, err := gate(to, desc+"\n(סקר — שלח ידנית כסקר)")
+		sp := specialPayload{Question: q, Options: opts, Max: max}
+		msg, desc, _ := buildSpecial(client, "poll", sp)
+		ok, res, err := gate(to, desc, "poll", sp)
 		if !ok {
 			return res, err
 		}
-		resp, err := client.SendMessage(ctx, to, client.BuildPollCreation(q, opts, max))
+		resp, err := client.SendMessage(ctx, to, msg)
 		if err == nil {
 			recordSent(to, resp.ID, desc, "", "", true, "poll")
 		}
@@ -228,13 +228,13 @@ func registerExtras2API(client *whatsmeow.Client) {
 		if textOK(name) != nil || name == "" || phone == "" {
 			return nil, errString("need name and phone")
 		}
-		desc := fmt.Sprintf("👤 %s: +%s", name, phone)
-		ok, res, err := gate(to, desc)
+		sp := specialPayload{Name: name, Phone: phone}
+		msg, desc, _ := buildSpecial(client, "contact", sp)
+		ok, res, err := gate(to, desc, "contact", sp)
 		if !ok {
 			return res, err
 		}
-		vcard := fmt.Sprintf("BEGIN:VCARD\nVERSION:3.0\nFN:%s\nTEL;type=CELL;waid=%s:+%s\nEND:VCARD", name, phone, phone)
-		resp, err := client.SendMessage(ctx, to, &waE2E.Message{ContactMessage: &waE2E.ContactMessage{DisplayName: proto.String(name), Vcard: proto.String(vcard)}})
+		resp, err := client.SendMessage(ctx, to, msg)
 		if err == nil {
 			recordSent(to, resp.ID, desc, "", "", true, "contact")
 		}
@@ -267,16 +267,60 @@ func registerExtras2API(client *whatsmeow.Client) {
 		if text == "" {
 			return nil, errString("empty message")
 		}
-		ok, res, err := gate(to, text)
+		sp := specialPayload{Text: text}
+		ok, res, err := gate(to, text, "forward", sp)
 		if !ok {
 			return res, err
 		}
-		resp, err := client.SendMessage(ctx, to, &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-			Text: proto.String(text), ContextInfo: &waE2E.ContextInfo{IsForwarded: proto.Bool(true), ForwardingScore: proto.Uint32(1)},
-		}})
+		msg, _, _ := buildSpecial(client, "forward", sp)
+		resp, err := client.SendMessage(ctx, to, msg)
 		if err == nil {
 			recordSent(to, resp.ID, text, "", "", true, "forward")
 		}
 		return map[string]any{"id": resp.ID}, err
 	})
+}
+
+// specialPayload is what a poll / contact / forward draft stores, so an approval can rebuild the real message.
+type specialPayload struct {
+	Question string   `json:"question,omitempty"`
+	Options  []string `json:"options,omitempty"`
+	Max      int      `json:"max,omitempty"`
+	Name     string   `json:"name,omitempty"`
+	Phone    string   `json:"phone,omitempty"`
+	Text     string   `json:"text,omitempty"`
+}
+
+// buildSpecial builds the WhatsApp message for a special kind and its human-readable description (cards / log).
+func buildSpecial(client *whatsmeow.Client, kind string, sp specialPayload) (*waE2E.Message, string, error) {
+	switch kind {
+	case "poll":
+		if sp.Question == "" || len(sp.Options) < 2 {
+			return nil, "", errString("poll needs a question and >=2 options")
+		}
+		max := sp.Max
+		if max < 1 {
+			max = 1
+		}
+		desc := "📊 " + sp.Question
+		for _, o := range sp.Options {
+			desc += "\n▫️ " + o
+		}
+		return client.BuildPollCreation(sp.Question, sp.Options, max), desc, nil
+	case "contact":
+		if sp.Name == "" || sp.Phone == "" {
+			return nil, "", errString("contact needs name and phone")
+		}
+		vcard := fmt.Sprintf("BEGIN:VCARD\nVERSION:3.0\nFN:%s\nTEL;type=CELL;waid=%s:+%s\nEND:VCARD", sp.Name, sp.Phone, sp.Phone)
+		return &waE2E.Message{ContactMessage: &waE2E.ContactMessage{DisplayName: proto.String(sp.Name), Vcard: proto.String(vcard)}},
+			fmt.Sprintf("👤 %s: +%s", sp.Name, sp.Phone), nil
+	case "forward":
+		if sp.Text == "" {
+			return nil, "", errString("empty forward")
+		}
+		return &waE2E.Message{ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+			Text: proto.String(sp.Text), ContextInfo: &waE2E.ContextInfo{IsForwarded: proto.Bool(true), ForwardingScore: proto.Uint32(1)},
+		}}, sp.Text, nil
+	}
+	return nil, "", errString("unknown kind " + kind)
 }

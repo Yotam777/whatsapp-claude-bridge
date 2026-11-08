@@ -5,10 +5,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
 
@@ -45,9 +48,10 @@ func handleReaction(client *whatsmeow.Client, msg *events.Message) bool {
 
 // decideDraft sends (approve) or cancels exactly one pending draft: one approval = one message to one recipient.
 func decideDraft(client *whatsmeow.Client, id int64, approve bool, control string) (string, error) {
-	var recipient, name, message, media, quoted string
-	err := globalStore.db.QueryRow(`SELECT recipient, name, message, COALESCE(media_path,''), COALESCE(quoted_id,'')
-		FROM drafts WHERE id = ? AND status = 'pending'`, id).Scan(&recipient, &name, &message, &media, &quoted)
+	var recipient, name, message, media, quoted, kind, payload string
+	err := globalStore.db.QueryRow(`SELECT recipient, name, message, COALESCE(media_path,''), COALESCE(quoted_id,''),
+		COALESCE(kind,''), COALESCE(payload,'')
+		FROM drafts WHERE id = ? AND status = 'pending'`, id).Scan(&recipient, &name, &message, &media, &quoted, &kind, &payload)
 	if err != nil {
 		return "", fmt.Errorf("draft %d is not pending", id)
 	}
@@ -62,9 +66,15 @@ func decideDraft(client *whatsmeow.Client, id int64, approve bool, control strin
 		return "", fmt.Errorf("draft %d already handled", id)
 	}
 	go func() {
-		oneShotApproval.Store(recipient, true)
-		ok, detail := sendWhatsAppMessageQuoted(client, recipient, message, media, quoted)
-		oneShotApproval.Delete(recipient) // never leave an approval behind
+		var ok bool
+		var detail string
+		if kind != "" {
+			ok, detail = sendApprovedSpecial(client, recipient, kind, payload)
+		} else {
+			oneShotApproval.Store(recipient, true)
+			ok, detail = sendWhatsAppMessageQuoted(client, recipient, message, media, quoted)
+			oneShotApproval.Delete(recipient) // never leave an approval behind
+		}
 		status, note := "sent", fmt.Sprintf("🤖 ✅ _נשלח ל%s (אישור אחד = הודעה אחת)._", name)
 		if !ok {
 			status, note = "failed", fmt.Sprintf("🤖 ⚠️ _השליחה ל%s נכשלה: %s_", name, detail)
@@ -86,4 +96,38 @@ func registerApprovalAPI(client *whatsmeow.Client) {
 		st, err := decideDraft(client, int64(id), ok, control)
 		return map[string]any{"status": st}, err
 	})
+}
+
+// sendApprovedSpecial sends an approved poll / contact / forward draft as the real message. The approval itself is the
+// permission (no shared one-shot state); a pause and the pacer still apply.
+func sendApprovedSpecial(client *whatsmeow.Client, recipient, kind, payload string) (bool, string) {
+	to, err := types.ParseJID(recipient)
+	if err != nil {
+		return false, err.Error()
+	}
+	policyMu.Lock()
+	p := loadPolicy()
+	policyMu.Unlock()
+	if t, e := time.Parse(time.RFC3339, p.PausedUntil); e == nil && time.Now().Before(t) {
+		return false, "paused: " + p.PauseReason
+	}
+	var sp specialPayload
+	if err := json.Unmarshal([]byte(payload), &sp); err != nil {
+		return false, "bad draft payload"
+	}
+	msg, desc, err := buildSpecial(client, kind, sp)
+	if err != nil {
+		return false, err.Error()
+	}
+	if err := sendPacer.wait(client, to, len(desc)); err != nil {
+		recordSent(to, "", desc, "", "", false, err.Error())
+		return false, err.Error()
+	}
+	resp, err := client.SendMessage(context.Background(), to, msg)
+	if err != nil {
+		recordSent(to, "", desc, "", "", false, err.Error())
+		return false, err.Error()
+	}
+	recordSent(to, resp.ID, desc, "", "", true, kind)
+	return true, "sent"
 }

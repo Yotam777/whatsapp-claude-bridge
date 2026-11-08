@@ -740,7 +740,10 @@ def stop_applies(target, chat, active):
 def _run_claude(prompt, model, resume, timeout, on_stage=None, append=None, chat=None, tools=None, max_budget=None, stoppable=None):
     """One headless Claude Code run; the prompt goes in on stdin (no command-line length limit, no cmd.exe quoting).
     tools="" = a restricted run: no tools and no MCP servers at all (for classifying other people's text)."""
-    cmd = [shutil.which("claude") or "claude", "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "auto"]
+    # config "permission_mode" (default "auto"; e.g. "bypassPermissions" on a PC where nothing should wait for a click);
+    # restricted runs over other people's text never get more than "auto"
+    mode = "auto" if tools == "" else CFG.get("permission_mode", "auto")
+    cmd = [shutil.which("claude") or "claude", "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", mode]
     if model:
         cmd += ["--model", model]
     if append:

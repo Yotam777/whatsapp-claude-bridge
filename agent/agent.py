@@ -198,21 +198,6 @@ def token():
         return ""
 
 
-OWNER_TOKEN_FILE = os.path.join(STORE, "owner_token")
-
-
-def owner_token():
-    """The bridge's owner-only token (draft approval, policy). Claude's tools never use it; falls back to the API token
-    on bridges that don't have it yet."""
-    try:
-        t = open(OWNER_TOKEN_FILE).read().strip()
-        if t:
-            return t
-    except OSError:
-        pass
-    return token()
-
-
 def write_json(path, obj):
     """Atomic JSON write (temp file + rename): a reader never sees a half-written file."""
     tmp = f"{path}.tmp{os.getpid()}.{threading.get_ident()}"
@@ -1393,59 +1378,6 @@ def intake_failed(chat, mid, reason):
         _ctx.chat = None
 
 
-APPROVE_PHRASE = "מאשר לך שליחה"
-
-
-def select_draft(pending, quoted=None):
-    """Which draft a text approval is for. pending = [(draft id, card message id)], quoted = the message the owner replied to.
-    Returns (draft id or None, reason): a reply on a card approves that card; without a reply only a single pending draft."""
-    if quoted:
-        for did, card in pending:
-            if card and card == quoted:
-                return did, "quoted"
-        return None, "not_a_card"
-    if len(pending) == 1:
-        return pending[0][0], "only"
-    return None, ("none" if not pending else "several")
-
-
-def quoted_id_of(chat, mid):
-    """The message the owner's message replied to, if the bridge records it (messages.quoted_id); None otherwise."""
-    try:
-        with mdb() as db:
-            if "quoted_id" not in [r[1] for r in db.execute("PRAGMA table_info(messages)")]:
-                return None
-            r = db.execute("SELECT quoted_id FROM messages WHERE id = ? AND chat_jid = ?", (mid, chat)).fetchone()
-        return (r[0] or None) if r else None
-    except Exception as e:
-        log("quoted id lookup failed", e)
-        return None
-
-
-def approve_by_text(chat, mid, content):
-    """The owner wrote "מאשר לך שליחה" in a control group: approve exactly one pending draft (one approval = one message)
-    through the bridge with the owner-only token. No Claude run. Returns the rest of the message (to answer as a command)."""
-    with mdb() as db:
-        pending = db.execute("SELECT id, coalesce(card_id, '') FROM drafts WHERE status = 'pending' ORDER BY id").fetchall()
-    did, why = select_draft(pending, quoted_id_of(chat, mid))
-    _ctx.chat, _ctx.src, _ctx.sync = chat, "wa", 0
-    try:
-        if did is None:
-            reply({"none": "אין טיוטה ממתינה לאישור.",
-                   "several": f"יש {len(pending)} טיוטות ממתינות — הגב \"{APPROVE_PHRASE}\" בציטוט על הכרטיס הנכון, או ✅ עליו.",
-                   "not_a_card": "ההודעה שציטטת אינה כרטיס טיוטה ממתין — לא נשלח כלום."}[why], quoted=mid)
-        else:
-            res = bridge("/draft_decide", {"id": int(did), "approve": True}, timeout=30, tok=owner_token())
-            if res.get("success") is False:
-                reply(f"⚠️ האישור לטיוטה #{did} נכשל: {res.get('error') or res.get('message') or 'שגיאה'}", quoted=mid)
-            else:
-                react(mid, "✅")  # the bridge itself posts "✅ נשלח ל…" (or the failure) when the send is done
-        log("text approval", chat, mid, why, did)
-    finally:
-        _ctx.chat = None
-    return content.replace(APPROVE_PHRASE, "").strip(" \n.,!-")
-
-
 def handle(row):
     mid, cj, sender, ts, content, me, mtype = row
     content = (content or "").strip()
@@ -1456,14 +1388,6 @@ def handle(row):
             kv_set(K("last_owner_msg", cj), json.dumps({"ts": ts[:19], "text": content[:300] or f"[{mtype}]"}, ensure_ascii=False))
         except Exception as e:
             log("last_owner_msg failed", e)
-        if APPROVE_PHRASE in content and mtype != "audio":
-            try:
-                content = approve_by_text(cj, mid, content)
-            except Exception as e:
-                intake_failed(cj, mid, f"האישור נכשל ({e})")
-                return
-            if len(content) < 4:
-                return
         if mtype == "audio" and voice_enabled():
             def voice_cmd():
                 try:

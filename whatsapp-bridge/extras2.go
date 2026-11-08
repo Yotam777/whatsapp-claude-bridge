@@ -71,8 +71,11 @@ func registerExtras2API(client *whatsmeow.Client) {
 		return nil, client.SetStatusMessage(ctx, types.SetStatusInput{Text: &t})
 	})
 
-	// {"text":"..."} — post a text status (story). Gated: with the api token it becomes an approval card (gate.go).
+	// {"text":"...","approved":true} — post a text status (story). Outward-facing: needs approved=true.
 	adminHandler("/api/post_status", func(ctx context.Context, b map[string]any) (map[string]any, error) {
+		if ok, _ := b["approved"].(bool); !ok {
+			return nil, errString("status posts need approved=true (only after Yakir approved the exact text)")
+		}
 		t := str(b, "text")
 		if err := textOK(t); err != nil || t == "" {
 			return nil, errString("bad status text")

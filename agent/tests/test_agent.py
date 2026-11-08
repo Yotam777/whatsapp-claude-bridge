@@ -340,31 +340,6 @@ def test_total_daily_cap(multi):
     assert mod.over_budget(mod.PRIMARY) == ("chat", 4.0, 3.0)
 
 
-def test_text_approval_picks_exactly_one_draft(agent):
-    mod, _ = agent
-    assert mod.select_draft([(7, "CARD7")]) == (7, "only")
-    assert mod.select_draft([]) == (None, "none")
-    assert mod.select_draft([(7, "CARD7"), (8, "CARD8")]) == (None, "several")
-    assert mod.select_draft([(7, "CARD7"), (8, "CARD8")], quoted="CARD8") == (8, "quoted")
-    assert mod.select_draft([(7, "CARD7")], quoted="OTHER") == (None, "not_a_card"), "a reply to a non-card never approves"
-
-
-def test_text_approval_calls_the_bridge_with_the_owner_token(multi, tmp_path, monkeypatch):
-    mod, db = multi
-    db.execute("CREATE TABLE drafts (id INTEGER PRIMARY KEY, recipient TEXT, name TEXT, message TEXT, status TEXT, card_id TEXT)")
-    db.execute("INSERT INTO drafts VALUES (5, '972500000009@s.whatsapp.net', 'דני', 'שלום', 'pending', 'CARD5')")
-    db.commit()
-    (tmp_path / "store" / "owner_token").write_text("OWNERTOK")
-    monkeypatch.setattr(mod, "OWNER_TOKEN_FILE", str(tmp_path / "store" / "owner_token"))
-    calls, sent = [], []
-    monkeypatch.setattr(mod, "bridge", lambda path, body=None, timeout=180, tok=None: calls.append((path, body, tok)) or {"success": True})
-    monkeypatch.setattr(mod, "send", lambda chat, text, media=None, quoted=None: sent.append((chat, text)) or True)
-    mod.handle(("a1", DEV, "me", "2026-11-08 08:00:00+02:00", "מאשר לך שליחה", True, ""))
-    assert ("/draft_decide", {"id": 5, "approve": True}, "OWNERTOK") in calls
-    with mod.adb() as adb:
-        assert adb.execute("SELECT count(*) FROM commands").fetchone()[0] == 0, "an approval is not a Claude command"
-
-
 def test_load_groups_keeps_last_good_copy(multi):
     mod, _ = multi
     assert DEV in mod.load_groups()

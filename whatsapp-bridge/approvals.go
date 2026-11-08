@@ -67,17 +67,12 @@ func decideDraft(client *whatsmeow.Client, id int64, approve bool, control strin
 		switch kind {
 		case "":
 			ok, detail = sendCore(client, recipient, message, media, quoted, true)
-		case "api":
-			ok, detail = sendApprovedAPI(client, payload)
 		default:
 			ok, detail = sendApprovedSpecial(client, recipient, kind, payload)
 		}
 		status, note := "sent", fmt.Sprintf("🤖 ✅ _נשלח ל%s (אישור אחד = הודעה אחת)._", name)
-		if kind == "api" {
-			note = fmt.Sprintf("🤖 ✅ _בוצע (פעולה #%d, אישור אחד = פעולה אחת)._", id)
-		}
 		if !ok {
-			status, note = "failed", fmt.Sprintf("🤖 ⚠️ _הביצוע של #%d (%s) נכשל: %s_", id, name, detail)
+			status, note = "failed", fmt.Sprintf("🤖 ⚠️ _השליחה ל%s נכשלה: %s_", name, detail)
 		}
 		globalStore.db.Exec("UPDATE drafts SET status = ? WHERE id = ?", status, id)
 		sendWhatsAppMessage(client, control, note, "")

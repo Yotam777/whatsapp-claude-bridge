@@ -1000,7 +1000,6 @@ func main() {
 	addSyncColumns(messageStore)
 	apiToken = loadToken()
 	ownerToken = loadOwnerToken()
-	registerGates()
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {

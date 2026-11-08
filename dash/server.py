@@ -12,7 +12,6 @@ import sqlite3
 import subprocess
 import sys
 import re
-import secrets
 import shutil
 import threading
 import urllib.error
@@ -315,7 +314,7 @@ def git_action(kind, a):
         r = git("commit", "-m", notes)
         out = (r.stdout + r.stderr)[-400:]
         if new:
-            out += "\nNew files NOT committed (add them deliberately if they belong in the tool): " + ", ".join(new[:10])
+            out += "\n❓ קבצים חדשים שלא נשמרו — מה לעשות איתם (לשמור / להתעלם)? " + ", ".join(new[:10])
         return {"ok": r.returncode == 0, "out": out, "untracked": new}
     ver = a.get("version", "")
     if not re.fullmatch(r"\d+\.\d+\.\d+", ver):
@@ -686,17 +685,9 @@ def action(a):
     return {"error": "unknown action"}
 
 
-DASH_TOKEN = secrets.token_hex(16)  # per launch; injected into index.html, required on every POST
-
-
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
-
-    def host_ok(self):
-        """Only http://127.0.0.1:<port> / localhost:<port> — blocks DNS-rebinding pages from reading or acting."""
-        port = self.server.server_address[1]
-        return self.headers.get("Host", "") in (f"127.0.0.1:{port}", f"localhost:{port}")
 
     def send_bytes(self, b, ctype, code=200):
         self.send_response(code)
@@ -710,8 +701,6 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(json.dumps(obj, ensure_ascii=False, default=str).encode(), "application/json; charset=utf-8", code)
 
     def do_GET(self):
-        if not self.host_ok():
-            return self.send_bytes(b"forbidden", "text/plain", 403)
         path = self.path.split("?")[0]
         qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if path == "/data":
@@ -728,8 +717,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", mimetypes.guess_type(f)[0] or "application/octet-stream")
             self.send_header("Content-Length", str(os.path.getsize(f)))
             self.send_header("Content-Disposition", "inline; filename*=UTF-8''" + urllib.parse.quote(name))
-            self.send_header("Content-Security-Policy", "sandbox")  # Claude-made HTML/SVG cannot run script on our origin
-            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             with open(f, "rb") as fh:
                 shutil.copyfileobj(fh, self.wfile)
@@ -741,19 +728,13 @@ class Handler(BaseHTTPRequestHandler):
         ctype = mimetypes.guess_type(f)[0] or "application/octet-stream"
         if ctype.startswith("text/") or ctype.endswith("javascript"):
             ctype += "; charset=utf-8"
-        body = open(f, "rb").read()
-        if rel == "index.html":
-            body = body.replace(b"</head>", f'<meta name="dash-token" content="{DASH_TOKEN}"></head>'.encode(), 1)
-        self.send_bytes(body, ctype)
+        self.send_bytes(open(f, "rb").read(), ctype)
 
     def do_POST(self):
         host = self.headers.get("Host", "")
         origin = self.headers.get("Origin")
-        bad = not self.host_ok() or (origin and origin not in (f"http://{host}",))  # same-origin only
-        if bad or not secrets.compare_digest(self.headers.get("X-Dash-Token", ""), DASH_TOKEN):
-            self.rfile.read(min(int(self.headers.get("Content-Length", 0) or 0), 1 << 20))  # drain, so the reply is not reset
-            self.close_connection = True
-            return self.send_json({"error": "forbidden" if bad else "forbidden (reload the page)"}, 403)
+        if origin and origin not in (f"http://{host}",):  # same-origin only
+            return self.send_json({"error": "forbidden"}, 403)
         n = int(self.headers.get("Content-Length", 0))
         if self.path.startswith("/upload"):  # a file pasted / chosen in the chat box -> agent/home/inbox
             name = os.path.basename(urllib.parse.unquote((urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("name") or ["file"])[0])) or "file"

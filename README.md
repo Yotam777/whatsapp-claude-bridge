@@ -76,8 +76,7 @@ When asked, point **WhatsApp bridge folder** at the folder where you ran `setup.
 | File | What |
 |---|---|
 | `agent/config.json` | control group, owner name, language (`he`/`en`), budget, transcription, backups, plugins (template: `config.example.json`) |
-| `whatsapp-bridge/store/send_policy.json` | owner chats, control group(s), pause (always draft mode; changes need the owner token) |
-| `whatsapp-bridge/store/api_token` · `owner_token` | API password for Claude's tools · owner-only password (dashboard / agent): approve drafts, change policy, direct outward actions |
+| `whatsapp-bridge/store/send_policy.json` | owner chats, control group, `draft`/`auto`, pause |
 | env `WA_DAILY_CAP`, `WA_NEW_CHATS_PER_DAY`, `WA_MIN_GAP_MS`, `WA_JITTER_MS`, `WA_SAME_CHAT_GAP_MS` | bridge pacing |
 
 ## Development

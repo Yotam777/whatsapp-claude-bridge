@@ -44,12 +44,8 @@
 - כל נמען אחר → **טיוטה**: שורה בטבלת `drafts` + כרטיס בקבוצת הבקרה ("📝 טיוטה #N → שם", "לחיצה ארוכה ← ✅ או 👍", קישור wa.me).
 - תגובת ✅/✔️/👍 **של הבעלים** על הכרטיס → `decideDraft` מסמן `sending` אטומית ושולח **הודעה אחת** (`sendCore(..., approved=true)`); ❌ מבטל.
   טיוטת סקר/איש קשר/העברה שומרת `kind`+`payload` ושולחת את הדבר האמיתי.
-- **שני טוקנים** (`gate.go`): `api_token` — כלים של Claude; `owner_token` — לוח + סוכן בלבד: נדרש ל-`draft_decide` ול-POST `/api/policy`.
-  Claude חסום מלקרוא אותו ומלערוך את `send_policy.json` (`agent/home/.claude/settings.json`, deny).
-- **שער אישור** (`gatedPaths` ב-`gate.go`, במידלוור האימות): סטטוס, אודות, עריכה/מחיקה/הצמדה/תגובה בשיחת אחרים, משתתפים, הגדרות/שם/תמונה של קבוצה
-  שאינה בקרה, איפוס הזמנה, הצטרפות/יציאה, קבוצה עם משתתפים, חסימה — עם api_token הופכים לטיוטה `kind=api` + כרטיס "⚙️ פעולה ממתינה";
-  ✅ משחזר את הבקשה פנימית פעם אחת. עם owner_token — ישיר.
-- `paused_until` עתידי גובר על הכול (גם על אישור). אין מצב auto ואין `allow` (הגשר מתעלם מהם).
+- `allow` = נמען שיקיר אישר במילים ("מאשר לך שליחה", כלל 4 ב-CLAUDE.md — Claude מוסיף, שולח אחת ומנקה). אין מצב auto (הגשר מתעלם ממנו).
+- `paused_until` עתידי גובר על הכול (גם על אישור).
 - קצב (`sendPacer`), מגבלה יומית (נספרת מ-`send_log`, לא מתאפסת בהפעלה מחדש; שיחות הבעלים וקבוצות הבקרה פטורות), עצירה אוטומטית בחשד לחסימה (`pauseSends`).
 - `LoggedOut` → יציאה (הלולאה עולה ל-QR); `StreamReplaced` → יציאה אחרי 2 דק'.
 - הגנת טקסט: `textOK` מסרב ל-"??" / U+FFFD (עברית שנשברה בקונסולה).
@@ -85,7 +81,7 @@
 |---|---|
 | `whatsapp-bridge/store/messages.db` | `messages` (כל ההודעות, edited/deleted), `chats` (שמות), `drafts` (+card_id, quoted_id), `send_log`, `polls`, `poll_votes`, `conn_log` (זמני חיבור לסרגל) |
 | `whatsapp-bridge/store/whatsapp.db` | מצב whatsmeow: מכשיר, מפתחות, `whatsmeow_contacts`, `whatsmeow_lid_map` (LID↔טלפון) |
-| `whatsapp-bridge/store/<chat>/` | מדיה שהורדה · `send_policy.json` · `api_token` · `owner_token` |
+| `whatsapp-bridge/store/<chat>/` | מדיה שהורדה · `send_policy.json` · `api_token` (+`owner_token` ללוח, אותן הרשאות) |
 | `agent/agent.db` | `commands`, `claude_runs` (cost, cum, model), `transcripts`, `sent`, `reminders`, `handled`, `kv` (session_id, live_steps, override_until…), טבלאות תוספים |
 | `agent/config.json` | תצורה אישית (לא בגיט) — מפתחות ב-`config.example.json` + `deep_model`, `session_max_runs`, `maintainer` |
 | `agent/model_override.json` · `agent/models.json` | מודל כפוי (ווצאפ/לוח) · מדריך המודלים (תיאור, עלות, פקודה) |
@@ -99,7 +95,7 @@
 `group_info`/`group_rename`/`group_create`, `git_status`/`git_commit`/`release`, `tool_update_*`, `update_*`).
 `static/app.js`: כותרת מצב, סרגל חיבור 24ש', שיחה (בועות, בועת מצב עם שלבים, הודעה אופטימית באנטר, תפריט לחצן ימני),
 מגירות (טיוטות/נשלחו/התקבלו/תמלולים/עלות), עמודה: קבוצת בקרה · מערכת · מודל · תצוגה (גודל כתב/ממשק, גופן, רקע — localStorage).
-**אבטחה:** בדיקת Host (רק 127.0.0.1/localhost:פורט — חוסם DNS rebinding), טוקן לכל הפעלה שמוזרק ל-index.html ונדרש בכל POST (`X-Dash-Token`), `/lf/` עם `CSP: sandbox`. הלוח קורא לגשר עם `owner_token`. "שמור בגיט" = `git add -u` בלבד (קבצים חדשים רק ידנית).
+"שמור בגיט" = `git add -u` (קבצים חדשים מוצגים עם שאלה מה לעשות). שחרור: קבצי תמונה/אקסל/PDF בגיט → שאלה (`--allow-files` להמשך).
 **חשוב:** האפליקציה השולחנית מכילה עותק ארוז של `static/` — שינוי בלוח מגיע אליה רק בשחרור גרסה; בדפדפן (8770) — מיד.
 
 ## 6. גרסאות, עדכון ושחרור

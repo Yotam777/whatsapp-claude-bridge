@@ -47,8 +47,7 @@ RISKY_OK = ()
 
 def personal_data_scan(patterns):
     files = run(["git", "ls-files"]).split()
-    # binaries are not text-scanned, so a personal photo / Excel / PDF would slip through: refuse them by type
-    hits = [f"{f}: binary/personal file type in the repo" for f in files if f.lower().endswith(RISKY) and f not in RISKY_OK]
+    hits = []
     for f in files:
         if f.endswith((".woff2", ".ico", ".png", ".exe", ".sum", ".lock")) or "chart.umd" in f:
             continue
@@ -103,6 +102,14 @@ def main():
         personal += [o.split("@")[0] for o in pol.get("owner", [])]
     except Exception:
         pass
+    # photos / Excel / PDF are not text-scanned: list them and ASK (the owner decides) — continue with --allow-files
+    files = [f for f in run(["git", "ls-files"]).split() if f.lower().endswith(RISKY) and f not in RISKY_OK]
+    if files and "--allow-files" not in sys.argv:
+        sys.exit("❓ יש בגיט קבצים שכדאי לבדוק לפני פרסום (תמונה / אקסל / PDF):
+" + "
+".join(files)
+                 + "
+מה לעשות? להסיר אותם מהגיט, או להריץ שוב עם --allow-files כדי לפרסם איתם.")
     hits = personal_data_scan([x for x in personal if len(x) > 6])
     if hits:
         sys.exit("✖ נמצא מידע אישי בקבצים שעולים לגיט:\n" + "\n".join(hits))

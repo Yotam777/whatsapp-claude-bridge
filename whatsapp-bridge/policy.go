@@ -95,8 +95,8 @@ func isOwnTarget(jid types.JID) bool {
 func checkPolicy(jid types.JID) (string, SendPolicy) { return checkPolicyApproved(jid, false) }
 
 // checkPolicyApproved: approved=true only for the single send of a draft the owner approved (✅ / dashboard / "מאשר לך
-// שליחה"). There is no auto mode and no standing allow-list any more: "mode", "auto_until" and "allow" in the policy
-// file are ignored. A pause always wins.
+// שליחה"). "allow" holds a recipient approved in words (CLAUDE.md rule 4); there is no auto mode ("mode"/"auto_until"
+// are ignored — the owner's rule). A pause always wins.
 func checkPolicyApproved(jid types.JID, approved bool) (string, SendPolicy) {
 	policyMu.Lock()
 	defer policyMu.Unlock()
@@ -108,6 +108,9 @@ func checkPolicyApproved(jid types.JID, approved bool) (string, SendPolicy) {
 		return "paused", p
 	}
 	if approved {
+		return "send", p
+	}
+	if inList(p.Allow, jid) { // one recipient the owner approved in words ("מאשר לך שליחה" — CLAUDE.md rule 4)
 		return "send", p
 	}
 	return "draft", p
@@ -197,11 +200,7 @@ func makeDraftKind(client *whatsmeow.Client, p SendPolicy, jid types.JID, messag
 			draftID, _ = r.LastInsertId()
 		}
 	}
-	text := draftCardText(draftID, name, jid, message, mediaPath)
-	if kind == "api" {
-		text = apiCardText(draftID, message)
-	}
-	ok, res := sendWhatsAppMessage(client, p.ControlGroup, text, "")
+	ok, res := sendWhatsAppMessage(client, p.ControlGroup, draftCardText(draftID, name, jid, message, mediaPath), "")
 	if ok && draftID > 0 && globalStore != nil {
 		// remember the card's message id (from this send's own result) so a ✅ on it approves exactly this draft
 		if cardID := sentID(res); cardID != "" {

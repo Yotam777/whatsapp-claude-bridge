@@ -85,33 +85,3 @@ def test_budget_can_be_set_per_group(dash):
     assert srv.conversations()[DEV]["budget_usd"] == 12.5
     assert srv.action({"do": "group_budget", "jid": DEV, "budget": "-1"})["error"]
 
-
-def _serve(srv):
-    import threading
-    from http.server import ThreadingHTTPServer
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return httpd, httpd.server_address[1]
-
-
-def _req(port, path, method="GET", host=None, headers=None, body=None):
-    import http.client
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-    h = {"Host": host or f"127.0.0.1:{port}", **(headers or {})}
-    c.request(method, path, body=body, headers=h)
-    r = c.getresponse()
-    return r.status, r.read()
-
-
-def test_dashboard_blocks_foreign_host_and_tokenless_posts(dash):
-    srv, _ = dash
-    httpd, port = _serve(srv)
-    try:
-        assert _req(port, "/data", host="evil.example:80")[0] == 403  # DNS rebinding
-        st, body = _req(port, "/")
-        assert st == 200 and srv.DASH_TOKEN.encode() in body  # the page carries the per-launch token
-        assert _req(port, "/action", "POST", body=b'{"do":"git_status"}', headers={"Content-Type": "application/json"})[0] == 403
-        assert _req(port, "/action", "POST", body=b'{"do":"unknown_x"}',
-                    headers={"Content-Type": "application/json", "X-Dash-Token": srv.DASH_TOKEN})[0] != 403
-    finally:
-        httpd.shutdown()

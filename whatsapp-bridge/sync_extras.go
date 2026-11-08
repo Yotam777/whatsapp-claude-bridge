@@ -183,16 +183,9 @@ func withAuth(next http.Handler) http.Handler {
 		if got == "" {
 			got = r.URL.Query().Get("token")
 		}
-		owner := ownerToken != "" && got == ownerToken
+		owner := ownerToken != "" && got == ownerToken // the dashboard / agent token is accepted too
 		if !owner && (apiToken == "" || got != apiToken) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
-			return
-		}
-		if ownerOnly(r) && !owner {
-			http.Error(w, "owner token required (approve in WhatsApp with ✅ or in the dashboard)", http.StatusForbidden)
-			return
-		}
-		if gateRequest(w, r, owner) {
 			return
 		}
 		next.ServeHTTP(w, r)

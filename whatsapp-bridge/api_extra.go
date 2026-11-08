@@ -100,7 +100,7 @@ func registerExtraAPI(client *whatsmeow.Client) {
 				http.Error(w, "bad json", http.StatusBadRequest)
 				return
 			}
-			p.Mode, p.AutoUntil, p.Allow = "draft", "", nil // no auto mode, no standing allow-list
+			p.Mode, p.AutoUntil = "draft", "" // no auto mode (owner's rule); "allow" stays for rule 4
 			savePolicy(p)
 			policyMu.Unlock()
 		}

@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,7 +45,13 @@ def api(path, body=None):
     tok = open(p if os.path.exists(p) else os.path.join(STORE, "api_token")).read().strip()
     req = urllib.request.Request("http://127.0.0.1:8765/api" + path, data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + tok})
-    return json.loads(urllib.request.urlopen(req, timeout=15).read().decode())
+    for attempt in range(3):  # the bridge can drop a connection while it is busy syncing history right after linking
+        try:
+            return json.loads(urllib.request.urlopen(req, timeout=15).read().decode())
+        except (ConnectionError, urllib.error.URLError, TimeoutError):
+            if attempt == 2:
+                raise
+            time.sleep(3)
 
 
 def bridge_running():
@@ -131,9 +138,11 @@ def main():
     cfg["store_dir"] = "whatsapp-bridge/store"
     json.dump(cfg, open(cfg_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     api("/policy", {"owner": [me_pn] + ([me_lid] if me_lid else []), "control_group": cfg["claude_group"], "mode": "draft"})
-    if created:  # the control group is the owner's own chat, so this goes out even in drafts-only mode
+    if created or not cfg.get("greeted"):  # the control group is the owner's own chat: this goes out even in drafts-only mode
         api("/send", {"recipient": cfg["claude_group"], "message": "👋 זו השיחה שלך עם Claude. כתוב כאן כל בקשה." if lang == "he"
                       else "👋 This is your chat with Claude. Write any request here."})
+        cfg["greeted"] = True  # a run that failed before the greeting sends it on the next run
+        json.dump(cfg, open(cfg_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     home = os.path.join(AGENT, "home")
     if not os.path.exists(os.path.join(home, "CLAUDE.md")):
         tpl = "home.readonly.example" if cfg.get("assistant_mode") == "readonly" else "home.example"

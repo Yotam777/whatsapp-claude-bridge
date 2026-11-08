@@ -105,11 +105,8 @@ def main():
     # photos / Excel / PDF are not text-scanned: list them and ASK (the owner decides) — continue with --allow-files
     files = [f for f in run(["git", "ls-files"]).split() if f.lower().endswith(RISKY) and f not in RISKY_OK]
     if files and "--allow-files" not in sys.argv:
-        sys.exit("❓ יש בגיט קבצים שכדאי לבדוק לפני פרסום (תמונה / אקסל / PDF):
-" + "
-".join(files)
-                 + "
-מה לעשות? להסיר אותם מהגיט, או להריץ שוב עם --allow-files כדי לפרסם איתם.")
+        sys.exit("❓ יש בגיט קבצים שכדאי לבדוק לפני פרסום (תמונה / אקסל / PDF):\n" + "\n".join(files)
+                 + "\nמה לעשות? להסיר אותם מהגיט, או להריץ שוב עם --allow-files כדי לפרסם איתם.")
     hits = personal_data_scan([x for x in personal if len(x) > 6])
     if hits:
         sys.exit("✖ נמצא מידע אישי בקבצים שעולים לגיט:\n" + "\n".join(hits))

@@ -25,3 +25,6 @@ agent/update.log
 agent/actions.log
 agent/model_override.json
 agent/assets/
+agent/groups.json
+agent/agent.db.bak-*
+agent/restart-agent-once.ps1

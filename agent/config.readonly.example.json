@@ -38,5 +38,6 @@
   "assistant_mode": "readonly",
   "whisper_device": "cuda",
   "deep_model": "sonnet",
-  "total_daily_budget_usd": 1000
+  "total_daily_budget_usd": 1000,
+  "language": "he"
 }

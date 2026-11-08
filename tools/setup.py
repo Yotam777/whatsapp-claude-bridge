@@ -129,17 +129,19 @@ def main():
     say(f"✔ קבוצת בקרה: {cfg['claude_group']}", f"✔ control group: {cfg['claude_group']}")
 
     step(4, "הגדרות", "Settings")
-    cfg["language"] = lang
+    # the wizard's language is only the language of these screens: a config that already says Hebrew (language /
+    # whisper_language) stays Hebrew, so the English wizard can be used where the console shows Hebrew reversed
+    cfg["language"] = cfg.get("language") or ("he" if cfg.get("whisper_language") == "he" else lang)
     cfg["owner_name"] = ask("השם שלך (כך Claude יפנה אליך)", "Your name (how Claude refers to you)", cfg.get("owner_name", "").strip("<>") if not str(cfg.get("owner_name", "")).startswith("<") else "")
     voice = ask("לתמלל הודעות קוליות במחשב? (מוריד מודל של 1.6GB) כ/ל", "Transcribe voice notes locally? (downloads a 1.6 GB model) y/n", "כ" if lang == "he" else "y")
     cfg["transcribe"] = voice.lower() in ("כ", "y", "yes", "כן")
-    if lang == "en":
+    if cfg["language"] == "en":
         cfg["whisper_model"], cfg["whisper_language"] = "large-v3-turbo", "en"
     cfg["store_dir"] = "whatsapp-bridge/store"
     json.dump(cfg, open(cfg_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
     api("/policy", {"owner": [me_pn] + ([me_lid] if me_lid else []), "control_group": cfg["claude_group"], "mode": "draft"})
     if created or not cfg.get("greeted"):  # the control group is the owner's own chat: this goes out even in drafts-only mode
-        api("/send", {"recipient": cfg["claude_group"], "message": "👋 זו השיחה שלך עם Claude. כתוב כאן כל בקשה." if lang == "he"
+        api("/send", {"recipient": cfg["claude_group"], "message": "👋 זו השיחה שלך עם Claude. כתוב כאן כל בקשה." if cfg["language"] == "he"
                       else "👋 This is your chat with Claude. Write any request here."})
         cfg["greeted"] = True  # a run that failed before the greeting sends it on the next run
         json.dump(cfg, open(cfg_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)

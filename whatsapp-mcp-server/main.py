@@ -316,6 +316,19 @@ def chat_history(chat: str, after: Optional[str] = None, before: Optional[str] =
     return extras.chat_history(chat, after, before, limit)
 
 
+@mcp.tool()
+def transcribe_voice_note(chat: str, message_id: Optional[str] = None, wait_seconds: int = 120) -> Dict[str, Any]:
+    """Transcribe voice notes that have no text yet (e.g. ones that arrived before the agent was running) and return the
+    text. Use it when chat_history shows "(voice note, not transcribed yet)".
+
+    Args:
+        chat: contact or group name, phone number, or chat JID
+        message_id: one voice note's id (from chat_history); omit for the chat's recent untranscribed notes (last 7 days, up to 10)
+        wait_seconds: how long to wait for the text (default 120)
+    """
+    return extras.transcribe_voice_note(chat, message_id, wait_seconds)
+
+
 if __name__ == "__main__":
     # Initialize and run the server
     mcp.run(transport='stdio')

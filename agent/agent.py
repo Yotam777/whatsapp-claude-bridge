@@ -65,7 +65,7 @@ T = {
                   "אם צריך להחזיר קובץ (אקסל, תמונה, PDF) — שמור אותו בתיקייה outbox והוא יישלח אחרי התשובה.",
         "prompt_ro": "[הודעה מ{owner} {where}, {when}]\n{text}\n\n"
                      "ענה בשפה של {owner}, קצר ולעניין. התשובה שלך תישלח אוטומטית {dest}. "
-                     "לשאלות על הודעות והקלטות בווצאפ השתמש בכלי whatsapp (chat_history, search_all) — לתמלולי הקלטות כבר יש טקסט.",
+                     "לשאלות על הודעות והקלטות בווצאפ השתמש בכלי whatsapp (chat_history, search_all). להקלטה בלי תמלול השתמש ב-transcribe_voice_note.",
     },
     "en": {
         "budget_stop": "💸 Daily cost cap reached (${spent:.2f} of ${budget:.0f}). Start the message with ! to continue anyway (or !!! for a whole hour).",
@@ -87,7 +87,7 @@ T = {
                   "To return a file (spreadsheet, image, PDF) save it in the outbox folder; it is sent after your answer.",
         "prompt_ro": "[Message from {owner} {where}, {when}]\n{text}\n\n"
                      "Answer briefly in {owner}'s language. Your answer is posted {dest} automatically. "
-                     "For questions about WhatsApp messages and voice notes use the whatsapp tools (chat_history, search_all) — voice notes already have transcripts.",
+                     "For questions about WhatsApp messages and voice notes use the whatsapp tools (chat_history, search_all). For a voice note without a transcript use transcribe_voice_note.",
     },
 }[LANG]
 MSG_DB = os.path.join(STORE, "messages.db")
@@ -146,6 +146,8 @@ def _create_schema(db):
         CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT DEFAULT 'time', text TEXT,
             due TEXT, chat_jid TEXT, ref_ts TEXT, status TEXT DEFAULT 'active', created TEXT, fired TEXT);
         CREATE TABLE IF NOT EXISTS local_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat TEXT, at TEXT, role TEXT, text TEXT, files TEXT);
+        CREATE TABLE IF NOT EXISTS transcribe_requests (id TEXT, chat_jid TEXT, at TEXT, status TEXT DEFAULT 'pending',
+            PRIMARY KEY (id, chat_jid));
         CREATE TABLE IF NOT EXISTS scheduled_drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id INTEGER, send_at TEXT,
             status TEXT DEFAULT 'scheduled', chat TEXT, created TEXT, done TEXT);
     """)
@@ -632,6 +634,90 @@ def transcript_of(chat_jid, msg_id, sender, ts):
         db.execute("INSERT OR REPLACE INTO transcripts VALUES (?, ?, ?, ?, ?, ?)", (msg_id, chat_jid, sender, ts, text, CFG["whisper_model"]))
     log(f"transcribed {msg_id} in {time.time() - t0:.0f}s: {text[:80]}")
     return text
+
+
+def voice_label(chat_jid, sender):
+    """'Name' for a private chat, 'Name · Group' for a group — for transcripts posted to the control group."""
+    names = _contact_names()
+
+    def name(jid):
+        user = (jid or "").split("@")[0]
+        pn = phone_of(jid) if jid.endswith("@lid") else user
+        return names.get(user) or names.get(pn or "") or ("+" + pn if pn else user)
+    if chat_jid.endswith("@g.us"):
+        with mdb() as db:
+            r = db.execute("SELECT name FROM chats WHERE jid=?", (chat_jid,)).fetchone()
+        return f"{name(sender)} · {r[0] if r and r[0] else 'קבוצה'}"
+    return name(chat_jid)
+
+
+def transcribe_and_post(chat_jid, msg_id, sender, ts, me=False):
+    """A voice note from another chat: transcribe it (stored for search) and, with config post_transcripts, post it to
+    the control group as '🎙️ Name: text'. The reply prefix keeps the agent from reading the post as a command."""
+    try:
+        text = transcript_of(chat_jid, msg_id, sender, ts)
+    except Exception as e:
+        log("transcribe failed", msg_id, e)
+        return
+    if not text or me or not CFG.get("post_transcripts") or chat_jid in control_chats():
+        return
+    try:
+        send(PRIMARY, f"{CFG['reply_prefix']}🎙️ *{voice_label(chat_jid, sender)}* ({str(ts)[11:16]}):\n{text}")
+    except Exception as e:
+        log("post transcript failed", e)
+
+
+def backfill_transcripts():
+    """Once at start: voice notes of the last `transcribe_backfill_days` (default 7) that have no transcript yet —
+    newest first, stored for search only (not posted), so questions about older notes work too."""
+    days = int(CFG.get("transcribe_backfill_days", 7) or 0)
+    if not days or not voice_enabled():
+        return
+    since = (dt.datetime.now() - dt.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    with mdb() as db:
+        rows = db.execute("SELECT id, chat_jid, sender, timestamp FROM messages WHERE media_type='audio' AND timestamp > ? "
+                          "ORDER BY timestamp DESC", (since,)).fetchall()
+    with adb() as db:
+        done = {(i, c) for i, c in db.execute("SELECT id, chat_jid FROM transcripts")}
+    todo = [r for r in rows if (r[0], r[1]) not in done]
+    if todo:
+        log(f"backfill: {len(todo)} voice note(s) of the last {days} days")
+    for mid, cj, sender, ts in todo:
+        try:
+            transcript_of(cj, mid, sender, str(ts))
+        except Exception as e:
+            log("backfill transcribe failed", mid, e)
+
+
+def transcribe_requests_loop():
+    """Requests from the WhatsApp MCP tool transcribe_voice_note (a Claude run waiting for one specific note)."""
+    while True:
+        try:
+            with adb() as db:
+                rows = db.execute("SELECT id, chat_jid FROM transcribe_requests WHERE status='pending'").fetchall()
+            for mid, cj in rows:
+                with mdb() as db:
+                    r = db.execute("SELECT sender, timestamp FROM messages WHERE id=? AND chat_jid=?", (mid, cj)).fetchone()
+                status = "failed"
+                try:
+                    if r and voice_enabled() and transcript_of(cj, mid, r[0], str(r[1])):
+                        status = "done"
+                except Exception as e:
+                    log("requested transcribe failed", mid, e)
+                with adb() as db:
+                    db.execute("UPDATE transcribe_requests SET status=? WHERE id=? AND chat_jid=?", (status, mid, cj))
+        except Exception:
+            log("transcribe requests", traceback.format_exc())
+        time.sleep(2)
+
+
+def voice_worker():
+    while True:
+        fn = voice_q.get()
+        try:
+            fn()
+        except Exception:
+            log("voice job", traceback.format_exc())
 
 
 # ---------- headless Claude ----------
@@ -1838,7 +1924,8 @@ def load_plugins():
 # ---------- message intake ----------
 
 work = queue.Queue()  # the owner's intake (voice / files) and reminders: must never wait behind slow jobs
-slow = queue.Queue()  # slow jobs: backup, update / group checks, plugin jobs, other people's voice notes
+voice_q = queue.Queue()  # other people's voice notes: their own queue, so a backup or a check never delays a transcript
+slow = queue.Queue()  # slow jobs: backup, update / group checks, plugin jobs
 
 
 def worker(q=None):
@@ -2034,7 +2121,7 @@ def handle(row):
                 intake_failed(cj, mid, e)
         return
     if mtype == "audio" and CFG.get("transcribe_all_chats") and voice_enabled():
-        slow.put(lambda: transcript_of(cj, mid, sender, ts))
+        voice_q.put(lambda: transcribe_and_post(cj, mid, sender, ts, me))
     for hook in _hooks:
         try:
             hook(row)
@@ -2440,7 +2527,9 @@ if __name__ == "__main__":
             threading.Thread(target=notify_interrupted, args=(cut,), daemon=True).start()
     except Exception:
         log("mark_interrupted failed", traceback.format_exc())
-    for target in [worker, slow_worker, command_worker, scheduler, event_listener, watchdog, tunnel_keeper] + _threads:
+    # backfill on its own thread: the whisper lock interleaves it with live notes instead of queueing them behind it
+    for target in [worker, slow_worker, voice_worker, transcribe_requests_loop, backfill_transcripts, command_worker,
+                   scheduler, event_listener, watchdog, tunnel_keeper] + _threads:
         threading.Thread(target=target, daemon=True).start()
     sys.path.insert(0, ROOT)
     from dash import server as dash_server  # control panel, also on http://127.0.0.1:8770

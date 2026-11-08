@@ -158,7 +158,7 @@ def chat_history(chat: str, after: Optional[str], before: Optional[str], limit: 
         text = r["content"] or ""
         if r["media_type"] == "audio":
             t = voice.get(r["id"])
-            text = f"🎙️ (voice note) {t}" if t else "🎙️ (voice note, not transcribed yet)"
+            text = f"🎙️ (voice note) {t}" if t else "🎙️ (voice note, not transcribed yet — transcribe_voice_note can transcribe it)"
         elif r["media_type"] and not text:
             text = f"[{r['media_type']}]"
         elif r["media_type"]:
@@ -183,3 +183,54 @@ def _sender_name(sender: str) -> str:
         if rows and (rows[0].get("full_name") or rows[0].get("push_name")):
             return rows[0].get("full_name") or rows[0].get("push_name")
     return get_sender_name(sender)
+
+
+# ---------- transcribe one older voice note on request ----------
+
+def transcribe_voice_note(chat: str, message_id: Optional[str], wait_seconds: int) -> Dict[str, Any]:
+    """Ask the agent (which has the speech model) to transcribe voice notes, and wait for the text.
+    message_id = one note; without it, the untranscribed notes of the chat from the last 7 days (up to 10)."""
+    import sqlite3
+    import time
+    from datetime import datetime, timedelta
+    matches = resolve_chat(chat) if "@" not in chat else [{"jid": chat}]
+    if not matches:
+        return {"error": f"no chat matches {chat!r}"}
+    jid = matches[0]["jid"]
+    if message_id:
+        ids = [message_id]
+    else:
+        since = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        ids = [r["id"] for r in _rows(MESSAGES_DB_PATH, "SELECT id FROM messages WHERE chat_jid=? AND media_type='audio' AND timestamp > ? "
+                                                       "ORDER BY timestamp DESC LIMIT 10", (jid, since))]
+    if not ids:
+        return {"chat": jid, "transcripts": [], "note": "no voice notes in this chat in the last 7 days"}
+    db = sqlite3.connect(AGENT_DB, timeout=30)
+    try:
+        db.execute("CREATE TABLE IF NOT EXISTS transcribe_requests (id TEXT, chat_jid TEXT, at TEXT, status TEXT DEFAULT 'pending', "
+                   "PRIMARY KEY (id, chat_jid))")
+        have = {r[0] for r in db.execute(f"SELECT id FROM transcripts WHERE chat_jid=? AND id IN ({','.join('?' * len(ids))})", [jid] + ids)}
+        for i in ids:
+            if i not in have:
+                db.execute("INSERT OR REPLACE INTO transcribe_requests VALUES (?, ?, ?, 'pending')", (i, jid, datetime.now().isoformat()))
+        db.commit()
+        deadline = time.time() + max(5, min(int(wait_seconds), 170))
+        while time.time() < deadline:
+            pending = db.execute(f"SELECT COUNT(*) FROM transcribe_requests WHERE chat_jid=? AND status='pending' AND id IN ({','.join('?' * len(ids))})",
+                                 [jid] + ids).fetchone()[0]
+            if not pending:
+                break
+            time.sleep(1)
+        rows = {r[0]: (r[1], r[2]) for r in db.execute(f"SELECT id, ts, text FROM transcripts WHERE chat_jid=? AND id IN ({','.join('?' * len(ids))})",
+                                                       [jid] + ids)}
+        failed = {r[0] for r in db.execute(f"SELECT id FROM transcribe_requests WHERE chat_jid=? AND status='failed' AND id IN ({','.join('?' * len(ids))})",
+                                           [jid] + ids)}
+    finally:
+        db.close()
+    out = []
+    for i in ids:
+        if i in rows:
+            out.append({"id": i, "time": str(rows[i][0])[:16], "text": rows[i][1]})
+        else:
+            out.append({"id": i, "status": "failed (the recording could not be downloaded)" if i in failed else "still transcribing — try again shortly"})
+    return {"chat": jid, "transcripts": out}

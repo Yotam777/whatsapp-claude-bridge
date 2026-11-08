@@ -692,3 +692,36 @@ def test_whisper_uses_gpu_and_falls_back_to_cpu(agent, monkeypatch):
     monkeypatch.setitem(mod.CFG, "whisper_device", "cpu")
     fail["gpu"] = False
     assert mod._load_whisper()[1] == "cpu"
+
+
+def test_transcript_posted_to_control_group(agent, monkeypatch):
+    mod, _ = agent
+    sent = []
+    monkeypatch.setattr(mod, "send", lambda r, t, **k: sent.append((r, t)) or True)
+    monkeypatch.setattr(mod, "transcript_of", lambda *a: "תביא ביצים")
+    monkeypatch.setattr(mod, "voice_label", lambda c, s: "מיכל")
+    monkeypatch.setitem(mod.CFG, "post_transcripts", True)
+    mod.transcribe_and_post("972500000001@s.whatsapp.net", "v1", "x", "2026-11-09 00:20:00+02:00")
+    assert sent == [(mod.PRIMARY, mod.CFG["reply_prefix"] + "🎙️ *מיכל* (00:20):\nתביא ביצים")]
+    # the owner's own voice notes, and the setting off, post nothing (still transcribed)
+    mod.transcribe_and_post("972500000001@s.whatsapp.net", "v2", "x", "2026-11-09 00:21:00+02:00", me=True)
+    monkeypatch.setitem(mod.CFG, "post_transcripts", False)
+    mod.transcribe_and_post("972500000001@s.whatsapp.net", "v3", "x", "2026-11-09 00:22:00+02:00")
+    assert len(sent) == 1
+
+
+def test_backfill_transcribes_only_missing_recent_notes(agent, monkeypatch):
+    import datetime as _dt
+    mod, db = agent
+    now = _dt.datetime.now()
+    recent, old = (now - _dt.timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S"), (now - _dt.timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+    for mid, ts in (("r1", recent), ("r2", recent), ("o1", old)):
+        db.execute("INSERT INTO messages VALUES (?, 'c@s.whatsapp.net', 'x', '', ?, 0, 'audio', '')", (mid, ts))
+    db.commit()
+    with mod.adb() as a:
+        a.execute("INSERT INTO transcripts VALUES ('r2', 'c@s.whatsapp.net', 'x', '', 'done', 'm')")
+    done = []
+    monkeypatch.setattr(mod, "voice_enabled", lambda: True)
+    monkeypatch.setattr(mod, "transcript_of", lambda c, m, s, t: done.append(m))
+    mod.backfill_transcripts()
+    assert done == ["r1"]

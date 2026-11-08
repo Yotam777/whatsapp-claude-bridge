@@ -39,5 +39,7 @@
   "whisper_device": "cuda",
   "deep_model": "sonnet",
   "total_daily_budget_usd": 1000,
-  "language": "he"
+  "language": "he",
+  "post_transcripts": true,
+  "transcribe_backfill_days": 7
 }

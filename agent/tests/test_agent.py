@@ -725,3 +725,24 @@ def test_backfill_transcribes_only_missing_recent_notes(agent, monkeypatch):
     monkeypatch.setattr(mod, "transcript_of", lambda c, m, s, t: done.append(m))
     mod.backfill_transcripts()
     assert done == ["r1"]
+
+
+def test_bridge_retries_dropped_connection_only_when_safe(agent, monkeypatch):
+    import io
+    mod, _ = agent
+    calls = []
+
+    class Opener:
+        def open(self, req, timeout):
+            calls.append(req.full_url.rsplit("/", 1)[-1])
+            if len(calls) % 2 == 1:
+                raise ConnectionResetError(10054, "forcibly closed")
+            return io.BytesIO(b'{"ok": true}')
+    monkeypatch.setattr(mod, "LOCAL_HTTP", Opener())
+    monkeypatch.setattr(mod, "token", lambda: "t")
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    assert mod.bridge("/react", {}) == {"ok": True} and calls == ["react", "react"]
+    calls.clear()
+    with pytest.raises(ConnectionResetError):
+        mod.bridge("/send", {})
+    assert calls == ["send"]  # never repeated: it may already have gone out

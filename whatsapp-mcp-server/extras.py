@@ -6,6 +6,9 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+_LOCAL = requests.Session()
+_LOCAL.trust_env = False  # the bridge is on this PC: no system / antivirus proxy
+
 from whatsapp import MESSAGES_DB_PATH, TOOL_ROOT, WHATSAPP_API_BASE_URL, _auth
 
 ROOT = TOOL_ROOT
@@ -27,7 +30,7 @@ def _rows(db: str, sql: str, args=()) -> List[Dict[str, Any]]:
 
 def status() -> Dict[str, Any]:
     try:
-        return requests.get(f"{WHATSAPP_API_BASE_URL}/status", headers=_auth(), timeout=10).json()
+        return _LOCAL.get(f"{WHATSAPP_API_BASE_URL}/status", headers=_auth(), timeout=10).json()
     except Exception as e:
         return {"error": str(e)}
 
@@ -64,7 +67,7 @@ def drafts(status_: str, limit: int) -> List[Dict[str, Any]]:
 
 def react(chat_jid: str, message_id: str, emoji: str, sender: str = "") -> Dict[str, Any]:
     try:
-        return requests.post(f"{WHATSAPP_API_BASE_URL}/react", json={"chat_jid": chat_jid, "message_id": message_id,
+        return _LOCAL.post(f"{WHATSAPP_API_BASE_URL}/react", json={"chat_jid": chat_jid, "message_id": message_id,
                              "sender": sender, "emoji": emoji}, headers=_auth(), timeout=30).json()
     except Exception as e:
         return {"success": False, "error": str(e)}

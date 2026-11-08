@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import os.path
 import requests
+
+_LOCAL = requests.Session()
+_LOCAL.trust_env = False  # the bridge is on this PC: no system / antivirus proxy
 import json
 import audio
 
@@ -647,7 +650,7 @@ def send_message(recipient: str, message: str, quoted_message_id: str = "") -> T
         if quoted_message_id:
             payload["quoted_id"] = quoted_message_id  # reply quoting that message
         
-        response = requests.post(url, json=payload, headers=_auth())
+        response = _LOCAL.post(url, json=payload, headers=_auth())
         if response.status_code != 200 and response.headers.get("Content-Type", "").startswith("application/json"):
             result = response.json()  # drafts / pauses come back as non-200 with an explanation
             return result.get("success", False), result.get("message", response.text)
@@ -684,7 +687,7 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload, headers=_auth())
+        response = _LOCAL.post(url, json=payload, headers=_auth())
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -724,7 +727,7 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload, headers=_auth())
+        response = _LOCAL.post(url, json=payload, headers=_auth())
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -757,7 +760,7 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload, headers=_auth())
+        response = _LOCAL.post(url, json=payload, headers=_auth())
         
         if response.status_code == 200:
             result = response.json()

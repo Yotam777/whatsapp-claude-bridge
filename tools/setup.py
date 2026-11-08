@@ -57,7 +57,7 @@ def api(path, body=None):
                                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + tok})
     for attempt in range(3):  # the bridge can drop a connection while it is busy syncing history right after linking
         try:
-            return json.loads(urllib.request.urlopen(req, timeout=15).read().decode())
+            return json.loads(urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=15).read().decode())
         except (ConnectionError, urllib.error.URLError, TimeoutError):
             if attempt == 2:
                 raise

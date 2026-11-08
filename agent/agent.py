@@ -220,17 +220,48 @@ def write_json(path, obj):
     os.replace(tmp, path)
 
 
-def bridge(path, body=None, timeout=180, tok=None):
-    """Call the bridge API (token-protected). Errors that carry a JSON body (drafts, refusals) are returned as data."""
-    req = urllib.request.Request(CFG["bridge_url"] + path, data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + (tok or token())})
-    try:
-        return json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode() or "{}")
-    except urllib.error.HTTPError as e:
+# The bridge is always on this PC: never route it through a system / antivirus proxy (urllib on Windows reads the
+# proxy from the Internet settings, and 127.0.0.1 is not always exempt — a proxy there drops some connections).
+LOCAL_HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# Calls that are safe to repeat when the connection is dropped (a /send or a draft decision is never repeated:
+# the bridge may have done it before the connection broke, and a repeat would double-send).
+IDEMPOTENT = ("/status", "/react", "/edit_message", "/typing", "/download", "/group_info", "/events", "/policy")
+_net_logged = set()
+
+
+def _net_error(path, e, attempt):
+    """One log line per failed bridge call: which call, which error, and (once) the system proxy setting."""
+    kind = type(e).__name__
+    extra = ""
+    if "proxy" not in _net_logged:
+        _net_logged.add("proxy")
         try:
-            return json.loads(e.read().decode() or "{}")
+            extra = f" | system proxies: {urllib.request.getproxies() or 'none'}"
         except Exception:
-            return {"success": False, "message": f"HTTP {e.code}"}
+            pass
+    log(f"bridge {path} {kind} (attempt {attempt}): {e}{extra}")
+
+
+def bridge(path, body=None, timeout=180, tok=None):
+    """Call the bridge API (token-protected). Errors that carry a JSON body (drafts, refusals) are returned as data.
+    A dropped connection (WinError 10054 / 10053) is retried once for calls that are safe to repeat."""
+    data = json.dumps(body).encode() if body is not None else None
+    headers = {"Content-Type": "application/json", "Authorization": "Bearer " + (tok or token())}
+    tries = 2 if path in IDEMPOTENT else 1
+    for attempt in range(1, tries + 1):
+        req = urllib.request.Request(CFG["bridge_url"] + path, data=data, headers=headers)
+        try:
+            return json.loads(LOCAL_HTTP.open(req, timeout=timeout).read().decode() or "{}")
+        except urllib.error.HTTPError as e:
+            try:
+                return json.loads(e.read().decode() or "{}")
+            except Exception:
+                return {"success": False, "message": f"HTTP {e.code}"}
+        except (ConnectionResetError, ConnectionAbortedError, urllib.error.URLError) as e:
+            _net_error(path, e, attempt)
+            if attempt == tries or _refused(e):
+                raise
+            time.sleep(0.5)
 
 
 def send(recipient, text, media=None, quoted=None):
@@ -1117,8 +1148,11 @@ def claude(prompt, model=None, session=True, timeout=900, on_stage=None, chat=No
     except AuthError as e:
         log("claude not signed in", e)
         return AUTH_MSG if interactive else None
+    except FileNotFoundError as e:
+        log(f"claude failed: the claude program was not found ({claude_exe()}) — is Claude Code installed? {e}")
+        return None
     except Exception as e:
-        log("claude failed", e)
+        log(f"claude failed ({type(e).__name__}): {e}\n" + "".join(traceback.format_exc(limit=-3)))
         return None
     if session and res.get("session_id"):
         if res["session_id"] != kv_get(K("session_id", chat)):
@@ -2137,7 +2171,7 @@ def event_listener():
     while True:
         try:
             req = urllib.request.Request(CFG["bridge_url"] + "/events", headers={"Authorization": "Bearer " + token()})
-            with urllib.request.urlopen(req, timeout=90) as resp:
+            with LOCAL_HTTP.open(req, timeout=90) as resp:
                 kv_set("events_connected", dt.datetime.now().isoformat())
                 for line in resp:
                     if line.startswith(b"data:"):
@@ -2297,7 +2331,12 @@ def watchdog():
     limit = dt.timedelta(minutes=CFG.get("disconnect_alert_minutes", 10))
     while True:
         try:
-            st = bridge("/status", timeout=10)
+            try:
+                st = bridge("/status", timeout=10)
+            except Exception as e:  # one dropped connection is not a disconnect: look again before calling it down
+                log("watchdog: status check failed, checking again:", e)
+                time.sleep(5)
+                st = bridge("/status", timeout=10)
             ok = bool(st.get("connected"))
             if st.get("logged_in") is False and not alerted:
                 notify(T["logged_out_t"], T["logged_out_b"])

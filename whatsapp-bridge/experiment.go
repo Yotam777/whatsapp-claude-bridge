@@ -21,7 +21,7 @@ func secret32() []byte {
 	return b
 }
 
-func buildExperiment(client *whatsmeow.Client, kind string) (*waE2E.Message, error) {
+func buildExperiment(client *whatsmeow.Client, kind, text string) (*waE2E.Message, error) {
 	tomorrow := time.Now().Add(24 * time.Hour).Truncate(time.Hour)
 	own := client.Store.ID.ToNonAD()
 	switch kind {
@@ -63,6 +63,11 @@ func buildExperiment(client *whatsmeow.Client, kind string) (*waE2E.Message, err
 			Sections: []*waE2E.ListMessage_Section{{Title: proto.String("סטטוס"), Rows: []*waE2E.ListMessage_Row{
 				{RowID: proto.String("1"), Title: proto.String("טופל")}, {RowID: proto.String("2"), Title: proto.String("בטיפול")}}}},
 		}}, nil
+	case "copy": // plain text for the owner to copy (no reply prefix, no italics); logged so the agent ignores the echo
+		if text == "" {
+			return nil, errString("copy needs text")
+		}
+		return &waE2E.Message{Conversation: proto.String(text)}, nil
 	case "footer":
 		return &waE2E.Message{ViewOnceMessage: &waE2E.FutureProofMessage{Message: &waE2E.Message{
 			InteractiveMessage: &waE2E.InteractiveMessage{
@@ -100,7 +105,7 @@ func registerExperimentAPI(client *whatsmeow.Client) {
 		if !ownIn(loadPolicy(), to) {
 			return nil, errString("experiments go only to the owner's own chats / control groups")
 		}
-		msg, err := buildExperiment(client, str(b, "kind"))
+		msg, err := buildExperiment(client, str(b, "kind"), str(b, "text"))
 		if err != nil {
 			return nil, err
 		}

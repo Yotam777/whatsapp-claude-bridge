@@ -621,7 +621,7 @@ def test_paused_conversation_keeps_commands_queued(agent, monkeypatch):
     notes = []
     monkeypatch.setattr(mod, "reply", lambda t, *a, **k: notes.append((mod._ctx.chat, t)))
     started = []
-    monkeypatch.setattr(mod, "conversation_worker", lambda chat: started.append(chat))
+    monkeypatch.setattr(mod, "conversation_worker", lambda chat: None)  # a leftover dispatcher thread from another test must not count
     mod.enqueue_command("m1", "hello", "2026-11-08 10:00", chat=mod.PRIMARY)
     mod.kv_set("listen_paused", "2026-11-08T10:00:00")
     assert mod.listening_paused(mod.PRIMARY)

@@ -16,7 +16,7 @@ Claude **לא יכול** לשלוח הודעות, להריץ פקודות או �
 
 ## התקנה
 ```
-git clone <הריפו> whatsapp-claude-bridge
+git clone https://github.com/Yotam777/whatsapp-claude-bridge
 cd whatsapp-claude-bridge
 copy agent\config.readonly.example.json agent\config.json
 ```
@@ -38,10 +38,19 @@ setup.cmd
 | `assistant_mode` | `readonly` | Claude מקבל רק כלי חיפוש וקריאה. אין לו Bash, עריכת קבצים או שליחה |
 | `whisper_device` | `cuda` | תמלול על כרטיס המסך, עם חזרה אוטומטית למעבד אם ה-GPU לא זמין |
 | `transcribe_all_chats` | `true` | מתמלל הקלטות בכל השיחות, לא רק בקבוצת Claude |
-| `auto_update` | `false` | בלי הורדת קוד חדש מ-GitHub והרצה שלו כל לילה. מעדכנים ידנית עם `update.cmd` |
+| `auto_update` | `false` | בלי הורדת קוד חדש מ-GitHub והרצה שלו כל לילה |
 | `daily_budget_usd` | `1000` | במנוי, ה"עלות" היא רק הערכה. המגבלה האמיתית היא מכסת המנוי, והסוכן כבר ממתין לבד לאיפוס שלה |
 | `deep_model` | `sonnet` | לא לשרוף את מכסת המנוי על Opus אוטומטית. `!!` בתחילת הודעה עדיין עובד אם תשנה |
 | `voice_replies` | `false` | תשובה קולית שולחת את הטקסט לשירות של מיקרוסופט (edge-tts). אפשר להדליק |
 | `morning_summary` | `false` | סיכום בוקר צורך מהמכסה כל יום. אפשר להדליק |
 
 כדי לחזור למצב המלא (Claude עם גישה מלאה למחשב, טיוטות וכו'): `"assistant_mode": "full"`.
+
+## עדכונים
+זה עותק פרטי של [WallaBoohi/whatsapp-claude-bridge](https://github.com/WallaBoohi/whatsapp-claude-bridge).
+`update.cmd` מחפש גרסאות בריפו המקורי ולכן לא מתאים לעותק הזה. כדי לקבל גרסה חדשה מהמקור:
+```
+git remote add upstream https://github.com/WallaBoohi/whatsapp-claude-bridge
+git pull upstream main
+```
+אחר כך מריצים מחדש את `setup.cmd`, שמתקין רכיבים ושומר את ההגדרות.

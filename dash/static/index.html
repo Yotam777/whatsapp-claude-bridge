@@ -26,6 +26,16 @@
         <div class="row tight"><button class="btn small" id="pauseBtn" data-en="⏸ Pause 6h">⏸ השהה 6 שעות</button><button class="btn small" id="resumeBtn" data-en="▶ Resume">▶ חידוש</button></div>
       </div>
     </div>
+    <div class="search-wrap">
+      <button class="icon-btn" id="searchBtn" aria-label="חיפוש בכל ההיסטוריה" aria-expanded="false" aria-controls="searchBox" title="חיפוש בכל ההיסטוריה (Ctrl+K)">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 2a8 8 0 1 0 4.9 14.3l5.4 5.4 1.4-1.4-5.4-5.4A8 8 0 0 0 10 2zm0 2a6 6 0 1 1 0 12 6 6 0 0 1 0-12z"/></svg>
+      </button>
+      <div class="search-box" id="searchBox" hidden>
+        <input id="searchInp" type="search" role="combobox" aria-expanded="false" aria-controls="searchList" aria-autocomplete="list" autocomplete="off"
+               placeholder="חפש בכל השיחות: מילה, שם, חלק ממילה…" aria-label="חיפוש">
+        <ul id="searchList" role="listbox" aria-label="תוצאות חיפוש"></ul>
+      </div>
+    </div>
     <span class="stamp" id="updated" aria-live="polite"></span>
     <button class="icon-btn lang-btn" id="langBtn" aria-label="Language / שפה" title="English / עברית">EN</button>
     <button class="icon-btn" id="themeBtn" aria-label="החלף ערכת צבעים" title="בהיר / כהה">
@@ -33,6 +43,22 @@
     </button>
   </div>
 </header>
+
+<nav class="tabbar" id="tabbar" aria-label="שיחות עם Claude">
+  <div class="tabs" id="tabs" role="tablist" aria-label="שיחות"></div>
+  <button class="tab add" id="tabAdd" aria-haspopup="dialog" aria-controls="addPop">➕ חבר קבוצה</button>
+  <span class="presence" id="presence" aria-live="polite"></span>
+  <div class="addpop" id="addPop" hidden role="dialog" aria-label="חיבור קבוצה">
+    <h3>חבר האזנה לקבוצת ווצאפ</h3>
+    <p class="note tight">בחר קבוצה קיימת או צור חדשה. לכל קבוצה יהיו סשן, הוראות, מודל ותקרה משלה. אני אענה רק להודעות שלך בה.</p>
+    <div class="row tight"><label for="addPurpose">מטרה:</label>
+      <select id="addPurpose" class="btn small sel"><option value="dev">פיתוח הגשר והכלי</option><option value="general" selected>כללית</option><option value="4m">עבודת 4M</option></select></div>
+    <ul class="avail" id="availList" aria-label="קבוצות זמינות"></ul>
+    <div class="row tight"><input id="newGrpName" type="text" maxlength="100" placeholder="או: שם לקבוצה חדשה (רק אתה בה)" aria-label="שם לקבוצה חדשה" style="flex:1">
+      <button class="btn small primary" id="newGrpBtn">➕ צור וחבר</button></div>
+    <div class="row tight"><button class="btn small ghost" id="addClose">סגור</button></div>
+  </div>
+</nav>
 
 <main id="main">
   <!-- connection strip: full width -->
@@ -73,21 +99,33 @@
       <div class="chat-row">
         <div class="chat" id="chat" tabindex="0" aria-live="polite"></div>
       </div>
+      <div class="attach-row" id="attachRow" hidden></div>
       <form class="composer" id="composer" autocomplete="off">
         <textarea id="say" rows="1" placeholder="המשך את השיחה עם הכלי… (Enter לשליחה, Shift+Enter לשורה חדשה)" aria-label="הודעה לכלי"></textarea>
         <button class="btn primary" id="sayBtn" type="submit" data-en="Send">שלח</button>
       </form>
+      <div class="composer-opts" id="composerOpts">
+        <button type="button" class="btn small" id="attachBtn" title="צרף קובץ או תמונה (אפשר גם להדביק Ctrl+V או לגרור)">📎 צרף</button>
+        <input type="file" id="fileInp" multiple hidden>
+        <label class="chk" id="syncLbl" title="כשמסומן, ההודעה והתשובה נשלחות גם לקבוצה בווצאפ (ובנייד תראה אותן). כשלא — הכול נשאר כאן, והשיחה ממשיכה מהנייד מאותה נקודה."><input type="checkbox" id="syncChk"> שלח גם לווצאפ</label>
+        <button type="button" class="btn small danger-soft" id="stopBtn" hidden>⛔ עצור</button>
+        <span class="note" id="sendHint"></span>
+      </div>
     </section>
 
     <!-- side rail: compact tools -->
     <aside class="rail" aria-label="כלים">
       <section class="card compact" aria-labelledby="h-grp">
-        <div class="card-head"><h2 id="h-grp" data-en="Control group">קבוצת הבקרה</h2></div>
-        <p class="note tight"><span data-en="Now:">כעת:</span> <strong id="grpName">—</strong></p>
-        <div class="row tight"><input id="grpInput" type="text" maxlength="100" placeholder="שם חדש" aria-label="שם לקבוצת הבקרה" style="flex:1;min-width:120px"></div>
-        <div class="row tight">
-          <button class="btn small" id="grpRename" title="משנה את השם של הקבוצה הנוכחית בווצאפ" data-en="Rename">✏️ שנה שם</button>
-          <button class="btn small" id="grpCreate" title="יוצר קבוצה חדשה שבה רק אתה, ומעביר אליה את השיחה עם Claude (הסוכן עולה מחדש)" data-en="New group">➕ צור קבוצה ייעודית</button>
+        <div class="card-head"><h2 id="h-grp" data-en="This conversation">השיחה הנוכחית</h2></div>
+        <p class="note tight"><strong id="grpName">—</strong></p>
+        <p class="note tight" id="grpMeta"></p>
+        <div id="grpEdit">
+          <div class="row tight"><input id="grpInput" type="text" maxlength="100" placeholder="שם חדש לקבוצה" aria-label="שם חדש לקבוצה" style="flex:1;min-width:120px"></div>
+          <div class="row tight">
+            <button class="btn small" id="grpRename" title="משנה את שם הקבוצה בווצאפ" data-en="Rename">✏️ שנה שם</button>
+            <button class="btn small" id="grpBudget" title="תקרת עלות יומית לשיחה הזו">💲 תקרה</button>
+            <button class="btn small danger-soft" id="grpOff" title="הסוכן יפסיק להאזין לקבוצה (הקבוצה נשארת בווצאפ)">נתק האזנה</button>
+          </div>
         </div>
       </section>
 

@@ -180,6 +180,7 @@ func registerExtraAPI(client *whatsmeow.Client) {
 			res["success"] = true
 			res["name"] = info.Name
 			res["description"] = info.Topic
+			res["members"] = len(info.Participants)
 			res["stored_name"] = ""
 			res["healed"] = false
 			if globalStore != nil && info.Name != "" {
@@ -260,8 +261,8 @@ func registerExtraAPI(client *whatsmeow.Client) {
 			http.Error(w, "bad group jid", http.StatusBadRequest)
 			return
 		}
-		if req.JID == loadPolicy().ControlGroup {
-			http.Error(w, "refusing to leave the control group", http.StatusForbidden)
+		if lp := loadPolicy(); req.JID == lp.ControlGroup || inList(lp.ControlGroups, jid) {
+			http.Error(w, "refusing to leave a control group", http.StatusForbidden)
 			return
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

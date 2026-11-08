@@ -64,3 +64,19 @@ func TestDraftCardText(t *testing.T) {
 		t.Fatalf("group/media card must not carry a prefilled link and must mention the file:\n%s", g)
 	}
 }
+
+func TestConnectedGroupsAreSentToDirectly(t *testing.T) {
+	dir := t.TempDir()
+	wd, _ := os.Getwd()
+	defer os.Chdir(wd)
+	os.Chdir(dir)
+	os.MkdirAll(filepath.Join(dir, "store"), 0755)
+	os.WriteFile(filepath.Join(dir, "store", "send_policy.json"),
+		[]byte(`{"mode":"draft","owner":["972500000001@s.whatsapp.net"],"control_group":"1203630000@g.us","control_groups":["1203631111@g.us"]}`), 0644)
+	if d, _ := checkPolicy(types.NewJID("1203631111", types.GroupServer)); d != "send" {
+		t.Fatalf("a connected extra group must get Claude's replies directly, got %q", d)
+	}
+	if d, _ := checkPolicy(types.NewJID("1203632222", types.GroupServer)); d != "draft" {
+		t.Fatalf("an unconnected group must still be a draft, got %q", d)
+	}
+}

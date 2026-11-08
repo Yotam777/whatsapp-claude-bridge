@@ -75,7 +75,7 @@ func registerAdminAPI(client *whatsmeow.Client) {
 		if err != nil {
 			return nil, err
 		}
-		if cg := str(b, "jid"); cg == loadPolicy().ControlGroup && str(b, "action") == "remove" {
+		if lp, cg := loadPolicy(), str(b, "jid"); (cg == lp.ControlGroup || inList(lp.ControlGroups, g)) && str(b, "action") == "remove" {
 			return nil, errString("refusing to remove people from the control group")
 		}
 		res, err := client.UpdateGroupParticipants(ctx, g, users, whatsmeow.ParticipantChange(str(b, "action")))

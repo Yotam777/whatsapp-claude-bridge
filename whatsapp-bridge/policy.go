@@ -25,13 +25,14 @@ import (
 const policyFile = "store/send_policy.json"
 
 type SendPolicy struct {
-	Mode         string   `json:"mode"`          // "draft" or "auto"
-	AutoUntil    string   `json:"auto_until"`    // RFC3339; auto mode falls back to draft after this
-	Owner        []string `json:"owner"`         // the owner's own chats: always sent directly
-	ControlGroup string   `json:"control_group"` // where draft cards and alerts go
-	Allow        []string `json:"allow"`         // extra recipients that may always be sent to directly
-	PausedUntil  string   `json:"paused_until"`  // set by the health guard
-	PauseReason  string   `json:"pause_reason"`
+	Mode          string   `json:"mode"`           // "draft" or "auto"
+	AutoUntil     string   `json:"auto_until"`     // RFC3339; auto mode falls back to draft after this
+	Owner         []string `json:"owner"`          // the owner's own chats: always sent directly
+	ControlGroup  string   `json:"control_group"`  // where draft cards and alerts go
+	ControlGroups []string `json:"control_groups"` // extra groups the owner talks to Claude in (connected from the dashboard): replies go out directly
+	Allow         []string `json:"allow"`          // extra recipients that may always be sent to directly
+	PausedUntil   string   `json:"paused_until"`   // set by the health guard
+	PauseReason   string   `json:"pause_reason"`
 }
 
 var policyMu sync.Mutex
@@ -82,7 +83,7 @@ func checkPolicy(jid types.JID) (string, SendPolicy) {
 	policyMu.Lock()
 	defer policyMu.Unlock()
 	p := loadPolicy()
-	own := inList(p.Owner, jid) || jid.String() == p.ControlGroup || isOwnChat(jid)
+	own := inList(p.Owner, jid) || jid.String() == p.ControlGroup || inList(p.ControlGroups, jid) || isOwnChat(jid)
 	if own {
 		return "send", p
 	}

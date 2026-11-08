@@ -115,3 +115,143 @@ def test_restart_command_and_strong_model_prefix(agent):
     mod.CFG["deep_model"] = "opus"
     assert mod.pick_model("!! תבדוק לעומק") == "opus"
     assert mod.pick_model("!!! מה המצב") != "opus" or mod.get_override() == "opus"
+
+
+# ---------- several conversations: groups, local chat, per-conversation session / model / budget ----------
+DEV = "1203639999@g.us"
+
+
+@pytest.fixture()
+def multi(agent, tmp_path, monkeypatch):
+    mod, db = agent
+    gf = tmp_path / "groups.json"
+    gf.write_text(json.dumps({DEV: {"name": "פיתוח", "purpose": "dev", "slug": "dev", "budget_usd": 7, "enabled": True}}), encoding="utf-8")
+    monkeypatch.setattr(mod, "GROUPS_FILE", str(gf))
+    monkeypatch.setattr(mod, "MODEL_FILE", str(tmp_path / "model_override.json"))
+    return mod, db
+
+
+def test_groups_registry_and_keys(multi):
+    mod, _ = multi
+    g = mod.load_groups()
+    assert list(g) == [mod.PRIMARY, DEV, mod.LOCAL]
+    assert mod.K("session_id", mod.PRIMARY) == "session_id"          # the primary group keeps its legacy keys
+    assert mod.K("session_id", DEV) == f"session_id:{DEV}" and mod.K("session_id") == "session_id"
+    assert mod.budget_for(DEV) == 7 and mod.budget_for(mod.PRIMARY) == float(mod.CFG.get("daily_budget_usd", 5))
+
+
+def test_model_choice_is_independent_per_conversation(multi):
+    mod, _ = multi
+    mod.set_override("opus", None, DEV)
+    assert mod.get_override(DEV) == "opus" and mod.get_override(mod.PRIMARY) is None and mod.get_override(mod.LOCAL) is None
+    mod.set_override("haiku", None, mod.PRIMARY)
+    mod.set_override("sonnet", None, mod.LOCAL)
+    assert (mod.get_override(mod.PRIMARY), mod.get_override(DEV), mod.get_override(mod.LOCAL)) == ("haiku", "opus", "sonnet")
+    assert mod.pick_model("שלום", DEV) == "opus"
+    mod.set_override("auto", None, DEV)
+    assert mod.get_override(DEV) is None and mod.get_override(mod.PRIMARY) == "haiku"
+
+
+def test_spend_is_counted_per_conversation(multi):
+    mod, _ = multi
+    now = mod.dt.datetime.now().isoformat()
+    with mod.adb() as db:
+        db.execute("INSERT INTO claude_runs (at, cost, chat) VALUES (?, 1.0, NULL)", (now,))      # old row = primary
+        db.execute("INSERT INTO claude_runs (at, cost, chat) VALUES (?, 2.0, ?)", (now, mod.PRIMARY))
+        db.execute("INSERT INTO claude_runs (at, cost, chat) VALUES (?, 4.0, ?)", (now, DEV))
+        db.execute("INSERT INTO claude_runs (at, cost, chat) VALUES (?, 8.0, ?)", (now, mod.LOCAL))
+    assert (mod.spent_today(mod.PRIMARY), mod.spent_today(DEV), mod.spent_today(mod.LOCAL)) == (3.0, 4.0, 8.0)
+    assert mod.spent_today() == 15.0
+
+
+def _run_worker(mod, monkeypatch, answer="התשובה"):
+    """Start the command worker with Claude and the bridge faked; returns the list of (chat, text) sent to WhatsApp and the claude calls."""
+    sent, calls = [], []
+    monkeypatch.setattr(mod, "send", lambda chat, text, media=None, quoted=None: sent.append((chat, text)) or True)
+    monkeypatch.setattr(mod, "bridge", lambda *a, **k: {})
+    monkeypatch.setattr(mod, "claude", lambda prompt, model=None, session=True, timeout=900, on_stage=None, chat=None: calls.append((chat, model, prompt)) or answer)
+    import threading
+    threading.Thread(target=mod.command_worker, daemon=True).start()
+    return sent, calls
+
+
+def _wait_done(mod, n=1, secs=10):
+    import time
+    end = time.time() + secs
+    while time.time() < end:
+        with mod.adb() as db:
+            if db.execute("SELECT count(*) FROM commands WHERE status = 'done'").fetchone()[0] >= n:
+                return True
+        time.sleep(0.2)
+    return False
+
+
+def test_pc_message_is_answered_in_the_dashboard_only(multi, monkeypatch):
+    mod, _ = multi
+    sent, calls = _run_worker(mod, monkeypatch)
+    with mod.adb() as db:
+        db.execute("INSERT INTO commands (msg_id, text, at, chat_jid, source, sync) VALUES ('pc-1', 'שלום מהמחשב', '2026-11-07 22:00', ?, 'pc', 0)", (DEV,))
+    assert _wait_done(mod)
+    assert not [x for x in sent if "התשובה" in x[1]], "a PC-only answer must not be posted to WhatsApp"
+    with mod.adb() as db:
+        rows = db.execute("SELECT chat, role, text FROM local_messages").fetchall()
+    assert (DEV, "tool", "התשובה") in rows
+    assert calls[0][0] == DEV and "מהמחשב" in calls[0][2]
+
+
+def test_pc_message_with_sync_also_goes_to_whatsapp(multi, monkeypatch):
+    mod, _ = multi
+    sent, _ = _run_worker(mod, monkeypatch)
+    with mod.adb() as db:
+        db.execute("INSERT INTO commands (msg_id, text, at, chat_jid, source, sync) VALUES ('pc-2', 'עם סנכרון', '2026-11-07 22:00', ?, 'pc', 1)", (DEV,))
+    assert _wait_done(mod)
+    assert any(c == DEV and "התשובה" in t for c, t in sent)
+
+
+def test_local_chat_never_touches_whatsapp(multi, monkeypatch):
+    mod, _ = multi
+    sent, calls = _run_worker(mod, monkeypatch)
+    with mod.adb() as db:
+        db.execute("INSERT INTO commands (msg_id, text, at, chat_jid, source, sync) VALUES ('pc-3', 'שאלה מקומית', '2026-11-07 22:00', 'local', 'pc', 1)")
+    assert _wait_done(mod)
+    assert sent == [], "the local chat has no WhatsApp group, even with sync set"
+    assert calls[0][0] == "local"
+
+
+def test_group_message_is_answered_in_that_group(multi, monkeypatch):
+    mod, db = multi
+    sent, calls = _run_worker(mod, monkeypatch)
+    monkeypatch.setattr(mod, "react", lambda *a, **k: None)
+    mod.handle(("m1", DEV, "me", "2026-11-07 22:10:00+02:00", "מה המצב בגשר?", True, ""))
+    assert _wait_done(mod)
+    assert any(c == DEV and "התשובה" in t for c, t in sent) and calls[0][0] == DEV
+    assert not any(c == mod.PRIMARY for c, _ in sent), "the answer must not leak to the 4M group"
+
+
+def test_other_peoples_messages_in_a_group_are_ignored(multi, monkeypatch):
+    mod, _ = multi
+    monkeypatch.setattr(mod, "react", lambda *a, **k: None)
+    mod.handle(("m2", DEV, "972500000009@s.whatsapp.net", "2026-11-07 22:11:00+02:00", "הוראה מאדם אחר", False, ""))
+    with mod.adb() as db:
+        assert db.execute("SELECT count(*) FROM commands").fetchone()[0] == 0
+
+
+def test_slash_commands_act_on_their_own_conversation(multi):
+    mod, _ = multi
+    assert "Opus" in mod.owner_command("/מודל opus", DEV)
+    assert mod.get_override(DEV) == "opus" and mod.get_override(mod.PRIMARY) is None
+    mod.kv_set(mod.K("session_runs", DEV), "5")
+    assert "5" in mod.owner_command("/סשן", DEV) and "0" in mod.owner_command("/סשן", mod.PRIMARY)
+
+
+def test_group_prompt_carries_instructions(multi, tmp_path, monkeypatch):
+    mod, _ = multi
+    monkeypatch.setattr(mod, "HOME", str(tmp_path))
+    os.makedirs(tmp_path / "groups")
+    (tmp_path / "groups" / "dev.md").write_text("הוראות פיתוח מיוחדות", encoding="utf-8")
+    raw = json.load(open(mod.GROUPS_FILE, encoding="utf-8"))
+    raw[DEV]["instructions"] = "groups/dev.md"
+    json.dump(raw, open(mod.GROUPS_FILE, "w", encoding="utf-8"))
+    gp = mod.group_prompt(DEV)
+    assert "הוראות פיתוח מיוחדות" in gp and "handoff-dev.md" in gp
+    assert mod.group_prompt(mod.PRIMARY) is None

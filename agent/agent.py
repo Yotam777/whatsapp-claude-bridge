@@ -57,8 +57,8 @@ T = {
         "handoff_prompt": "השיחה הזו נסגרת ותתחיל שיחה חדשה. כתוב סיכום העברה של עד 12 שורות: משימות פתוחות, החלטות, "
                           "העדפות של {owner} ודברים שחייבים לזכור. רק הסיכום, בלי הקדמה.",
         "handoff_title": "# סיכום מהשיחה הקודמת",
-        "prompt": "[הודעה מ{owner} בקבוצת הבקרה בווצאפ, {when}]\n{text}\n\n"
-                  "ענה בשפה של {owner}, קצר ולעניין. התשובה שלך תישלח אוטומטית לקבוצה — אל תשלח אותה בעצמך. "
+        "prompt": "[הודעה מ{owner} {where}, {when}]\n{text}\n\n"
+                  "ענה בשפה של {owner}, קצר ולעניין. התשובה שלך תישלח אוטומטית {dest} — אל תשלח אותה בעצמך. "
                   "אם צריך להחזיר קובץ (אקסל, תמונה, PDF) — שמור אותו בתיקייה outbox והוא יישלח אחרי התשובה.",
     },
     "en": {
@@ -76,8 +76,8 @@ T = {
         "handoff_prompt": "This session is closing and a new one starts. Write a hand-off summary of up to 12 lines: open tasks, "
                           "decisions, {owner}'s preferences and things to remember. Only the summary.",
         "handoff_title": "# Summary of the previous session",
-        "prompt": "[Message from {owner} in the WhatsApp control group, {when}]\n{text}\n\n"
-                  "Answer briefly in {owner}'s language. Your answer is posted to the group automatically — do not send it yourself. "
+        "prompt": "[Message from {owner} {where}, {when}]\n{text}\n\n"
+                  "Answer briefly in {owner}'s language. Your answer is posted {dest} automatically — do not send it yourself. "
                   "To return a file (spreadsheet, image, PDF) save it in the outbox folder; it is sent after your answer.",
     },
 }[LANG]
@@ -119,6 +119,7 @@ def adb():
             status TEXT DEFAULT 'pending', answered TEXT);
         CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT DEFAULT 'time', text TEXT,
             due TEXT, chat_jid TEXT, ref_ts TEXT, status TEXT DEFAULT 'active', created TEXT, fired TEXT);
+        CREATE TABLE IF NOT EXISTS local_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat TEXT, at TEXT, role TEXT, text TEXT, files TEXT);
     """)
     global _runs_migrated
     if not _runs_migrated:  # older databases: record which model each run used (dashboard cost view)
@@ -127,6 +128,12 @@ def adb():
             db.execute("ALTER TABLE claude_runs ADD COLUMN model TEXT")
         if "cum" not in cols:  # Claude reports the session's cumulative cost; cost = this run only, cum = what Claude reported
             db.execute("ALTER TABLE claude_runs ADD COLUMN cum REAL")
+        if "chat" not in cols:  # which conversation (group jid / 'local') a run belongs to; NULL = the primary control group
+            db.execute("ALTER TABLE claude_runs ADD COLUMN chat TEXT")
+        ccols = [r[1] for r in db.execute("PRAGMA table_info(commands)")]
+        for col, ddl in (("chat_jid", "TEXT"), ("source", "TEXT DEFAULT 'wa'"), ("sync", "INTEGER DEFAULT 0")):
+            if col not in ccols:  # commands now carry their conversation, where they came from (wa | pc) and whether PC answers go to WhatsApp
+                db.execute(f"ALTER TABLE commands ADD COLUMN {col} {ddl}")
         prev = {}  # rows written before this fix (cum NULL): turn the cumulative figure into this run's share
         for rowid, sess, cost, cum in db.execute("SELECT rowid, session, cost, cum FROM claude_runs ORDER BY at").fetchall():
             if cum is None:
@@ -254,6 +261,68 @@ def report_restart():
           + (f"\nסיבה: {info['reason']}" if info.get("reason") else ""))
 
 
+# ---------- conversations: the primary control group, extra groups (groups.json) and the dashboard's local chat ----------
+GROUPS_FILE = os.path.join(HERE, "groups.json")
+GROUPS_DIR = os.path.join(HOME, "groups")
+INBOX = os.path.join(HOME, "inbox")
+LOCAL_FILES = os.path.join(HOME, "local_files")
+STOP_FILE = os.path.join(HERE, "stop.request")
+PRIMARY = CFG["claude_group"]
+LOCAL = "local"
+_ctx = threading.local()  # the conversation the command worker is answering right now (chat, src, sync)
+
+
+def load_groups():
+    """jid -> {name, purpose, instructions, budget_usd, ...} for every conversation Claude answers in. Re-read on every use,
+    so a group connected from the dashboard works without a restart."""
+    try:
+        raw = json.load(open(GROUPS_FILE, encoding="utf-8"))
+    except Exception:
+        raw = {}
+    g = {PRIMARY: {"name": "4M", "purpose": "4m", **(raw.get(PRIMARY) or {})}}
+    for jid, v in raw.items():
+        if jid not in g and jid != LOCAL and v.get("enabled", True):
+            g[jid] = dict(v)
+    g[LOCAL] = {"name": "שיחה מקומית", "purpose": "local", **(raw.get(LOCAL) or {})}
+    return g
+
+
+def K(name, chat=None):
+    """Per-conversation key in kv; the primary group keeps the legacy (unsuffixed) keys so its session survives the upgrade."""
+    return name if not chat or chat == PRIMARY else f"{name}:{chat}"
+
+
+def cur_chat():
+    return getattr(_ctx, "chat", None) or PRIMARY
+
+
+def budget_for(chat):
+    return float((load_groups().get(chat or PRIMARY) or {}).get("budget_usd") or CFG.get("daily_budget_usd", 5))
+
+
+def handoff_path(chat):
+    if not chat or chat == PRIMARY:
+        return os.path.join(HOME, "handoff.md")
+    g = load_groups().get(chat) or {}
+    return os.path.join(HOME, f"handoff-{g.get('slug') or re.sub(r'[^0-9a-zA-Z]+', '', chat.split('@')[0])[:12] or 'chat'}.md")
+
+
+def group_prompt(chat):
+    """Extra system prompt for a non-primary conversation: its instructions file (agent/home/groups/*.md) plus the hand-off file name."""
+    if not chat or chat == PRIMARY:
+        return None
+    g = load_groups().get(chat) or {}
+    parts = [f"שיחה: {g.get('name', chat)} (מטרה: {g.get('purpose', '')}). זו שיחה נפרדת — לכל שיחה סשן, הוראות ומודל משלה."]
+    ins = g.get("instructions")
+    if ins:
+        try:
+            parts.append(open(os.path.join(HOME, ins), encoding="utf-8").read().strip())
+        except OSError:
+            pass
+    parts.append(f"בתחילת סשן חדש קרא את {handoff_path(chat)} אם קיים (סיכום מהשיחה הקודמת בשיחה הזו).")
+    return "\n\n".join(parts)
+
+
 def italic(text):
     """WhatsApp italics line by line (a marker can't span lines), so the tool's messages look different from the owner's.
     Lines with underscores or code are left as they are."""
@@ -267,15 +336,33 @@ def italic(text):
     return "\n".join(out)
 
 
+def pc_only():
+    """True while answering a message that came from the dashboard and must not be posted to WhatsApp (local chat, or sync off)."""
+    return cur_chat() == LOCAL or (getattr(_ctx, "src", "wa") == "pc" and not getattr(_ctx, "sync", 0))
+
+
+def local_say(chat, role, text, files=None):
+    with adb() as db:
+        db.execute("INSERT INTO local_messages (chat, at, role, text, files) VALUES (?, ?, ?, ?, ?)",
+                   (chat, dt.datetime.now().isoformat(timespec="seconds"), role, text, json.dumps(files or [], ensure_ascii=False)))
+
+
 def reply(text, quoted=None):
-    kv_set("last_tool_msg", json.dumps({"ts": dt.datetime.now().isoformat(timespec="seconds"), "text": text.strip()[:300]}, ensure_ascii=False))
+    chat = cur_chat()
+    if chat == PRIMARY:
+        kv_set("last_tool_msg", json.dumps({"ts": dt.datetime.now().isoformat(timespec="seconds"), "text": text.strip()[:300]}, ensure_ascii=False))
+    if pc_only():  # answer shown in the dashboard chat only
+        local_say(chat, "tool", text.strip())
+        return
     body = italic(text.strip()) if CFG.get("reply_italic", True) else text.strip()
-    send(CFG["claude_group"], CFG["reply_prefix"] + body, quoted=quoted)
+    send(chat, CFG["reply_prefix"] + body, quoted=quoted)
 
 
 def react(msg_id, emoji):
+    if pc_only() or getattr(_ctx, "src", "wa") == "pc":
+        return
     try:
-        bridge("/react", {"chat_jid": CFG["claude_group"], "message_id": msg_id, "sender": "", "emoji": emoji}, timeout=20)
+        bridge("/react", {"chat_jid": cur_chat(), "message_id": msg_id, "sender": "", "emoji": emoji}, timeout=20)
     except Exception as e:
         log("react failed", e)
 
@@ -435,10 +522,16 @@ def _stage_of(ev):
     return None
 
 
-def _run_claude(prompt, model, resume, timeout, on_stage=None):
+class Stopped(Exception):
+    pass
+
+
+def _run_claude(prompt, model, resume, timeout, on_stage=None, append=None, chat=None):
     cmd = [shutil.which("claude") or "claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "auto"]
     if model:
         cmd += ["--model", model]
+    if append:
+        cmd += ["--append-system-prompt", append]
     if CFG.get("strict_mcp"):
         cmd += ["--strict-mcp-config"]  # skip the heavy connector tool lists (Gmail, Shopify...) to cut tokens
     if resume:
@@ -447,6 +540,24 @@ def _run_claude(prompt, model, resume, timeout, on_stage=None):
     proc = subprocess.Popen(cmd, cwd=HOME, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8")
     killer = threading.Timer(timeout, proc.kill)
     killer.start()
+    stopped = threading.Event()
+    try:
+        os.remove(STOP_FILE)  # a stop request left over from before this run must not kill it
+    except OSError:
+        pass
+
+    def watch_stop():  # the dashboard's "stop" button drops a stop.request file
+        while proc.poll() is None:
+            if os.path.exists(STOP_FILE):
+                try:
+                    os.remove(STOP_FILE)
+                except OSError:
+                    pass
+                stopped.set()
+                proc.kill()
+                return
+            time.sleep(1)
+    threading.Thread(target=watch_stop, daemon=True).start()
     res = {}
     try:
         for line in proc.stdout:
@@ -467,6 +578,8 @@ def _run_claude(prompt, model, resume, timeout, on_stage=None):
         proc.wait()
     finally:
         killer.cancel()
+    if stopped.is_set():
+        raise Stopped()
     if not res:
         raise RuntimeError("claude returned no result")
     usage = res.get("usage", {})
@@ -476,18 +589,19 @@ def _run_claude(prompt, model, resume, timeout, on_stage=None):
         prev = db.execute("SELECT cum FROM claude_runs WHERE session = ? AND cum IS NOT NULL ORDER BY at DESC LIMIT 1",
                           (res.get("session_id"),)).fetchone() if resume else None
         cost = run_cost(cum, prev[0] if prev else None)
-        db.execute("INSERT INTO claude_runs (at, session, cost, input_tokens, output_tokens, seconds, ok, model, cum) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        db.execute("INSERT INTO claude_runs (at, session, cost, input_tokens, output_tokens, seconds, ok, model, cum, chat) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                    (dt.datetime.now().isoformat(), res.get("session_id"), cost, usage.get("input_tokens", 0),
-                    usage.get("output_tokens", 0), time.time() - t0, 0 if res.get("is_error") else 1, model or CFG.get("claude_model") or "", cum))
+                    usage.get("output_tokens", 0), time.time() - t0, 0 if res.get("is_error") else 1, model or CFG.get("claude_model") or "", cum,
+                    chat or PRIMARY))
     return res
 
 
-def write_handoff(old_sid):
+def write_handoff(old_sid, chat=None):
     """Before a session is rotated, ask it for a short hand-off so the next session keeps the thread."""
     try:
-        res = _run_claude(T["handoff_prompt"].format(owner=OWNER), None, old_sid, 300)
+        res = _run_claude(T["handoff_prompt"].format(owner=OWNER), None, old_sid, 300, append=group_prompt(chat), chat=chat)
         if res.get("result"):
-            with open(os.path.join(HOME, "handoff.md"), "w", encoding="utf-8") as f:
+            with open(handoff_path(chat), "w", encoding="utf-8") as f:
                 f.write(f"{T['handoff_title']} ({dt.datetime.now():%d.%m.%Y %H:%M})\n\n{res['result'].strip()}\n")
             log("handoff written")
     except Exception as e:
@@ -503,33 +617,44 @@ def is_dev_work(text):
     return any(w.lower() in t for w in DEV_WORDS)
 
 
-def claude(prompt, model=None, session=True, timeout=900, on_stage=None):
-    """Run Claude Code headless in HOME. The conversation session is resumed until it is rotated (daily, with hand-off)."""
-    sid = kv_get("session_id") if session else None
-    started = kv_get("session_started")
+def claude(prompt, model=None, session=True, timeout=900, on_stage=None, chat=None):
+    """Run Claude Code headless in HOME. Each conversation (group / local chat) has its own session, resumed until it is
+    rotated (daily, with hand-off; and after session_max_runs for business conversations)."""
+    chat = chat or PRIMARY
+    g = load_groups().get(chat) or {}
+    sid = kv_get(K("session_id", chat)) if session else None
+    started = kv_get(K("session_started", chat))
+    uncapped = g.get("purpose") == "dev" or is_dev_work(prompt)  # no message cap while working on the bridge/agent code
     if sid and started and dt.datetime.fromisoformat(started).date() != dt.date.today():  # rotate at midnight
-        write_handoff(sid)
+        write_handoff(sid, chat)
         sid = None
-    elif sid and not is_dev_work(prompt) and int(kv_get("session_runs") or 0) >= int(CFG.get("session_max_runs", 60)):  # business work only: long sessions get expensive, rotate with hand-off (no cap while working on the bridge/agent code)
-        write_handoff(sid)
+    elif sid and not uncapped and int(kv_get(K("session_runs", chat)) or 0) >= int(CFG.get("session_max_runs", 60)):
+        write_handoff(sid, chat)
         sid = None
     try:
-        res = _run_claude(prompt, model, sid, timeout, on_stage)
+        res = _run_claude(prompt, model, sid, timeout, on_stage, append=group_prompt(chat), chat=chat)
+    except Stopped:
+        return "⛔ עצרתי את העבודה לבקשתך."
     except Exception as e:
         log("claude failed", e)
         return None
     if session and res.get("session_id"):
-        if res["session_id"] != kv_get("session_id"):
-            kv_set("session_started", dt.datetime.now().isoformat())
-            kv_set("session_runs", "0")
-        kv_set("session_id", res["session_id"])
-        kv_set("session_runs", str(int(kv_get("session_runs") or 0) + 1))
+        if res["session_id"] != kv_get(K("session_id", chat)):
+            kv_set(K("session_started", chat), dt.datetime.now().isoformat())
+            kv_set(K("session_runs", chat), "0")
+        kv_set(K("session_id", chat), res["session_id"])
+        kv_set(K("session_runs", chat), str(int(kv_get(K("session_runs", chat)) or 0) + 1))
     return res.get("result")
 
 
-def spent_today():
+def spent_today(chat=None):
+    """Spend today: for one conversation (chat) or, with no argument, in total."""
+    q, args = "SELECT coalesce(sum(cost),0) FROM claude_runs WHERE substr(at,1,10) = ?", [dt.date.today().isoformat()]
+    if chat:
+        q += " AND (chat = ? OR (chat IS NULL AND ? = ?))"
+        args += [chat, chat, PRIMARY]
     with adb() as db:
-        return db.execute("SELECT coalesce(sum(cost),0) FROM claude_runs WHERE substr(at,1,10) = ?", (dt.date.today().isoformat(),)).fetchone()[0]
+        return db.execute(q, args).fetchone()[0]
 
 
 # The owner's questions are stored before they are answered and closed only after the reply went out,
@@ -537,15 +662,20 @@ def spent_today():
 _command_signal = threading.Event()
 
 
-def enqueue_command(msg_id, text, when):
+def enqueue_command(msg_id, text, when, chat=None):
+    chat = chat or PRIMARY
     with adb() as db:
-        db.execute("INSERT INTO commands (msg_id, text, at) VALUES (?, ?, ?)", (msg_id, text, when))
-    react(msg_id, "👀")  # immediate "got it"
+        db.execute("INSERT INTO commands (msg_id, text, at, chat_jid, source, sync) VALUES (?, ?, ?, ?, 'wa', 0)", (msg_id, text, when, chat))
+    _ctx.chat, _ctx.src, _ctx.sync = chat, "wa", 0
+    try:
+        react(msg_id, "👀")  # immediate "got it"
+    finally:
+        _ctx.chat = None
     _command_signal.set()
 
 
 def send_outbox(since):
-    """Files Claude saved in home/outbox during the answer are sent to the owner, then archived."""
+    """Files Claude saved in home/outbox during the answer are sent to the owner (WhatsApp, or shown in the dashboard chat), then archived."""
     if not os.path.isdir(OUTBOX):
         return
     done = os.path.join(OUTBOX, "sent")
@@ -553,34 +683,51 @@ def send_outbox(since):
     for f in sorted(os.listdir(OUTBOX)):
         p = os.path.join(OUTBOX, f)
         if os.path.isfile(p) and os.path.getmtime(p) >= since - 5:
-            send(CFG["claude_group"], CFG["reply_prefix"] + "📎 " + f, media=p)
-            shutil.move(p, os.path.join(done, f"{dt.datetime.now():%Y%m%d_%H%M%S}_{f}"))
+            stamp = f"{dt.datetime.now():%Y%m%d_%H%M%S}_{f}"
+            if pc_only():
+                os.makedirs(LOCAL_FILES, exist_ok=True)
+                shutil.copy(p, os.path.join(LOCAL_FILES, stamp))
+                local_say(cur_chat(), "tool", "📎 " + f, [stamp])
+            else:
+                send(cur_chat(), CFG["reply_prefix"] + "📎 " + f, media=p)
+            shutil.move(p, os.path.join(done, stamp))
 
 
 MODEL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_override.json")
 MODELS = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "models.json"), encoding="utf-8"))
 
 
-def get_override():
-    """Model forced by the owner (WhatsApp /מודל or the dashboard), or None for automatic routing."""
+def _override_state():
     try:
-        o = json.load(open(MODEL_FILE, encoding="utf-8"))
-        if o.get("model") in (None, "", "auto"):
-            return None
-        if o.get("until") and o["until"] < dt.datetime.now().isoformat(timespec="seconds"):
-            return None
-        return o["model"]
+        return json.load(open(MODEL_FILE, encoding="utf-8"))
     except Exception:
+        return {}
+
+
+def get_override(chat=None):
+    """Model forced by the owner for this conversation (WhatsApp /מודל or the dashboard), or None for automatic routing.
+    Every conversation has its own choice; the primary group keeps the legacy top-level fields."""
+    o = _override_state()
+    node = o if not chat or chat == PRIMARY else (o.get("groups") or {}).get(chat) or {}
+    if node.get("model") in (None, "", "auto"):
         return None
+    if node.get("until") and node["until"] < dt.datetime.now().isoformat(timespec="seconds"):
+        return None
+    return node["model"]
 
 
-def set_override(model, hours=None):
+def set_override(model, hours=None, chat=None):
     until = (dt.datetime.now() + dt.timedelta(hours=hours)).isoformat(timespec="seconds") if hours else ""
-    json.dump({"model": model, "until": until}, open(MODEL_FILE, "w", encoding="utf-8"))
+    o = _override_state()
+    if not chat or chat == PRIMARY:
+        o["model"], o["until"] = model, until
+    else:
+        o.setdefault("groups", {})[chat] = {"model": model, "until": until}
+    json.dump(o, open(MODEL_FILE, "w", encoding="utf-8"))
 
 
-def models_guide():
-    cur = get_override() or "auto"
+def models_guide(chat=None):
+    cur = get_override(chat) or "auto"
     lines = [f"*המודל כרגע: {MODELS[cur]['he']}*", ""]
     for k, m in MODELS.items():
         lines.append(f"{'👉 ' if k == cur else ''}*{m['he']}* — {m['cost']}\n{m['tip']}\nפקודה: {m['cmd']}")
@@ -606,9 +753,9 @@ def recommend(text, used, failed):
     return want, why
 
 
-def pick_model(text):
+def pick_model(text, chat=None):
     """Cost routing: Haiku for short lookups/updates, Sonnet for anything heavier (config: light_model / claude_model)."""
-    forced = get_override()
+    forced = get_override(chat)
     if forced:
         return forced
     s = text.lstrip()
@@ -628,16 +775,18 @@ def pick_model(text):
 class StatusMsg:
     """One WhatsApp message that is edited while Claude works (stage, detail, elapsed time, model). At the end it is left
     in its final state (not deleted). The steps also go to kv 'live_steps' for the dashboard."""
-    def __init__(self, model):
+    def __init__(self, model, chat=None, wa=True):
         self.model, self.stage, self.mid, self.t0, self.done = model, "🧠 מתחיל", None, time.time(), threading.Event()
+        self.chat, self.wa = chat or PRIMARY, wa
         self.steps = []
         self._save(False)
         self.timer = threading.Timer(8, self._start)
-        self.timer.start()
+        if wa:  # PC-only conversations show progress in the dashboard only
+            self.timer.start()
 
     def _save(self, done):
         try:
-            kv_set("live_steps", json.dumps({"model": self.model, "started": dt.datetime.fromtimestamp(self.t0).isoformat(timespec="seconds"),
+            kv_set(K("live_steps", self.chat), json.dumps({"model": self.model, "started": dt.datetime.fromtimestamp(self.t0).isoformat(timespec="seconds"),
                                              "done": done, "secs": int(time.time() - self.t0), "steps": self.steps[-8:]}, ensure_ascii=False))
         except Exception as e:
             log("live_steps save failed", e)
@@ -664,12 +813,12 @@ class StatusMsg:
         if self.done.is_set():
             return
         text = self._text()
-        send(CFG["claude_group"], text)
+        send(self.chat, text)
         for _ in range(8):
             try:
                 with mdb() as db:
                     r = db.execute("SELECT id FROM messages WHERE chat_jid = ? AND is_from_me = 1 AND content = ? ORDER BY timestamp DESC LIMIT 1",
-                                   (CFG["claude_group"], text)).fetchone()
+                                   (self.chat, text)).fetchone()
                 if r:
                     self.mid = r[0]
                     break
@@ -681,13 +830,13 @@ class StatusMsg:
             new = self._text()
             if new != last:
                 try:
-                    bridge("/edit_message", {"jid": CFG["claude_group"], "id": self.mid, "text": new}, timeout=20)
+                    bridge("/edit_message", {"jid": self.chat, "id": self.mid, "text": new}, timeout=20)
                     last = new
                 except Exception as e:
                     log("status edit failed", e)
         if self.done.is_set() and self.mid:  # leave the final state (owner request 07.11): no delete
             try:
-                bridge("/edit_message", {"jid": CFG["claude_group"], "id": self.mid, "text": self._final()}, timeout=20)
+                bridge("/edit_message", {"jid": self.chat, "id": self.mid, "text": self._final()}, timeout=20)
             except Exception as e:
                 log("status final edit failed", e)
 
@@ -697,8 +846,8 @@ class StatusMsg:
         self.timer.cancel()
 
 
-def owner_command(text):
-    """Slash commands answered locally (no Claude run, no cost). Returns reply text or None."""
+def owner_command(text, chat=None):
+    """Slash commands answered locally (no Claude run, no cost), for this conversation. Returns reply text or None."""
     if re.match(r"^/(הפעל מחדש|אתחל|restart)\s*$", text.strip()):
         RESTART_REQ.set()
         return "🔄 מפעיל את הסוכן מחדש. אכתוב כאן כשאעלה (בערך 20 שניות)."
@@ -707,80 +856,112 @@ def owner_command(text):
         return None
     cmd, arg = m.group(1), m.group(2).strip().lower()
     if cmd in ("סשן", "session"):
-        sid = kv_get("session_id")
+        sid = kv_get(K("session_id", chat))
         if arg in ("חדש", "new", "reset"):
             if sid:
-                write_handoff(sid)
-            kv_set("session_id", "")
-            kv_set("session_runs", "0")
-            return "🔄 הסשן נסגר (נכתב handoff.md). ההודעה הבאה פותחת שיחה חדשה עם הסיכום."
+                write_handoff(sid, chat)
+            kv_set(K("session_id", chat), "")
+            kv_set(K("session_runs", chat), "0")
+            return f"🔄 הסשן נסגר (נכתב {os.path.basename(handoff_path(chat))}). ההודעה הבאה פותחת שיחה חדשה עם הסיכום."
         fresh = CFG.get("fresh_sessions")
-        return (f"סשן: {'נקי לכל הודעה (fresh_sessions)' if fresh else 'רציף'} · הודעות בסשן: {kv_get('session_runs') or 0}"
-                f" מתוך {CFG.get('session_max_runs', 60)} (אז מתחלף עם סיכום) · התחיל: {(kv_get('session_started') or '-')[:16]}")
+        return (f"סשן: {'נקי לכל הודעה (fresh_sessions)' if fresh else 'רציף'} · הודעות בסשן: {kv_get(K('session_runs', chat)) or 0}"
+                f" מתוך {CFG.get('session_max_runs', 60)} (אז מתחלף עם סיכום) · התחיל: {(kv_get(K('session_started', chat)) or '-')[:16]}")
     if not arg:
-        return models_guide()
+        return models_guide(chat)
     parts = arg.replace("שעה", "hour").split()
     name = {"אוטו": "auto"}.get(parts[0], parts[0])
     if name not in MODELS:
-        return "לא מכיר את המודל הזה. אפשרויות: " + ", ".join(MODELS) + "\n\n" + models_guide()
+        return "לא מכיר את המודל הזה. אפשרויות: " + ", ".join(MODELS) + "\n\n" + models_guide(chat)
     hours = 1 if "hour" in parts[1:] else None
-    set_override(name, hours)
+    set_override(name, hours, chat)
     return f"✅ המודל הוחלף ל-*{MODELS[name]['he']}*{' לשעה' if hours else ''} ({MODELS[name]['cost']}). חזרה לאוטו: /מודל אוטו"
+
+
+T_BACK_HE = ("[המשך מהנייד: ההודעות האחרונות בשיחה הזו נכתבו בלוח הבקרה במחשב ולא הופיעו בקבוצה בווצאפ. "
+             "המשך מאותה נקודה כאילו זו אותה שיחה; אם התשובה נשענת על מה שנעשה במחשב, פתח בשורה קצרה שמסכמת אותו כדי שהקבוצה תבין.]\n")
+T_BACK_EN = ("[Continued from the phone: the latest turns of this conversation were typed in the PC dashboard and never appeared in the "
+             "WhatsApp group. Continue from the same point; if the answer relies on that PC work, open with one short line recapping it.]\n")
+
+
+def came_back_from_pc(chat, cid):
+    """True when the previous command in this conversation was a PC-only one (dashboard, WhatsApp sync off): the phone
+    message continues that same session, and the WhatsApp group hasn't seen those turns."""
+    with adb() as db:
+        prev = db.execute("SELECT source, sync FROM commands WHERE chat_jid = ? AND id < ? AND status = 'done' ORDER BY id DESC LIMIT 1",
+                          (chat, cid)).fetchone()
+    return bool(prev) and prev[0] == "pc" and not prev[1]
 
 
 def command_worker():
     while True:
         with adb() as db:
-            row = db.execute("SELECT id, msg_id, text, at FROM commands WHERE status = 'pending' ORDER BY id LIMIT 1").fetchone()
+            row = db.execute("SELECT id, msg_id, text, at, chat_jid, source, sync FROM commands WHERE status = 'pending' ORDER BY id LIMIT 1").fetchone()
         if not row:
-            _command_signal.wait(30)
+            _command_signal.wait(3)  # short: the dashboard (a separate process) queues PC messages straight into the table
             _command_signal.clear()
             continue
-        cid, mid, text, when = row
+        cid, mid, text, when, chat, src, sync = row
+        chat, src, sync = chat or PRIMARY, src or "wa", sync or 0
+        _ctx.chat, _ctx.src, _ctx.sync = chat, src, sync
+        g = load_groups().get(chat) or {}
         try:
-            local = owner_command(text)
+            local = owner_command(text, chat)
             if local is not None:
-                reply(local, quoted=mid)
+                reply(local, quoted=mid if src == "wa" else None)
                 react(mid, "✅")
                 with adb() as db:
                     db.execute("UPDATE commands SET status = 'done', answered = ? WHERE id = ?", (dt.datetime.now().isoformat(), cid))
                 if RESTART_REQ.is_set():
                     restart_now("/הפעל מחדש")
                 continue
-            budget = float(CFG.get("daily_budget_usd", 5))
-            spent = spent_today()
+            budget = budget_for(chat)
+            spent = spent_today(chat)
             if text.lstrip().startswith("!!!"):  # lift the cap for an hour
                 until = dt.datetime.now() + dt.timedelta(hours=1)
-                kv_set("override_until", until.isoformat(timespec="seconds"))
+                kv_set(K("override_until", chat), until.isoformat(timespec="seconds"))
                 reply(T["override_hour"].format(until=until.strftime("%H:%M")))
-            override = text.lstrip().startswith("!") or (kv_get("override_until") or "") > dt.datetime.now().isoformat(timespec="seconds")
+            override = text.lstrip().startswith("!") or (kv_get(K("override_until", chat)) or "") > dt.datetime.now().isoformat(timespec="seconds")
             if spent >= budget and not override:
                 reply(T["budget_stop"].format(spent=spent, budget=budget))
             else:
-                if spent >= budget * 0.8 and kv_get("budget_warned") != dt.date.today().isoformat():
-                    kv_set("budget_warned", dt.date.today().isoformat())
+                if spent >= budget * 0.8 and kv_get(K("budget_warned", chat)) != dt.date.today().isoformat():
+                    kv_set(K("budget_warned", chat), dt.date.today().isoformat())
                     reply(T["budget_warn"].format(spent=spent, budget=budget))
-                prompt = T["prompt"].format(owner=OWNER, when=when, text=text.lstrip("!").strip())
-                model = pick_model(text)
+                gname = g.get("name") or ""
+                if chat == PRIMARY and src == "wa":
+                    where, dest = ("בקבוצת הבקרה בווצאפ", "לקבוצה") if LANG == "he" else ("in the WhatsApp control group", "to the group")
+                elif pc_only():
+                    where, dest = (f'מהמחשב (לוח הבקרה, "{gname}")', "לחלון השיחה בלוח הבקרה") if LANG == "he" else (f'from the PC (dashboard, "{gname}")', "to the dashboard chat")
+                elif src == "pc":
+                    where, dest = (f'מהמחשב (לוח הבקרה) לקבוצה "{gname}"', "גם לקבוצה בווצאפ") if LANG == "he" else (f'from the PC (dashboard) for group "{gname}"', "to the WhatsApp group too")
+                else:
+                    where, dest = (f'בקבוצה "{gname}" בווצאפ', "לקבוצה") if LANG == "he" else (f'in the WhatsApp group "{gname}"', "to the group")
+                prompt = T["prompt"].format(owner=OWNER, when=when, text=text.lstrip("!").strip(), where=where, dest=dest)
+                if src == "wa" and came_back_from_pc(chat, cid):
+                    prompt = (T_BACK_HE if LANG == "he" else T_BACK_EN) + prompt
+                model = pick_model(text, chat)
                 started = time.time()
-                status = StatusMsg(model)
+                status = StatusMsg(model, chat, wa=not pc_only())
                 try:
-                    answer = claude(prompt, model=model, session=not CFG.get("fresh_sessions"), on_stage=status.set_stage)
+                    answer = claude(prompt, model=model, session=not CFG.get("fresh_sessions"), on_stage=status.set_stage, chat=chat)
                 finally:
                     status.finish()
-                streak = 0 if answer else int(kv_get("fail_streak") or 0) + 1
-                kv_set("fail_streak", str(streak))
-                kv_set("last_model", model)
-                rec = recommend(text, model, streak)
-                kv_set("last_recommend", json.dumps({"model": rec[0], "why": rec[1], "at": dt.datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False) if rec else "")
+                stopped = (answer or "").startswith("⛔ עצרתי")
+                streak = 0 if answer else int(kv_get(K("fail_streak", chat)) or 0) + 1
+                kv_set(K("fail_streak", chat), str(streak))
+                kv_set(K("last_model", chat), model)
+                rec = None if stopped else recommend(text, model, streak)
+                kv_set(K("last_recommend", chat), json.dumps({"model": rec[0], "why": rec[1], "at": dt.datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False) if rec else "")
                 out = answer or T["failed"]
                 if rec:
                     out += f"\n\n💡 כדאי לעבור ל-{MODELS[rec[0]]['he']} ({rec[1]}). פקודה: {MODELS[rec[0]]['cmd']}"
-                reply(out, quoted=mid if CFG.get("quote_replies", True) else None)
+                reply(out, quoted=mid if (CFG.get("quote_replies", True) and src == "wa") else None)
                 send_outbox(started)
                 react(mid, "✅")
         except Exception:
             log("command error", traceback.format_exc())
+        finally:
+            _ctx.chat = None
         with adb() as db:
             db.execute("UPDATE commands SET status = 'done', answered = ? WHERE id = ?", (dt.datetime.now().isoformat(), cid))
         if RESTART_REQ.is_set():
@@ -852,22 +1033,25 @@ def update_check():
 
 
 def group_check():
-    """Daily: ask WhatsApp for the control group's current name, compare with the bridge's stored name,
+    """Daily: ask WhatsApp for each connected group's current name, compare with the bridge's stored name,
     let the bridge heal the stored name, and tell the owner only if something was wrong or changed."""
-    jid = CFG["claude_group"]
-    try:
-        res = bridge("/group_info", {"jid": jid}, timeout=60)
-    except Exception as e:
-        log("group_check: bridge unreachable", e)
-        return
-    if not res.get("success"):
-        log("group_check failed:", res)
-        reply(f"בדיקה יומית של שם הקבוצה נכשלה: {res.get('error') or res.get('message') or 'שגיאה לא ידועה'}")
-        return
-    name, stored = res.get("name", ""), res.get("stored_name", "")
-    log(f"group_check: live={name!r} stored={stored!r} healed={res.get('healed')}")
-    if res.get("healed"):
-        reply(f"שם הקבוצה השתנה ל-\"{name}\". עדכנתי את הגשר (היה רשום \"{stored}\"). המזהה לא השתנה, והחיבור תקין.")
+    for jid, g in load_groups().items():
+        if jid == LOCAL:
+            continue
+        try:
+            res = bridge("/group_info", {"jid": jid}, timeout=60)
+        except Exception as e:
+            log("group_check: bridge unreachable", e)
+            return
+        if not res.get("success"):
+            log("group_check failed:", jid, res)
+            if jid == PRIMARY:
+                reply(f"בדיקה יומית של שם הקבוצה נכשלה: {res.get('error') or res.get('message') or 'שגיאה לא ידועה'}")
+            continue
+        name, stored = res.get("name", ""), res.get("stored_name", "")
+        log(f"group_check: {jid} live={name!r} stored={stored!r} healed={res.get('healed')}")
+        if res.get("healed") and jid == PRIMARY:
+            reply(f"שם הקבוצה השתנה ל-\"{name}\". עדכנתי את הגשר (היה רשום \"{stored}\"). המזהה לא השתנה, והחיבור תקין.")
 
 
 # ---------- plugins ----------
@@ -915,23 +1099,23 @@ def worker():
 def handle(row):
     mid, cj, sender, ts, content, me, mtype = row
     content = (content or "").strip()
-    if cj == CFG["claude_group"] and me:
+    if cj != LOCAL and cj in load_groups() and me:  # the owner's own message in a connected group (others' messages stay plain information)
         if content.startswith(CFG["reply_prefix"].strip()):
             return  # our own reply
-        kv_set("last_owner_msg", json.dumps({"ts": ts[:19], "text": content[:300] or f"[{mtype}]"}, ensure_ascii=False))
+        kv_set(K("last_owner_msg", cj), json.dumps({"ts": ts[:19], "text": content[:300] or f"[{mtype}]"}, ensure_ascii=False))
         if mtype == "audio" and voice_enabled():
             def voice_cmd():
                 text = transcript_of(cj, mid, sender, ts)
                 if text:
-                    enqueue_command(mid, f"{T['voice']} {text}", ts[:16])
+                    enqueue_command(mid, f"{T['voice']} {text}", ts[:16], cj)
             work.put(voice_cmd)
         elif mtype in ("image", "document", "video"):
             def file_cmd():
                 p = media_path(cj, mid)
-                enqueue_command(mid, (content + "\n" if content else "") + T["attached"].format(path=p or T["download_failed"]), ts[:16])
+                enqueue_command(mid, (content + "\n" if content else "") + T["attached"].format(path=p or T["download_failed"]), ts[:16], cj)
             work.put(file_cmd)
         elif content:
-            enqueue_command(mid, content, ts[:16])
+            enqueue_command(mid, content, ts[:16], cj)
         return
     if mtype == "audio" and CFG.get("transcribe_all_chats") and voice_enabled():
         work.put(lambda: transcript_of(cj, mid, sender, ts))
@@ -1094,7 +1278,8 @@ def scheduler():
 
 
 if __name__ == "__main__":
-    os.makedirs(OUTBOX, exist_ok=True)
+    for d in (OUTBOX, GROUPS_DIR, INBOX, LOCAL_FILES):
+        os.makedirs(d, exist_ok=True)
     adb().close()
     load_plugins()
     if len(sys.argv) > 1:  # manual runs: agent.py backup | <plugin job>

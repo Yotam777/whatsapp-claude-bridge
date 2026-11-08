@@ -1,5 +1,10 @@
 // Dashboard front-end: renders /data, sends actions to /action. Hebrew (default) and English.
 const $ = id => document.getElementById(id);
+const post = a => fetch("/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(a) }).then(r => r.json());
+let curChat = ""; try { curChat = localStorage.getItem("wa-dash-chat") || ""; } catch (e) {}
+let syncMap = {}; try { syncMap = JSON.parse(localStorage.getItem("wa-dash-sync") || "{}"); } catch (e) {}
+const PURPOSE = { dev: "פיתוח הגשר והכלי", general: "כללית", "4m": "עבודת 4M", local: "מקומית (בלי ווצאפ)" };
+const MODEL_HE = m => ({ auto: "אוטו" })[m] || m;
 
 // ---- language ----
 let lang = "he";
@@ -124,32 +129,69 @@ $("bgSel").onchange = e => { view.bg = e.target.value; applyView(); };
 $("viewReset").onclick = () => { view = { chat: 2, ui: 2, font: "", bg: "" }; applyView(); };
 applyView();
 
-// ---- continue the conversation from here// ---- continue the conversation from here (a normal message from you in the WhatsApp group) ----
+// ---- continue the conversation from here (PC chat, optionally also posted to the WhatsApp group) ----
 const say = $("say");
 const grow = () => { say.style.height = "auto"; say.style.height = Math.min(140, say.scrollHeight) + "px"; };
 say.addEventListener("input", grow);
 say.addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("composer").requestSubmit(); } });
-let outbox = [];  // messages typed here and not yet seen in the WhatsApp conversation: shown at once as "sending…"
-let sending = false;
+let outbox = [];  // messages typed here and not yet seen in the conversation: shown at once as "sending…"
+let sending = false, attached = [];
+const baseName = pth => String(pth).split(/[\\/]/).pop();
+function drawAttach() {
+  const row = $("attachRow"); row.hidden = !attached.length;
+  row.innerHTML = attached.map((f, i) => `<span class="attach"><span title="${esc(f.name)}">📎 ${esc(f.name)}</span><button type="button" data-i="${i}" aria-label="${L("הסר קובץ", "Remove file")}">✕</button></span>`).join("");
+  row.querySelectorAll("button").forEach(btn => btn.onclick = () => { attached.splice(+btn.dataset.i, 1); drawAttach(); });
+}
+async function upload(file) {
+  try {
+    const j = await (await fetch("/upload?name=" + encodeURIComponent(file.name || "image.png"), { method: "POST", body: file })).json();
+    if (j.ok) attached.push(j); else toast(L("העלאה נכשלה: ", "Upload failed: ") + (j.error || ""));
+  } catch (e) { toast(L("העלאה נכשלה", "Upload failed")); }
+  drawAttach();
+}
+say.addEventListener("paste", e => { const fs = [...((e.clipboardData && e.clipboardData.files) || [])]; if (fs.length) { e.preventDefault(); fs.forEach(upload); } });
+$("attachBtn").onclick = () => $("fileInp").click();
+$("fileInp").onchange = e => { [...e.target.files].forEach(upload); e.target.value = ""; };
+const dropZone = document.querySelector(".chat-card");
+["dragenter", "dragover"].forEach(ev => dropZone.addEventListener(ev, e => { if ([...(e.dataTransfer.types || [])].includes("Files")) { e.preventDefault(); dropZone.classList.add("composer-drop"); } }));
+["dragleave", "drop"].forEach(ev => dropZone.addEventListener(ev, () => dropZone.classList.remove("composer-drop")));
+dropZone.addEventListener("drop", e => { if (e.dataTransfer.files.length) { e.preventDefault(); [...e.dataTransfer.files].forEach(upload); } });
+$("syncChk").onchange = e => { syncMap[curChat] = e.target.checked; try { localStorage.setItem("wa-dash-sync", JSON.stringify(syncMap)); } catch (er) {} sendHint(); };
+$("stopBtn").onclick = () => { $("stopBtn").disabled = true; act({ do: "stop", chat: curChat }, L("עוצר את העבודה…", "Stopping…")).then(() => setTimeout(() => { $("stopBtn").disabled = false; load(); }, 2500)); };
+function sendHint() {
+  const local = curChat === "local", sync = $("syncChk").checked;
+  $("syncLbl").hidden = local;
+  $("sendHint").textContent = local ? L("שיחה מקומית — התשובות מוצגות כאן בלבד, בלי ווצאפ.", "Local chat — answers show here only, no WhatsApp.")
+    : sync ? L("ההודעה והתשובה נשלחות גם לקבוצה בווצאפ.", "Message and answer are also posted to the WhatsApp group.")
+    : L("נשאר כאן בלבד. אפשר להמשיך מהנייד מאותה נקודה.", "Stays here only. You can continue from the phone from this point.");
+}
 $("composer").onsubmit = async e => {
   e.preventDefault();
-  const text = say.value.trim(); if (!text || sending) return;
+  const text = say.value.trim(); if ((!text && !attached.length) || sending) return;
+  const isLocal = curChat === "local", sync = !isLocal && $("syncChk").checked;
+  if (sync && attached.length > 1) { toast(L("בשליחה לווצאפ אפשר לצרף קובץ אחד", "Only one file when posting to WhatsApp")); return; }
   sending = true;
-  const item = { text, at: new Date().toISOString(), state: "sending" };
-  outbox.push(item); say.value = ""; grow(); drawOutbox(true);
+  const files = attached, shown = (text + files.map(f => "\n📎 " + baseName(f.path)).join("")).trim();
+  const item = { text: shown, at: new Date().toISOString(), state: "sending", chat: curChat };
+  outbox.push(item); say.value = ""; attached = []; drawAttach(); grow(); drawOutbox(true);
+  let ok = false;
   try {
-    const j = await (await fetch("/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ do: "say", text }) })).json();
-    item.state = j && !j.error ? "sent" : "failed"; item.err = j && j.error;
+    const body = (isLocal || !sync) ? { do: "say_pc", chat: curChat, text, sync: 0, attach: files.map(f => f.path) }
+                                    : { do: "say", chat: curChat, text, media_path: files[0] && files[0].path };
+    const j = await post(body);
+    ok = !!j && !j.error; item.state = ok ? "sent" : "failed"; item.err = j && j.error;
+    if (ok && j.agent_alive === false) toast(L("הסוכן לא פעיל כרגע — ההודעה תטופל כשיחזור", "The agent is not running — it will be handled when it is back"));
   } catch (err) { item.state = "failed"; item.err = String(err); }
   sending = false;
-  if (item.state === "failed") { toast(L("השליחה נכשלה — הטקסט חזר לתיבה", "Send failed — text is back in the box")); outbox = outbox.filter(x => x !== item); if (!say.value) { say.value = text; grow(); } }
-  drawOutbox(true); setTimeout(load, 1500); setTimeout(load, 6000);
+  if (!ok) { toast(L("השליחה נכשלה — הטקסט חזר לתיבה", "Send failed — text is back in the box")); outbox = outbox.filter(x => x !== item); if (!say.value) { say.value = text; grow(); } attached = files; drawAttach(); }
+  else if (sync && files.length) outbox = outbox.filter(x => x !== item);
+  drawOutbox(true); setTimeout(load, 1200); setTimeout(load, 5000);
 };
 function drawOutbox(scroll) {
   const chat = $("chat"); chat.querySelectorAll(".bubble.outbox").forEach(x => x.remove());
   const shown = new Set((last && last.conversation || []).filter(m => !m.tool).map(m => (m.content || "").trim()));
   outbox = outbox.filter(x => !(x.state === "sent" && shown.has(x.text)) && Date.now() - Date.parse(x.at) < 5 * 60000);
-  outbox.forEach(x => chat.insertAdjacentHTML("beforeend", `<div class="bubble me outbox ${x.state}"><span class="who">${L("אתה", "You")}</span>${esc(x.text)}<span class="meta">${x.state === "sending" ? L("⏳ שולח…", "⏳ sending…") : L("✓ נשלח", "✓ sent")}</span></div>`));
+  outbox.filter(x => x.chat === curChat).forEach(x => chat.insertAdjacentHTML("beforeend", `<div class="bubble me outbox ${x.state}"><span class="who">${L("אתה", "You")}</span>${esc(x.text)}<span class="meta">${x.state === "sending" ? L("⏳ שולח…", "⏳ sending…") : L("✓ נשלח", "✓ sent")}</span></div>`));
   if (scroll) chat.scrollTop = chat.scrollHeight;
 }
 
@@ -236,13 +278,14 @@ function drawerContent(kind, d) {
     return `<div class="sum-row"><span class="stat">${L("היום", "Today")}: $${(a.spent_today ?? 0).toFixed(2)}</span><span class="stat">${L("תקרה", "Cap")}: $${a.budget}</span><span class="stat">${L("ריצות היום", "Runs today")}: ${runs.length}</span></div>
       <div class="item"><div class="item-head"><strong>${L("ניצול התקרה היומית", "Daily cap used")}</strong><span class="muted">${Math.round(pct)}%</span></div><span class="meter${pct > 80 ? " hot" : ""}"><span style="width:${pct}%"></span></span></div>
       ${Object.keys(byModel).length ? `<div class="item"><div class="item-head"><strong>${L("היום לפי מודל", "Today by model")}</strong></div>${Object.entries(byModel).sort((x, y) => y[1].cost - x[1].cost).map(([m, v]) => `<div class="bar-row" style="grid-template-columns:90px 1fr 120px"><span>${m === "?" ? L("לא נרשם", "not recorded") : esc(m)}</span><span class="meter"><span style="width:${100 * v.cost / mmax}%"></span></span><span>$${v.cost.toFixed(2)} · ${v.n} ${L("ריצות", "runs")}</span></div>`).join("")}</div>` : ""}
+      <div class="item"><div class="item-head"><strong>${L("לפי שיחה — היום", "By conversation — today")}</strong></div>${(d.groups || []).map(g => `<div class="conv-row"><span>${g.jid === "local" ? "💻" : "👥"} ${esc(g.name)} · <span class="muted">${esc(MODEL_HE(g.model))}</span></span><span>$${g.spent} / $${g.budget}</span><span class="meter${g.spent >= g.budget ? " hot" : ""}"><span style="width:${Math.min(100, 100 * g.spent / (g.budget || 1))}%"></span></span></div>`).join("")}<p class="note tight">${L("תקרה לכל שיחה בנפרד — לשינוי: בכרטיס \"השיחה הנוכחית\" ← 💲 תקרה", "Each conversation has its own cap — change it in the 'This conversation' card")}</p></div>
       <div class="item"><div class="item-head"><strong>${L("לפי יום", "By day")}</strong></div>${c.slice().reverse().map(r => `<div class="bar-row"><span class="muted">${r.day.slice(8, 10)}.${r.day.slice(5, 7)}</span><span class="meter"><span style="width:${100 * r.cost / max}%"></span></span><span>$${r.cost}</span></div>`).join("")}</div>
       <div class="item"><div class="item-head"><strong>${L("ריצות Claude היום", "Claude runs today")}</strong></div>${runs.length ? runs.map(r => `<div class="bar-row" style="grid-template-columns:52px 70px 1fr 70px"><span class="muted">${hhmm(toDate(r.at))}</span><span class="muted">${esc(r.model || "")}</span><span class="${r.ok ? "" : "bad"}">${r.ok ? "" : "✖ "}${Math.round(r.seconds)} ${L("שנ'", "s")}</span><span>$${(r.cost || 0).toFixed(3)}</span></div>`).join("") : `<span class="muted">—</span>`}</div>`;
   }
   return "";
 }
 function renderDrawer(reset) {
-  if (!drawerKind || !last) return;
+  if (!drawerKind || !last || drawerKind === "ctx") return;
   const names = DRAWERS(), body = $("drawerBody"), top = body.scrollTop;
   $("drawerTitle").textContent = names[drawerKind];
   $("drawerTabs").innerHTML = Object.entries(names).map(([k, n]) => `<button role="tab" aria-selected="${k === drawerKind}" data-k="${k}">${n}</button>`).join("");
@@ -344,17 +387,33 @@ function render(d) {
   // chat
   const chat = $("chat"); const atBottom = chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 40;
   const MT = { audio: L("הודעה קולית", "voice note"), image: L("תמונה", "image"), document: L("קובץ", "file"), video: L("וידאו", "video") };
+  renderTabs(d);
   const isStatus = m => m.tool && /^_?(⏳|✅ סיימתי)/.test(m.content || "");
   const conv = d.conversation || [], lastStatus = conv.map(isStatus).lastIndexOf(true);
   const lv = d.live || null, steps = (lv && lv.steps) || [];
-  const statusHtml = (m, i) => {
-    if (i !== lastStatus || !steps.length) return `<div class="bubble tool status old"><span class="st-head">${wa(m.content)}</span><span class="meta">${fmt(m.timestamp)}</span></div>`;
+  const statusBody = () => {
     const head = lv.done ? L(`✅ סיימתי · ${Math.floor(lv.secs / 60)}:${String(lv.secs % 60).padStart(2, "0")} · ${esc(lv.model)} · ${steps.length} שלבים`, `✅ done · ${esc(lv.model)}`)
                          : L(`⏳ עובד · ${esc(lv.model)}`, `⏳ working · ${esc(lv.model)}`);
-    return `<div class="bubble tool status"><span class="st-head">${head}</span><ol>${steps.map((x, j) => `<li class="${j === steps.length - 1 && !lv.done ? "now" : ""}" title="${esc(x.text)}">${hhmm(toDate(x.at))} · ${esc(x.text)}</li>`).join("")}</ol><span class="meta">${fmt(m.timestamp)}</span></div>`;
+    return `<span class="st-head">${head}</span><ol>${steps.map((x, j) => `<li class="${j === steps.length - 1 && !lv.done ? "now" : ""}" title="${esc(x.text)}">${hhmm(toDate(x.at))} · ${esc(x.text)}</li>`).join("")}</ol>`;
   };
-  chat.innerHTML = conv.map((m, i) => isStatus(m) ? statusHtml(m, i) : `<div class="bubble ${m.tool ? "tool" : "me"}"><span class="who">${m.tool ? L("🤖 הכלי", "🤖 Tool") : L("אתה", "You")}</span>${wa(m.content || (m.media_type ? "[" + (MT[m.media_type] || m.media_type) + "]" : ""))}<span class="meta">${fmt(m.timestamp)}</span></div>`).join("")
-    || `<p class="empty">${L("עדיין אין שיחה", "No conversation yet")}</p>`;
+  const statusHtml = (m, i) => (i !== lastStatus || !steps.length)
+    ? `<div class="bubble tool status old"><span class="st-head">${wa(m.content)}</span><span class="meta">${fmt(m.timestamp)}</span></div>`
+    : `<div class="bubble tool status">${statusBody()}<span class="meta">${fmt(m.timestamp)}</span></div>`;
+  const bubbleHtml = m => {
+    const txt = m.content || (m.media_type ? "[" + (MT[m.media_type] || m.media_type) + "]" : "");
+    const long = (txt.length > 700 || txt.split("\n").length > 14) && !expanded.has(String(m.id));
+    const files = (m.files || []).map(f => `<a href="/lf/${encodeURIComponent(f)}" target="_blank" rel="noopener">📎 ${esc(f.replace(/^\d{8}_\d{6}_/, ""))}</a>`).join("");
+    const canFold = txt.length > 700 || txt.split("\n").length > 14;
+    return `<div class="bubble ${m.tool ? "tool" : "me"}" data-k="${esc(m.id)}"><span class="who">${m.tool ? L("🤖 הכלי", "🤖 Tool") : L("אתה", "You")}${m.src === "pc" ? `<span class="pc-tag" title="${L("נכתב בלוח הבקרה במחשב", "typed in the dashboard on the PC")}">💻</span>` : ""}</span>` +
+      `<div class="bt${long ? " fold" : ""}">${wa(txt)}</div>${canFold ? `<button class="more" type="button">${long ? L("הצג עוד ▾", "Show more ▾") : L("הצג פחות ▴", "Show less ▴")}</button>` : ""}` +
+      `${files ? `<div class="files">${files}</div>` : ""}<span class="meta">${fmt(m.timestamp)}</span></div>`;
+  };
+  let html = conv.map((m, i) => isStatus(m) ? statusHtml(m, i) : bubbleHtml(m)).join("");
+  // a PC-only run has no WhatsApp status message: show its steps as a bubble at the end of the conversation
+  const lastMe = conv.filter(m => !m.tool).map(m => String(m.timestamp).slice(0, 19)).sort().pop() || "";
+  if (lv && steps.length && lastStatus < 0 && (!lv.done || String(lv.started).replace("T", " ") >= lastMe))
+    html += `<div class="bubble tool status">${statusBody()}</div>`;
+  chat.innerHTML = html || `<p class="empty">${L("עדיין אין שיחה", "No conversation yet")}</p>`;
   drawOutbox(false);
   if (atBottom || !chat._init) { chat.scrollTop = chat.scrollHeight; chat._init = true; }
   const pc = $("pendingChip"); pc.hidden = !a.pending; pc.textContent = a.pending ? L(`${a.pending} ממתינות לתשובה`, `${a.pending} awaiting an answer`) : "";
@@ -364,7 +423,7 @@ function render(d) {
   $("pauseBox").textContent = b.paused ? L(`⛔ שליחה לאחרים מושהית עד ${fmt(p.paused_until)} — `, `⛔ Sending to others is paused until ${fmt(p.paused_until)} — `) + (p.pause_reason || "") : "";
   // system
   $("sys").innerHTML = `
-    <dt>${L("שיחת Claude", "Session")}</dt><dd>${L("מאז", "since")} ${fmt(a.session_started)}</dd>
+    <dt>${L("הסשן הנוכחי", "Current session")}</dt><dd>${(d.model && d.model.session_runs) || 0} ${L("הודעות", "messages")}</dd>
     <dt>${L("גיבוי", "Backup")}</dt><dd>${fmt(a.backup_done)}</dd>
     <dt>${L("תוספים", "Plugins")}</dt><dd class="muted">${esc((a.plugins || []).join(", ") || L("אין", "none"))}</dd>`;
   // model picker
@@ -379,7 +438,9 @@ function render(d) {
   }
   sel.onfocus = () => sel.dataset.busy = "1"; sel.onblur = () => delete sel.dataset.busy;
   sel.onchange = () => { $("modelTip").textContent = (guide[sel.value] || {}).tip || ""; sel.title = tipOf(sel.value); delete sel.dataset.busy;
-    act({ do: "model", model: sel.value, hours: 0 }, L("המודל הוחלף", "Model changed")); };
+    act({ do: "model", chat: d.chat, model: sel.value, hours: 0 }, L("המודל הוחלף", "Model changed")); };
+  const cg = (d.groups || []).find(g => g.jid === d.chat) || {};
+  $("modelNow").innerHTML = `<strong>${esc(cg.name || "")}</strong><br>` + $("modelNow").innerHTML;
   const rc = mi.recommend;
   $("modelRec").textContent = rc && rc.model ? `💡 ${L("המלצה: ", "Suggestion: ")}${(guide[rc.model] || {}).he || rc.model} (${rc.why})` : "";
   $("modelBox").classList.toggle("working", !!(d.live && !d.live.done));
@@ -388,27 +449,135 @@ function render(d) {
   drawCharts(d);
 }
 
-// ---- control group card ----
-async function loadGroup() {
-  try { const j = await (await fetch("/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ do: "group_info" }) })).json();
-    $("grpName").textContent = j.name || j.stored_name || "—"; $("grpName").title = j.jid || ""; } catch (e) {}
+// ---- current conversation card + tabs ----
+const groupOf = jid => ((last && last.groups) || []).find(g => g.jid === jid) || {};
+function renderTabs(d) {
+  const gs = d.groups || [];
+  if (!d.chat || d.chat !== curChat) { curChat = d.chat; try { localStorage.setItem("wa-dash-chat", curChat); } catch (e) {} }
+  $("tabs").innerHTML = gs.map(g => {
+    const run = g.live && !g.live.done;
+    return `<button class="tab" role="tab" aria-selected="${g.jid === d.chat}" data-chat="${esc(g.jid)}" title="${esc(PURPOSE[g.purpose] || "")} · ${L("תקרה", "cap")} $${g.budget}">` +
+      `<span aria-hidden="true">${g.jid === "local" ? "💻" : "👥"}</span><span class="t-name">${esc(g.name)}</span>` +
+      `${run ? `<span class="t-dot" title="${L("עובד עכשיו", "working now")}"></span>` : ""}${g.pending ? `<span class="t-badge">${g.pending}</span>` : ""}` +
+      `<span class="t-meta">${esc(MODEL_HE(g.model))} · $${g.spent}</span></button>`;
+  }).join("");
+  $("tabAdd").textContent = "➕ " + L("חבר קבוצה", "Connect a group");
+  const pr = d.presence || {}, pcL = pr.pc_last ? toDate(pr.pc_last).getTime() : 0, phL = pr.phone_last ? toDate(pr.phone_last).getTime() : 0, recent = Math.max(pcL, phL);
+  $("presence").innerHTML = !recent || Date.now() - recent > 30 * 60000 ? "🕑 " + L("לא פעיל לאחרונה", "idle")
+    : pcL >= phL ? `💻 <b>${L("אתה במחשב", "You are at the PC")}</b>` : `📱 <b>${L("אתה בנייד", "You are on the phone")}</b>`;
+  const g = groupOf(d.chat), local = d.chat === "local";
+  $("grpName").textContent = g.name || "—";
+  $("grpMeta").textContent = `${PURPOSE[g.purpose] || ""} · ${L("תקרה", "cap")} $${g.budget ?? "—"} · ${L("היום", "today")} $${g.spent ?? 0}`;
+  $("grpEdit").hidden = local; $("grpOff").hidden = !!g.primary;
+  $("h-chat").textContent = local ? L("שיחה מקומית עם Claude", "Local chat with Claude") : L("השיחה בקבוצה", "Conversation in group") + " · " + (g.name || "");
+  $("syncChk").checked = !!syncMap[d.chat]; sendHint();
+  const run = !!(d.live && !d.live.done); $("stopBtn").hidden = !run;
+  fitChat();
 }
+$("tabAdd").onclick = e => { e.stopPropagation(); toggleAdd(); };
+$("tabs").addEventListener("click", e => {
+  const t = e.target.closest(".tab"); if (!t) return;
+  curChat = t.dataset.chat; try { localStorage.setItem("wa-dash-chat", curChat); } catch (er) {}
+  const c = $("chat"); c._init = false; c.innerHTML = ""; load();
+});
 $("grpRename").onclick = async () => {
   const n = $("grpInput").value.trim(); if (!n) { toast(L("כתוב שם", "Type a name")); return; }
-  if (!confirm(L(`לשנות את שם קבוצת הבקרה ל: ${n}?`, `Rename the control group to: ${n}?`))) return;
-  const j = await act({ do: "group_rename", name: n }, L("השם שונה", "Renamed")); if (j && !j.error) { $("grpInput").value = ""; loadGroup(); }
+  if (!confirm(L(`לשנות את שם הקבוצה ל: ${n}?`, `Rename the group to: ${n}?`))) return;
+  const j = await act({ do: "group_rename", jid: curChat, name: n }, L("השם שונה", "Renamed")); if (j && !j.error) $("grpInput").value = "";
 };
-$("grpCreate").onclick = async () => {
-  const n = $("grpInput").value.trim() || "Claude";
-  if (!confirm(L(`ליצור קבוצה חדשה "${n}" שבה רק אתה ולהעביר אליה את השיחה עם Claude? הקבוצה הנוכחית תישאר אבל הסוכן יפסיק להאזין לה.`,
-                 `Create a new group "${n}" with only you and move the Claude chat there?`))) return;
-  const j = await act({ do: "group_create", name: n }, L("הקבוצה נוצרה — הסוכן עולה מחדש", "Group created — agent restarting"));
-  if (j && !j.error) { $("grpInput").value = ""; setTimeout(loadGroup, 3000); }
+$("grpBudget").onclick = async () => {
+  const g = groupOf(curChat), v = prompt(L(`תקרת עלות יומית (דולר) ל"${g.name}":`, `Daily cost cap (USD) for "${g.name}":`), g.budget);
+  if (v === null) return; const j = await act({ do: "group_budget", jid: curChat, budget: v }, L("התקרה עודכנה", "Cap updated")); if (j && j.error) toast(j.error);
 };
-loadGroup(); setInterval(loadGroup, 300000);
+$("grpOff").onclick = async () => {
+  const g = groupOf(curChat);
+  if (!confirm(L(`לנתק את ההאזנה לקבוצה "${g.name}"? הסוכן יפסיק לענות בה (הקבוצה והיסטוריה נשארות).`, `Stop listening to "${g.name}"?`))) return;
+  const j = await act({ do: "group_disconnect", jid: curChat }, L("ההאזנה נותקה", "Disconnected")); if (j && !j.error) { curChat = ""; load(); }
+};
+
+// ---- connect a WhatsApp group ----
+function toggleAdd(force) {
+  const pop = $("addPop"), show = force === undefined ? pop.hidden : force; pop.hidden = !show;
+  if (show) loadAvail();
+}
+async function loadAvail() {
+  const ul = $("availList"); ul.innerHTML = `<li class="empty">${L("טוען קבוצות…", "Loading groups…")}</li>`;
+  const j = await post({ do: "groups_available" });
+  const gs = (j.groups || []).filter(g => g.name).sort((x, y) => x.name.localeCompare(y.name, "he"));
+  ul.innerHTML = gs.length ? gs.map((g, i) => `<li><span>${esc(g.name)}</span><button class="btn small" data-i="${i}">${L("חבר", "Connect")}</button></li>`).join("") : `<li class="empty">${esc(j.error || L("אין קבוצות פנויות", "No groups available"))}</li>`;
+  ul.querySelectorAll("button").forEach(b => b.onclick = async () => {
+    const g = gs[+b.dataset.i]; b.disabled = true;
+    let r = await post({ do: "group_connect", jid: g.jid, name: g.name, purpose: $("addPurpose").value });
+    if (r.needs_confirm) {
+      if (!confirm(L(`בקבוצה "${g.name}" יש ${r.members} חברים. התשובות שלי יהיו גלויות לכולם (אענה רק להודעות שלך). לחבר בכל זאת?`, `The group has ${r.members} members; my answers will be visible to all. Connect anyway?`))) { b.disabled = false; return; }
+      r = await post({ do: "group_connect", jid: g.jid, name: g.name, purpose: $("addPurpose").value, confirm_members: true });
+    }
+    if (r.error) { toast(r.error); b.disabled = false; return; }
+    toast(L("מחובר — מעכשיו אענה בקבוצה", "Connected")); curChat = r.jid; toggleAdd(false); load();
+  });
+}
+$("newGrpBtn").onclick = async () => {
+  const n = $("newGrpName").value.trim(); if (!n) { toast(L("כתוב שם לקבוצה", "Type a group name")); return; }
+  $("newGrpBtn").disabled = true;
+  const r = await post({ do: "group_create", name: n, purpose: $("addPurpose").value });
+  $("newGrpBtn").disabled = false;
+  if (r.error) { toast(r.error); return; }
+  $("newGrpName").value = ""; toast(L("הקבוצה נוצרה ומחוברת", "Group created and connected")); curChat = r.jid; toggleAdd(false); load();
+};
+$("addClose").onclick = () => toggleAdd(false);
+document.addEventListener("keydown", e => { if (e.key === "Escape") toggleAdd(false); });
+
+// ---- long bubbles: show more / less (remembered across refreshes) ----
+const expanded = new Set();
+$("chat").addEventListener("click", e => {
+  const b = e.target.closest(".more"); if (!b) return;
+  const k = b.closest(".bubble").dataset.k; if (expanded.has(k)) expanded.delete(k); else expanded.add(k);
+  if (last) render(last);
+});
+
+// ---- search the whole history ----
+const sBtn = $("searchBtn"), sBox = $("searchBox"), sInp = $("searchInp"), sList = $("searchList");
+let sTimer = null, sItems = [], sSel = -1, sSeq = 0;
+function openSearch(v) { sBox.hidden = !v; sBtn.setAttribute("aria-expanded", v); if (v) { sInp.focus(); sInp.select(); } }
+sBtn.onclick = e => { e.stopPropagation(); openSearch(sBox.hidden); };
+document.addEventListener("click", e => { if (!e.target.closest(".search-wrap")) openSearch(false); });
+document.addEventListener("keydown", e => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openSearch(true); }
+  if (e.key === "Escape" && !sBox.hidden) { openSearch(false); sBtn.focus(); }
+});
+const hl = (t, q) => { const x = esc(t); if (!q) return x; try { return x.replace(new RegExp("(" + esc(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + ")", "gi"), "<mark>$1</mark>"); } catch (e) { return x; } };
+function drawSearch(q) {
+  sInp.setAttribute("aria-expanded", !!q);
+  sList.innerHTML = !q ? "" : sItems.length ? sItems.map((r, i) => `<li role="option" id="so${i}" aria-selected="${i === sSel}" data-i="${i}"><span class="s-head"><b>${esc(r.chat_name)}${r.kind === "voice" ? " 🎙️" : ""}</b><span>${esc(r.sender)} · ${fmt(r.ts)}</span></span><span class="s-snip">${hl(r.snippet, q)}</span></li>`).join("")
+    : `<li class="s-empty">${L("לא נמצא — נסה חלק אחר מהמילה", "Nothing found — try part of the word")}</li>`;
+  sInp.setAttribute("aria-activedescendant", sSel >= 0 ? "so" + sSel : "");
+}
+async function runSearch() {
+  const q = sInp.value.trim(); if (q.length < 2) { sItems = []; drawSearch(""); return; }
+  const my = ++sSeq; const j = await post({ do: "search", q }); if (my !== sSeq) return;
+  sItems = j.results || []; sSel = sItems.length ? 0 : -1; drawSearch(q);
+}
+sInp.addEventListener("input", () => { clearTimeout(sTimer); sTimer = setTimeout(runSearch, 180); });
+sInp.addEventListener("keydown", e => {
+  if (e.key === "ArrowDown" || e.key === "ArrowUp") { e.preventDefault(); if (sItems.length) { sSel = (sSel + (e.key === "ArrowDown" ? 1 : -1) + sItems.length) % sItems.length; drawSearch(sInp.value.trim()); const el = $("so" + sSel); if (el) el.scrollIntoView({ block: "nearest" }); } }
+  if (e.key === "Enter" && sSel >= 0) { e.preventDefault(); pickResult(sItems[sSel]); }
+});
+sList.addEventListener("click", e => { const li = e.target.closest("li[data-i]"); if (li) pickResult(sItems[+li.dataset.i]); });
+async function pickResult(r) {
+  openSearch(false);
+  const j = await post({ do: "context", chat: r.chat, ts: r.ts });
+  const q = sInp.value.trim();
+  drawerKind = "ctx"; $("scrim").hidden = false; $("drawer").hidden = false; $("drawerTitle").textContent = L("הקשר: ", "Context: ") + (j.chat_name || r.chat_name);
+  $("drawerTabs").innerHTML = "";
+  const conn = ((last && last.groups) || []).find(g => g.jid === r.chat);
+  $("drawerBody").innerHTML = ((j.messages || []).map(m => `<div class="ctx-msg${m.hit ? " hit" : ""}"><span class="who">${esc(m.who)} · ${fmt(m.timestamp)}</span>${hl(m.content || (m.media_type ? "[" + m.media_type + "]" : ""), m.hit ? q : "")}</div>`).join("") || `<p class="empty">${L("אין הקשר זמין", "No context")}</p>`) +
+    (conn ? `<div class="row tight"><button class="btn small" id="ctxOpen">${L("פתח את השיחה בלשונית", "Open this conversation tab")}</button></div>` : "");
+  const ob = $("ctxOpen"); if (ob) ob.onclick = () => { closeDrawer(); curChat = r.chat; load(); };
+  $("drawerClose").focus();
+}
 
 async function load() {
-  try { const d = await (await fetch("/data", { cache: "no-store" })).json(); if (d.error) throw new Error(d.error); render(d); }
+  try { const d = await (await fetch("/data?chat=" + encodeURIComponent(curChat || ""), { cache: "no-store" })).json(); if (d.error) throw new Error(d.error); render(d); }
   catch (e) { $("connText").textContent = L("אין גישה לנתונים", "No access to data"); $("connSub").textContent = String(e); }
 }
 load(); setInterval(load, 10000);

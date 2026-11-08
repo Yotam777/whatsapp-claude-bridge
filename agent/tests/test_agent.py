@@ -289,7 +289,7 @@ def test_dev_work_uses_the_owners_own_words(agent):
     mod, _ = agent
     wrapped = mod.T["prompt"].format(owner="יקיר", when="x", text="מה עם הנעליים של דני", where='מהמחשב (לוח הבקרה, "4M")', dest="לחלון")
     assert mod.is_dev_work(wrapped), "the wrapper itself mentions the dashboard"
-    attached = "תסדר את הטופס\n" + mod.T["attached"].format(path="C:/Users/walla/whatsapp-mcp/whatsapp-bridge/store/x.jpg")
+    attached = "תסדר את הטופס\n" + mod.T["attached"].format(path="C:/Users/me/whatsapp-mcp/whatsapp-bridge/store/x.jpg")
     assert not mod.is_dev_work(mod.raw_text(attached)), "an attachment path is not dev work"
     assert mod.is_dev_work(mod.raw_text("תתקן את הגשר"))
 

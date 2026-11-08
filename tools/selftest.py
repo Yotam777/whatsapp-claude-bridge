@@ -102,7 +102,7 @@ def t_media_names():
 
 def t_policy():
     code, p = call("/policy")
-    return code == 200 and p.get("mode") in ("draft", "auto"), f"מצב שליחה: {'טיוטות בלבד' if p.get('mode') == 'draft' else 'עצמאי'}"
+    return code == 200 and p.get("mode") == "draft", "מצב שליחה: טיוטות בלבד" if p.get("mode") == "draft" else f"מצב שליחה לא צפוי: {p.get('mode')}"
 
 
 def t_send_owner():

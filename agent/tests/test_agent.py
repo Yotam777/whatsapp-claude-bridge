@@ -26,6 +26,10 @@ def agent(tmp_path, monkeypatch):
     sys.path.insert(0, HERE)
     mod = importlib.reload(importlib.import_module("agent"))
     mod.LOG = str(tmp_path / "agent.log")
+    # never touch the real installation's files from a test (model choice, groups, restart / stop requests)
+    for name, fname in (("MODEL_FILE", "model_override.json"), ("GROUPS_FILE", "groups.json"),
+                        ("RESTART_FILE", "restart.request"), ("STOP_FILE", "stop.request")):
+        monkeypatch.setattr(mod, name, str(tmp_path / fname))
     mod.adb().close()
     return mod, db
 
@@ -169,7 +173,7 @@ def _run_worker(mod, monkeypatch, answer="התשובה"):
     sent, calls = [], []
     monkeypatch.setattr(mod, "send", lambda chat, text, media=None, quoted=None: sent.append((chat, text)) or True)
     monkeypatch.setattr(mod, "bridge", lambda *a, **k: {})
-    monkeypatch.setattr(mod, "claude", lambda prompt, model=None, session=True, timeout=900, on_stage=None, chat=None: calls.append((chat, model, prompt)) or answer)
+    monkeypatch.setattr(mod, "claude", lambda prompt, model=None, session=True, timeout=900, on_stage=None, chat=None, **k: calls.append((chat, model, prompt)) or answer)
     import threading
     threading.Thread(target=mod.command_worker, daemon=True).start()
     return sent, calls
@@ -255,3 +259,148 @@ def test_group_prompt_carries_instructions(multi, tmp_path, monkeypatch):
     gp = mod.group_prompt(DEV)
     assert "הוראות פיתוח מיוחדות" in gp and "handoff-dev.md" in gp
     assert mod.group_prompt(mod.PRIMARY) is None
+
+
+# ---------- review fixes 08.11: interrupted commands, dev-work on raw text, sticky model, total cap, text approval ----------
+
+def test_interrupted_command_is_not_rerun(multi, monkeypatch):
+    mod, _ = multi
+    sent = []
+    monkeypatch.setattr(mod, "send", lambda chat, text, media=None, quoted=None: sent.append((chat, text)) or True)
+    monkeypatch.setattr(mod, "wait_bridge", lambda *a, **k: True)
+    with mod.adb() as db:
+        db.execute("INSERT INTO commands (msg_id, text, at, chat_jid, source, sync, status) VALUES ('r1', 'עבודה ארוכה', '2026-11-08 07:00', ?, 'wa', 0, 'running')", (DEV,))
+        db.execute("INSERT INTO commands (msg_id, text, at, chat_jid, source, sync, status) VALUES ('p1', 'עוד לא התחיל', '2026-11-08 07:01', ?, 'wa', 0, 'pending')", (DEV,))
+    rows = mod.mark_interrupted()
+    assert [r[1] for r in rows] == ["r1"]
+    mod.notify_interrupted(rows)
+    with mod.adb() as db:
+        st = dict(db.execute("SELECT msg_id, status FROM commands").fetchall())
+    assert st == {"r1": "interrupted", "p1": "pending"}, "running → interrupted (not re-run); pending still answered"
+    assert any(c == DEV and "נקטעה" in t for c, t in sent)
+    row = mod.claim_next(DEV)
+    assert row[1] == "p1"
+    with mod.adb() as db:
+        assert db.execute("SELECT status, attempts FROM commands WHERE msg_id = 'p1'").fetchone() == ("running", 1)
+    assert mod.claim_next(DEV) is None
+
+
+def test_dev_work_uses_the_owners_own_words(agent):
+    mod, _ = agent
+    wrapped = mod.T["prompt"].format(owner="יקיר", when="x", text="מה עם הנעליים של דני", where='מהמחשב (לוח הבקרה, "4M")', dest="לחלון")
+    assert mod.is_dev_work(wrapped), "the wrapper itself mentions the dashboard"
+    attached = "תסדר את הטופס\n" + mod.T["attached"].format(path="C:/Users/walla/whatsapp-mcp/whatsapp-bridge/store/x.jpg")
+    assert not mod.is_dev_work(mod.raw_text(attached)), "an attachment path is not dev work"
+    assert mod.is_dev_work(mod.raw_text("תתקן את הגשר"))
+
+
+def test_model_is_sticky_within_a_session(multi):
+    mod, _ = multi
+    mod.CFG.update({"deep_model": "opus", "light_model": "sonnet", "claude_model": "sonnet", "fresh_sessions": False})
+    chat = mod.PRIMARY
+    # brand-new session: deep words may start it on the deep model
+    assert mod.pick_model_info("תכנן לי את השבוע", chat) == ("opus", "auto")
+    # running session on sonnet: deep words keep sonnet (cache) and suggest !!
+    mod.kv_set(mod.K("session_id", chat), "s1")
+    mod.kv_set(mod.K("session_started", chat), mod.dt.datetime.now().isoformat())
+    mod.kv_set(mod.K("session_model", chat), "sonnet")
+    assert mod.pick_model_info("תכנן לי את השבוע", chat) == ("sonnet", "sticky_deep")
+    assert mod.pick_model_info("!! תכנן לי את השבוע", chat) == ("opus", "bang"), "explicit !! still works"
+    mod.set_override("haiku", None, chat)
+    assert mod.pick_model_info("תכנן", chat) == ("haiku", "forced")
+    mod.set_override("auto", None, chat)
+    # a session that started on opus keeps opus (no switch mid-session)
+    mod.kv_set(mod.K("session_model", chat), "opus")
+    assert mod.pick_model_info("מה המצב", chat) == ("opus", "auto")
+    # light → strong is the only automatic switch in a running session
+    mod.CFG["light_model"] = "haiku"
+    mod.kv_set(mod.K("session_model", chat), "haiku")
+    assert mod.pick_model_info("תסכם את הדוח", chat) == ("sonnet", "auto")
+    mod.kv_set(mod.K("session_model", chat), "sonnet")
+    assert mod.pick_model_info("שלום", chat) == ("sonnet", "auto"), "no step down mid-session"
+    # yesterday's session rotates: free choice again
+    mod.kv_set(mod.K("session_started", chat), "2020-01-01T00:00:00")
+    assert mod.pick_model_info("תכנן", chat) == ("opus", "auto")
+
+
+def test_total_daily_cap(multi):
+    mod, _ = multi
+    mod.CFG.update({"daily_budget_usd": 5})
+    mod.CFG.pop("total_daily_budget_usd", None)
+    assert mod.total_budget() == 10.0
+    now = mod.dt.datetime.now().isoformat()
+    with mod.adb() as db:
+        db.execute("INSERT INTO claude_runs (at, cost, chat) VALUES (?, 4.0, ?)", (now, mod.PRIMARY))
+        db.execute("INSERT INTO claude_runs (at, cost, chat) VALUES (?, 6.5, ?)", (now, DEV))  # DEV cap is 7
+    assert mod.over_budget(DEV) == ("total", 10.5, 10.0), "under its own cap, but the total is used up"
+    assert mod.over_budget(DEV, "! בכל זאת") is None, "! lifts the cap for one message"
+    mod.CFG["total_daily_budget_usd"] = 50
+    assert mod.over_budget(DEV) is None and mod.over_budget(mod.PRIMARY) is None
+    mod.CFG["daily_budget_usd"] = 3
+    assert mod.over_budget(mod.PRIMARY) == ("chat", 4.0, 3.0)
+
+
+def test_text_approval_picks_exactly_one_draft(agent):
+    mod, _ = agent
+    assert mod.select_draft([(7, "CARD7")]) == (7, "only")
+    assert mod.select_draft([]) == (None, "none")
+    assert mod.select_draft([(7, "CARD7"), (8, "CARD8")]) == (None, "several")
+    assert mod.select_draft([(7, "CARD7"), (8, "CARD8")], quoted="CARD8") == (8, "quoted")
+    assert mod.select_draft([(7, "CARD7")], quoted="OTHER") == (None, "not_a_card"), "a reply to a non-card never approves"
+
+
+def test_text_approval_calls_the_bridge_with_the_owner_token(multi, tmp_path, monkeypatch):
+    mod, db = multi
+    db.execute("CREATE TABLE drafts (id INTEGER PRIMARY KEY, recipient TEXT, name TEXT, message TEXT, status TEXT, card_id TEXT)")
+    db.execute("INSERT INTO drafts VALUES (5, '972500000009@s.whatsapp.net', 'דני', 'שלום', 'pending', 'CARD5')")
+    db.commit()
+    (tmp_path / "store" / "owner_token").write_text("OWNERTOK")
+    monkeypatch.setattr(mod, "OWNER_TOKEN_FILE", str(tmp_path / "store" / "owner_token"))
+    calls, sent = [], []
+    monkeypatch.setattr(mod, "bridge", lambda path, body=None, timeout=180, tok=None: calls.append((path, body, tok)) or {"success": True})
+    monkeypatch.setattr(mod, "send", lambda chat, text, media=None, quoted=None: sent.append((chat, text)) or True)
+    mod.handle(("a1", DEV, "me", "2026-11-08 08:00:00+02:00", "מאשר לך שליחה", True, ""))
+    assert ("/draft_decide", {"id": 5, "approve": True}, "OWNERTOK") in calls
+    with mod.adb() as adb:
+        assert adb.execute("SELECT count(*) FROM commands").fetchone()[0] == 0, "an approval is not a Claude command"
+
+
+def test_load_groups_keeps_last_good_copy(multi):
+    mod, _ = multi
+    assert DEV in mod.load_groups()
+    open(mod.GROUPS_FILE, "w", encoding="utf-8").write('{"broken": ')  # caught mid-write
+    assert DEV in mod.load_groups(), "a half-written groups.json must not drop the connected groups"
+    os.remove(mod.GROUPS_FILE)
+    assert DEV not in mod.load_groups(), "a deleted file really means no extra groups"
+
+
+def test_stop_request_targets_its_conversation(agent):
+    mod, _ = agent
+    assert mod.stop_applies("1203639999@g.us", "1203639999@g.us", {})
+    assert not mod.stop_applies("1203639999@g.us", mod.PRIMARY, {})
+    assert mod.stop_applies("", mod.PRIMARY, {"a": 1, "b": 2}), "legacy empty request stops the primary run"
+    assert mod.stop_applies("", "1203639999@g.us", {"1203639999@g.us": 1}), "or the only run"
+    assert not mod.stop_applies("", "1203639999@g.us", {"x": 1, "1203639999@g.us": 1})
+
+
+def test_conversations_run_in_parallel(multi, monkeypatch):
+    import threading
+    mod, _ = multi
+    release, done_dev = threading.Event(), threading.Event()
+
+    def fake(prompt, model=None, session=True, timeout=900, on_stage=None, chat=None, **k):
+        if chat == mod.PRIMARY:
+            release.wait(10)  # a long run in the 4M group…
+        else:
+            done_dev.set()   # …must not block the dev group
+        return "ok"
+    monkeypatch.setattr(mod, "send", lambda *a, **k: True)
+    monkeypatch.setattr(mod, "bridge", lambda *a, **k: {})
+    monkeypatch.setattr(mod, "claude", fake)
+    with mod.adb() as db:
+        db.execute("INSERT INTO commands (msg_id, text, at, chat_jid, source, sync) VALUES ('x1', 'ארוך', '2026-11-08 08:00', ?, 'pc', 0)", (mod.PRIMARY,))
+        db.execute("INSERT INTO commands (msg_id, text, at, chat_jid, source, sync) VALUES ('x2', 'קצר', '2026-11-08 08:00', ?, 'pc', 0)", (DEV,))
+    threading.Thread(target=mod.command_worker, daemon=True).start()
+    assert done_dev.wait(8), "the dev group was blocked by the 4M group's run"
+    release.set()
+    assert _wait_done(mod, 2)

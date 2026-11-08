@@ -39,9 +39,16 @@ def rewrite(rel, fn):
             f.write(new)
 
 
+RISKY = (".xlsx", ".xls", ".csv", ".docx", ".doc", ".pdf", ".jpg", ".jpeg", ".heic", ".mp4", ".ogg", ".opus", ".db", ".sqlite",
+         ".json.bak", ".zip")
+# files in the repo that are allowed to have a "risky" extension (part of the tool itself)
+RISKY_OK = ()
+
+
 def personal_data_scan(patterns):
     files = run(["git", "ls-files"]).split()
-    hits = []
+    # binaries are not text-scanned, so a personal photo / Excel / PDF would slip through: refuse them by type
+    hits = [f"{f}: binary/personal file type in the repo" for f in files if f.lower().endswith(RISKY) and f not in RISKY_OK]
     for f in files:
         if f.endswith((".woff2", ".ico", ".png", ".exe", ".sum", ".lock")) or "chart.umd" in f:
             continue

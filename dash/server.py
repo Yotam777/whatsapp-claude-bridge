@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import re
+import secrets
 import shutil
 import threading
 import urllib.error
@@ -48,16 +49,20 @@ def paths():
     store = store if os.path.isabs(store) else os.path.join(ROOT, store)
     return {"msg": os.path.join(store, "messages.db"), "wa": os.path.join(store, "whatsapp.db"),
             "agent": os.path.join(ROOT, "agent", "agent.db"), "log": os.path.join(ROOT, "agent", "agent.log"),
-            "token": os.path.join(store, "api_token"), "policy": os.path.join(store, "send_policy.json"),
+            "token": os.path.join(store, "api_token"), "owner_token": os.path.join(store, "owner_token"),
+            "policy": os.path.join(store, "send_policy.json"),
             "bridge_log": os.path.join(ROOT, "whatsapp-bridge", "bridge.log")}
 
 
 def bridge(path, body=None, timeout=8):
     c, p = cfg(), paths()
-    try:
-        tok = open(p["token"]).read().strip()
-    except OSError:
-        tok = ""
+    tok = ""
+    for k in ("owner_token", "token"):  # owner token: approvals / policy / direct actions; api token = older bridges
+        try:
+            tok = open(p[k]).read().strip()
+            break
+        except OSError:
+            pass
     req = urllib.request.Request(c["bridge_url"] + path, data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + tok})
     try:
@@ -92,6 +97,14 @@ def _groups_file():
     return os.path.join(ROOT, "agent", "groups.json")
 
 
+def dump_json(obj, path, **kw):
+    """Write JSON atomically (temp file + replace) so a reader never sees a half-written file."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, **kw)
+    os.replace(tmp, path)
+
+
 def load_groups_raw():
     try:
         return json.load(open(_groups_file(), encoding="utf-8"))
@@ -100,7 +113,7 @@ def load_groups_raw():
 
 
 def save_groups_raw(raw):
-    json.dump(raw, open(_groups_file(), "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    dump_json(raw, _groups_file(), ensure_ascii=False, indent=2)
 
 
 def conversations():
@@ -125,7 +138,7 @@ def sync_policy_groups():
     if "error" in res:  # bridge down: it reads the policy file on every send
         pol = local_policy()
         pol["control_groups"] = jids
-        json.dump(pol, open(paths()["policy"], "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+        dump_json(pol, paths()["policy"], ensure_ascii=False, indent=2)
 
 
 def agent_db_rw():
@@ -224,7 +237,7 @@ def data(chat=None):
                       "budget": float(g.get("budget_usd") or c.get("daily_budget_usd", 5)), "spent": round(sp[0]["s"], 2) if sp else 0,
                       "model": model_info(jid)["current"], "primary": jid == c["claude_group"],
                       "live": (json.loads(kv(K("live_steps", jid))) if kv(K("live_steps", jid)) else None),
-                      "pending": (rows(p["agent"], "SELECT count(*) n FROM commands WHERE status = 'pending' AND coalesce(chat_jid, ?) = ?", (c["claude_group"], jid)) or [{"n": 0}])[0]["n"]})
+                      "pending": (rows(p["agent"], "SELECT count(*) n FROM commands WHERE status IN ('pending','running') AND coalesce(chat_jid, ?) = ?", (c["claude_group"], jid)) or [{"n": 0}])[0]["n"]})
     pc_last = (rows(p["agent"], "SELECT max(at) m FROM local_messages WHERE role = 'me'") or [{"m": None}])[0]["m"]
     phone_last = (rows(p["msg"], "SELECT max(timestamp) m FROM messages WHERE is_from_me = 1 AND chat_jid IN (%s) AND content NOT LIKE ?" %
                        ",".join("?" * len([j for j in convs if j != LOCAL])), [j for j in convs if j != LOCAL] + [c["reply_prefix"].strip() + "%"]) or [{"m": None}])[0]["m"]
@@ -248,7 +261,7 @@ def data(chat=None):
         "received_today": (rows(p["msg"], "SELECT count(*) n FROM messages WHERE is_from_me = 0 AND substr(timestamp,1,10) = ?", (today,)) or [{"n": 0}])[0]["n"],
         "agent": {"heartbeat": kv("heartbeat"), "session_started": kv("session_started"), "backup_done": kv("backup_done"),
                   "events_connected": kv("events_connected"), "plugins": [os.path.basename(x) for x in c.get("plugins", [])],
-                  "pending": (rows(p["agent"], "SELECT count(*) n FROM commands WHERE status = 'pending'") or [{"n": 0}])[0]["n"],
+                  "pending": (rows(p["agent"], "SELECT count(*) n FROM commands WHERE status IN ('pending','running')") or [{"n": 0}])[0]["n"],
                   "budget": c.get("daily_budget_usd", 5), "spent_today": round(spent[0]["s"], 2) if spent else 0,
                   "heartbeat_age": None},
         "chat": group, "groups": glist,
@@ -296,9 +309,14 @@ def git_action(kind, a):
     if kind == "git_commit":
         if not notes:
             return {"error": "write a short description of the change"}
-        git("add", "-A")  # personal data is excluded by .gitignore; the release scan checks again
+        # only files already in git are committed: a new file (possibly personal: photos, Excel, outbox) never slips in
+        git("add", "-u")
+        new = [l[3:] for l in git("status", "--porcelain").stdout.splitlines() if l.startswith("??")]
         r = git("commit", "-m", notes)
-        return {"ok": r.returncode == 0, "out": (r.stdout + r.stderr)[-400:]}
+        out = (r.stdout + r.stderr)[-400:]
+        if new:
+            out += "\nNew files NOT committed (add them deliberately if they belong in the tool): " + ", ".join(new[:10])
+        return {"ok": r.returncode == 0, "out": out, "untracked": new}
     ver = a.get("version", "")
     if not re.fullmatch(r"\d+\.\d+\.\d+", ver):
         return {"error": "version must look like 1.0.2"}
@@ -347,7 +365,7 @@ def set_model(chat, model, hours=0):
         o["model"], o["until"] = model, until
     else:
         o.setdefault("groups", {})[chat] = {"model": model, "until": until}
-    json.dump(o, open(_model_file(), "w", encoding="utf-8"))
+    dump_json(o, _model_file())
 
 
 # ---------------- search over the whole history (own index, never touches the bridge's databases) ----------------
@@ -614,9 +632,8 @@ def action(a):
         if "error" in res:  # bridge down: write the policy file directly; the bridge reads it on every send
             pol = local_policy()
             pol.update(body)
-            if pol.get("mode") != "auto":
-                pol["mode"], pol["auto_until"] = "draft", ""
-            json.dump(pol, open(p["policy"], "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+            pol["mode"], pol["auto_until"], pol["allow"] = "draft", "", None  # no auto mode, no allow-list
+            dump_json(pol, p["policy"], ensure_ascii=False, indent=2)
             res = pol
         return res
     if kind == "draft":
@@ -669,9 +686,17 @@ def action(a):
     return {"error": "unknown action"}
 
 
+DASH_TOKEN = secrets.token_hex(16)  # per launch; injected into index.html, required on every POST
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
+
+    def host_ok(self):
+        """Only http://127.0.0.1:<port> / localhost:<port> — blocks DNS-rebinding pages from reading or acting."""
+        port = self.server.server_address[1]
+        return self.headers.get("Host", "") in (f"127.0.0.1:{port}", f"localhost:{port}")
 
     def send_bytes(self, b, ctype, code=200):
         self.send_response(code)
@@ -685,6 +710,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(json.dumps(obj, ensure_ascii=False, default=str).encode(), "application/json; charset=utf-8", code)
 
     def do_GET(self):
+        if not self.host_ok():
+            return self.send_bytes(b"forbidden", "text/plain", 403)
         path = self.path.split("?")[0]
         qs = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if path == "/data":
@@ -701,6 +728,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", mimetypes.guess_type(f)[0] or "application/octet-stream")
             self.send_header("Content-Length", str(os.path.getsize(f)))
             self.send_header("Content-Disposition", "inline; filename*=UTF-8''" + urllib.parse.quote(name))
+            self.send_header("Content-Security-Policy", "sandbox")  # Claude-made HTML/SVG cannot run script on our origin
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             with open(f, "rb") as fh:
                 shutil.copyfileobj(fh, self.wfile)
@@ -712,13 +741,19 @@ class Handler(BaseHTTPRequestHandler):
         ctype = mimetypes.guess_type(f)[0] or "application/octet-stream"
         if ctype.startswith("text/") or ctype.endswith("javascript"):
             ctype += "; charset=utf-8"
-        self.send_bytes(open(f, "rb").read(), ctype)
+        body = open(f, "rb").read()
+        if rel == "index.html":
+            body = body.replace(b"</head>", f'<meta name="dash-token" content="{DASH_TOKEN}"></head>'.encode(), 1)
+        self.send_bytes(body, ctype)
 
     def do_POST(self):
         host = self.headers.get("Host", "")
         origin = self.headers.get("Origin")
-        if origin and origin not in (f"http://{host}",):  # same-origin only
-            return self.send_json({"error": "forbidden"}, 403)
+        bad = not self.host_ok() or (origin and origin not in (f"http://{host}",))  # same-origin only
+        if bad or not secrets.compare_digest(self.headers.get("X-Dash-Token", ""), DASH_TOKEN):
+            self.rfile.read(min(int(self.headers.get("Content-Length", 0) or 0), 1 << 20))  # drain, so the reply is not reset
+            self.close_connection = True
+            return self.send_json({"error": "forbidden" if bad else "forbidden (reload the page)"}, 403)
         n = int(self.headers.get("Content-Length", 0))
         if self.path.startswith("/upload"):  # a file pasted / chosen in the chat box -> agent/home/inbox
             name = os.path.basename(urllib.parse.unquote((urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("name") or ["file"])[0])) or "file"

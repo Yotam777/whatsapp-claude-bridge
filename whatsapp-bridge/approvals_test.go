@@ -18,8 +18,7 @@ func TestOneShotApprovalSendsOnce(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "store", "send_policy.json"),
 		[]byte(`{"mode":"draft","owner":["972500000001@s.whatsapp.net"],"control_group":"1203630000@g.us"}`), 0644)
 	who := types.NewJID("972500000009", types.DefaultUserServer)
-	oneShotApproval.Store(who.String(), true)
-	if d, _ := checkPolicy(who); d != "send" {
+	if d, _ := checkPolicyApproved(who, true); d != "send" {
 		t.Fatalf("an approved draft must be sent, got %q", d)
 	}
 	if d, _ := checkPolicy(who); d != "draft" {
@@ -36,9 +35,7 @@ func TestOneShotApprovalDoesNotBeatPause(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "store", "send_policy.json"),
 		[]byte(`{"mode":"draft","paused_until":"2999-01-01T00:00:00Z"}`), 0644)
 	who := types.NewJID("972500000008", types.DefaultUserServer)
-	oneShotApproval.Store(who.String(), true)
-	defer oneShotApproval.Delete(who.String())
-	if d, _ := checkPolicy(who); d != "paused" {
+	if d, _ := checkPolicyApproved(who, true); d != "paused" {
 		t.Fatalf("an approval must not bypass a pause, got %q", d)
 	}
 }

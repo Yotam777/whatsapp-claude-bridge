@@ -230,6 +230,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 }
 
 func sendWhatsAppMessageQuoted(client *whatsmeow.Client, recipient string, message string, mediaPath string, quotedID string) (bool, string) {
+	return sendCore(client, recipient, message, mediaPath, quotedID, false)
+}
+
+// sendCore: approved=true only when sending a draft the owner approved (exactly one message).
+func sendCore(client *whatsmeow.Client, recipient string, message string, mediaPath string, quotedID string, approved bool) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -255,7 +260,7 @@ func sendWhatsAppMessageQuoted(client *whatsmeow.Client, recipient string, messa
 		}
 	}
 
-	switch decision, pol := checkPolicy(recipientJID); decision {
+	switch decision, pol := checkPolicyApproved(recipientJID, approved); decision {
 	case "paused":
 		recordSent(recipientJID, "", message, "", "", false, "paused: "+pol.PauseReason)
 		return false, "Paused: sends to others are suspended (" + pol.PauseReason + ")"
@@ -518,6 +523,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	if err != nil {
 		logger.Warnf("Failed to store message: %v", err)
 	} else {
+		// which message this one replied to (the agent uses it for "מאשר לך שליחה" as a reply on a draft card);
+		// stored before the event goes out so a listener can read it
+		if q := quotedStanza(msg.Message); q != "" {
+			messageStore.db.Exec("UPDATE messages SET quoted_id = ? WHERE id = ? AND chat_jid = ?", q, msg.Info.ID, chatJID)
+		}
 		publishMessage(msg.Info.ID, chatJID, sender, content, mediaType, msg.Info.Timestamp, msg.Info.IsFromMe)
 		if mediaType != "" {
 			autoDownload(client, messageStore, msg.Info.ID, chatJID)
@@ -989,6 +999,8 @@ func main() {
 	}
 	addSyncColumns(messageStore)
 	apiToken = loadToken()
+	ownerToken = loadOwnerToken()
+	registerGates()
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {

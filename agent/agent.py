@@ -105,8 +105,25 @@ def log(*a):
         f.write(line + "\n")
 
 
+_schema_lock = threading.Lock()
+_schema_done = set()  # databases whose schema was created in this process (adb() is called very often, from several threads)
+
+
 def adb():
     db = sqlite3.connect(AGENT_DB, timeout=30)
+    with _schema_lock:
+        if AGENT_DB not in _schema_done:
+            _create_schema(db)
+            _schema_done.add(AGENT_DB)
+    global _runs_migrated
+    if not _runs_migrated:
+        with _schema_lock:
+            if not _runs_migrated:
+                _migrate(db)
+    return db
+
+
+def _create_schema(db):
     db.executescript("""
         CREATE TABLE IF NOT EXISTS handled (id TEXT, chat_jid TEXT, at TIMESTAMP, PRIMARY KEY (id, chat_jid));
         CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
@@ -121,8 +138,11 @@ def adb():
             due TEXT, chat_jid TEXT, ref_ts TEXT, status TEXT DEFAULT 'active', created TEXT, fired TEXT);
         CREATE TABLE IF NOT EXISTS local_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat TEXT, at TEXT, role TEXT, text TEXT, files TEXT);
     """)
+
+
+def _migrate(db):
     global _runs_migrated
-    if not _runs_migrated:  # older databases: record which model each run used (dashboard cost view)
+    if True:  # older databases: record which model each run used (dashboard cost view)
         cols = [r[1] for r in db.execute("PRAGMA table_info(claude_runs)")]
         if "model" not in cols:
             db.execute("ALTER TABLE claude_runs ADD COLUMN model TEXT")
@@ -131,7 +151,7 @@ def adb():
         if "chat" not in cols:  # which conversation (group jid / 'local') a run belongs to; NULL = the primary control group
             db.execute("ALTER TABLE claude_runs ADD COLUMN chat TEXT")
         ccols = [r[1] for r in db.execute("PRAGMA table_info(commands)")]
-        for col, ddl in (("chat_jid", "TEXT"), ("source", "TEXT DEFAULT 'wa'"), ("sync", "INTEGER DEFAULT 0")):
+        for col, ddl in (("chat_jid", "TEXT"), ("source", "TEXT DEFAULT 'wa'"), ("sync", "INTEGER DEFAULT 0"), ("attempts", "INTEGER DEFAULT 0")):
             if col not in ccols:  # commands now carry their conversation, where they came from (wa | pc) and whether PC answers go to WhatsApp
                 db.execute(f"ALTER TABLE commands ADD COLUMN {col} {ddl}")
         prev = {}  # rows written before this fix (cum NULL): turn the cumulative figure into this run's share
@@ -143,7 +163,6 @@ def adb():
             prev[sess] = cum
         db.commit()
         _runs_migrated = True
-    return db
 
 
 _runs_migrated = False
@@ -179,10 +198,33 @@ def token():
         return ""
 
 
-def bridge(path, body=None, timeout=180):
+OWNER_TOKEN_FILE = os.path.join(STORE, "owner_token")
+
+
+def owner_token():
+    """The bridge's owner-only token (draft approval, policy). Claude's tools never use it; falls back to the API token
+    on bridges that don't have it yet."""
+    try:
+        t = open(OWNER_TOKEN_FILE).read().strip()
+        if t:
+            return t
+    except OSError:
+        pass
+    return token()
+
+
+def write_json(path, obj):
+    """Atomic JSON write (temp file + rename): a reader never sees a half-written file."""
+    tmp = f"{path}.tmp{os.getpid()}.{threading.get_ident()}"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def bridge(path, body=None, timeout=180, tok=None):
     """Call the bridge API (token-protected). Errors that carry a JSON body (drafts, refusals) are returned as data."""
     req = urllib.request.Request(CFG["bridge_url"] + path, data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + token()})
+                                 headers={"Content-Type": "application/json", "Authorization": "Bearer " + (tok or token())})
     try:
         return json.loads(urllib.request.urlopen(req, timeout=timeout).read().decode() or "{}")
     except urllib.error.HTTPError as e:
@@ -270,15 +312,22 @@ STOP_FILE = os.path.join(HERE, "stop.request")
 PRIMARY = CFG["claude_group"]
 LOCAL = "local"
 _ctx = threading.local()  # the conversation the command worker is answering right now (chat, src, sync)
+_groups_last = None  # last groups.json that parsed (used if the file is caught mid-write)
 
 
 def load_groups():
     """jid -> {name, purpose, instructions, budget_usd, ...} for every conversation Claude answers in. Re-read on every use,
     so a group connected from the dashboard works without a restart."""
+    global _groups_last
     try:
-        raw = json.load(open(GROUPS_FILE, encoding="utf-8"))
-    except Exception:
+        with open(GROUPS_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+        _groups_last = raw
+    except FileNotFoundError:
         raw = {}
+    except Exception as e:  # half-written / broken file: keep the last good copy instead of dropping the extra groups
+        log("groups.json unreadable, using the last good copy:", e)
+        raw = _groups_last or {}
     g = {PRIMARY: {"name": "4M", "purpose": "4m", **(raw.get(PRIMARY) or {})}}
     for jid, v in raw.items():
         if jid not in g and jid != LOCAL and v.get("enabled", True):
@@ -526,38 +575,97 @@ class Stopped(Exception):
     pass
 
 
-def _run_claude(prompt, model, resume, timeout, on_stage=None, append=None, chat=None):
-    cmd = [shutil.which("claude") or "claude", "-p", prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "auto"]
+def _kill_tree(proc):
+    """Kill Claude and everything it started (MCP servers, shells): a bare kill leaves children holding the pipe open."""
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30)
+        except Exception as e:
+            log("taskkill failed", e)
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+_active_runs = {}  # chat -> start time of the interactive Claude run answering it now (stop button / restart coordination)
+_active_lock = threading.Lock()
+
+
+def stop_target():
+    """Which conversation the dashboard's stop.request is for: (exists, chat or '' for a legacy/empty request)."""
+    try:
+        with open(STOP_FILE, encoding="utf-8") as f:
+            return True, f.read().strip()
+    except OSError:
+        return False, ""
+
+
+def stop_applies(target, chat, active):
+    """A stop request names its conversation; an empty (legacy) request stops the primary group's run, or the only run."""
+    if target:
+        return target == chat
+    return chat == PRIMARY or len(active) <= 1
+
+
+def _run_claude(prompt, model, resume, timeout, on_stage=None, append=None, chat=None, tools=None, max_budget=None, stoppable=None):
+    """One headless Claude Code run; the prompt goes in on stdin (no command-line length limit, no cmd.exe quoting).
+    tools="" = a restricted run: no tools and no MCP servers at all (for classifying other people's text)."""
+    cmd = [shutil.which("claude") or "claude", "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "auto"]
     if model:
         cmd += ["--model", model]
     if append:
         cmd += ["--append-system-prompt", append]
-    if CFG.get("strict_mcp"):
+    if tools is not None:
+        cmd += ["--tools", tools, "--strict-mcp-config"]  # --tools alone still loads MCP connector tools (e.g. Gmail send)
+    elif CFG.get("strict_mcp"):
         cmd += ["--strict-mcp-config"]  # skip the heavy connector tool lists (Gmail, Shopify...) to cut tokens
+    if max_budget:
+        cmd += ["--max-budget-usd", f"{float(max_budget):.2f}"]
     if resume:
         cmd += ["--resume", resume]
+    chat = chat or PRIMARY
+    if stoppable is None:
+        stoppable = on_stage is not None  # only the owner's interactive runs; plugin / hand-off runs never eat a stop request
     t0 = time.time()
-    proc = subprocess.Popen(cmd, cwd=HOME, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8")
-    killer = threading.Timer(timeout, proc.kill)
+    proc = subprocess.Popen(cmd, cwd=HOME, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, encoding="utf-8")
+    try:
+        proc.stdin.write(prompt)
+        proc.stdin.close()
+    except OSError as e:
+        log("claude stdin failed", e)
+    killer = threading.Timer(timeout, _kill_tree, args=(proc,))
     killer.start()
     stopped = threading.Event()
-    try:
-        os.remove(STOP_FILE)  # a stop request left over from before this run must not kill it
-    except OSError:
-        pass
+    if stoppable:
+        with _active_lock:
+            _active_runs[chat] = t0
+        exists, target = stop_target()
+        if exists and stop_applies(target, chat, _active_runs):
+            try:
+                os.remove(STOP_FILE)  # a stop request for this conversation left over from before this run must not kill it
+            except OSError:
+                pass
 
-    def watch_stop():  # the dashboard's "stop" button drops a stop.request file
-        while proc.poll() is None:
-            if os.path.exists(STOP_FILE):
-                try:
-                    os.remove(STOP_FILE)
-                except OSError:
-                    pass
-                stopped.set()
-                proc.kill()
-                return
-            time.sleep(1)
-    threading.Thread(target=watch_stop, daemon=True).start()
+        def watch_stop():  # the dashboard's "stop" button drops a stop.request file naming the conversation
+            while proc.poll() is None:
+                exists, target = stop_target()
+                if exists:
+                    with _active_lock:
+                        active = dict(_active_runs)
+                    if stop_applies(target, chat, active):
+                        try:
+                            os.remove(STOP_FILE)
+                        except OSError:
+                            pass
+                        stopped.set()
+                        _kill_tree(proc)
+                        return
+                time.sleep(1)
+        threading.Thread(target=watch_stop, daemon=True).start()
     res = {}
     try:
         for line in proc.stdout:
@@ -578,6 +686,10 @@ def _run_claude(prompt, model, resume, timeout, on_stage=None, append=None, chat
         proc.wait()
     finally:
         killer.cancel()
+        if stoppable:
+            with _active_lock:
+                if _active_runs.get(chat) == t0:
+                    _active_runs.pop(chat, None)
     if stopped.is_set():
         raise Stopped()
     if not res:
@@ -592,14 +704,16 @@ def _run_claude(prompt, model, resume, timeout, on_stage=None, append=None, chat
         db.execute("INSERT INTO claude_runs (at, session, cost, input_tokens, output_tokens, seconds, ok, model, cum, chat) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                    (dt.datetime.now().isoformat(), res.get("session_id"), cost, usage.get("input_tokens", 0),
                     usage.get("output_tokens", 0), time.time() - t0, 0 if res.get("is_error") else 1, model or CFG.get("claude_model") or "", cum,
-                    chat or PRIMARY))
+                    chat))
     return res
 
 
 def write_handoff(old_sid, chat=None):
     """Before a session is rotated, ask it for a short hand-off so the next session keeps the thread."""
     try:
-        res = _run_claude(T["handoff_prompt"].format(owner=OWNER), None, old_sid, 300, append=group_prompt(chat), chat=chat)
+        # the cheap model: this run re-reads the whole day's context (the CLI default may be the most expensive model)
+        hmodel = CFG.get("light_model") or CFG.get("claude_model") or "sonnet"
+        res = _run_claude(T["handoff_prompt"].format(owner=OWNER), hmodel, old_sid, 300, append=group_prompt(chat), chat=chat)
         if res.get("result"):
             with open(handoff_path(chat), "w", encoding="utf-8") as f:
                 f.write(f"{T['handoff_title']} ({dt.datetime.now():%d.%m.%Y %H:%M})\n\n{res['result'].strip()}\n")
@@ -617,22 +731,47 @@ def is_dev_work(text):
     return any(w.lower() in t for w in DEV_WORDS)
 
 
-def claude(prompt, model=None, session=True, timeout=900, on_stage=None, chat=None):
+def raw_text(text):
+    """The owner's own words: without the attachment line(s) the agent adds and the voice-note marker."""
+    lines = [l for l in (text or "").splitlines() if not l.strip().startswith(T["attached"].split("{")[0].strip())]
+    return "\n".join(lines).replace(T["voice"], "").strip()
+
+
+def session_rotates(chat, raw=""):
+    """True when the conversation's current session ends before the next run (midnight, or the message cap for business work)."""
+    g = load_groups().get(chat or PRIMARY) or {}
+    sid, started = kv_get(K("session_id", chat)), kv_get(K("session_started", chat))
+    if not sid:
+        return False
+    if started and dt.datetime.fromisoformat(started).date() != dt.date.today():
+        return True
+    uncapped = g.get("purpose") == "dev" or is_dev_work(raw)  # no message cap while working on the bridge/agent code
+    return not uncapped and int(kv_get(K("session_runs", chat)) or 0) >= int(CFG.get("session_max_runs", 60))
+
+
+def session_active(chat, raw=""):
+    """True when the next run resumes an existing session (so switching models would throw away its prompt cache)."""
+    return bool(kv_get(K("session_id", chat or PRIMARY))) and not session_rotates(chat or PRIMARY, raw) and not CFG.get("fresh_sessions")
+
+
+def claude(prompt, model=None, session=True, timeout=900, on_stage=None, chat=None, raw=None, tools=None, max_budget=None,
+           budget_check=False):
     """Run Claude Code headless in HOME. Each conversation (group / local chat) has its own session, resumed until it is
-    rotated (daily, with hand-off; and after session_max_runs for business conversations)."""
+    rotated (daily, with hand-off; and after session_max_runs for business conversations).
+    raw = the owner's own text (decides "dev work" — not the wrapped prompt). tools="" = restricted run (no tools, no MCP).
+    budget_check = refuse when this conversation's cap or the total daily cap is used up (plugin / background runs)."""
     chat = chat or PRIMARY
-    g = load_groups().get(chat) or {}
+    if budget_check:
+        why = over_budget(chat)
+        if why:
+            log(f"claude skipped ({why}) for", chat)
+            return None
     sid = kv_get(K("session_id", chat)) if session else None
-    started = kv_get(K("session_started", chat))
-    uncapped = g.get("purpose") == "dev" or is_dev_work(prompt)  # no message cap while working on the bridge/agent code
-    if sid and started and dt.datetime.fromisoformat(started).date() != dt.date.today():  # rotate at midnight
-        write_handoff(sid, chat)
-        sid = None
-    elif sid and not uncapped and int(kv_get(K("session_runs", chat)) or 0) >= int(CFG.get("session_max_runs", 60)):
+    if sid and session_rotates(chat, prompt if raw is None else raw):
         write_handoff(sid, chat)
         sid = None
     try:
-        res = _run_claude(prompt, model, sid, timeout, on_stage, append=group_prompt(chat), chat=chat)
+        res = _run_claude(prompt, model, sid, timeout, on_stage, append=group_prompt(chat), chat=chat, tools=tools, max_budget=max_budget)
     except Stopped:
         return "⛔ עצרתי את העבודה לבקשתך."
     except Exception as e:
@@ -642,8 +781,11 @@ def claude(prompt, model=None, session=True, timeout=900, on_stage=None, chat=No
         if res["session_id"] != kv_get(K("session_id", chat)):
             kv_set(K("session_started", chat), dt.datetime.now().isoformat())
             kv_set(K("session_runs", chat), "0")
+            kv_set(K("session_model", chat), "")  # a new session: no model yet
         kv_set(K("session_id", chat), res["session_id"])
         kv_set(K("session_runs", chat), str(int(kv_get(K("session_runs", chat)) or 0) + 1))
+        if model and getattr(_ctx, "auto_pick", False):
+            kv_set(K("session_model", chat), model)  # automatic routing stays on this model for the rest of the session
     return res.get("result")
 
 
@@ -655,6 +797,30 @@ def spent_today(chat=None):
         args += [chat, chat, PRIMARY]
     with adb() as db:
         return db.execute(q, args).fetchone()[0]
+
+
+def total_budget():
+    """Daily cap over all conversations together (each one also has its own cap)."""
+    v = CFG.get("total_daily_budget_usd")
+    return float(v) if v else 2 * float(CFG.get("daily_budget_usd", 5))
+
+
+def cap_lifted(chat, text=""):
+    """`!` on this message, or `!!!` earlier in this conversation (an hour without a cap)."""
+    return (text or "").lstrip().startswith("!") or (kv_get(K("override_until", chat)) or "") > dt.datetime.now().isoformat(timespec="seconds")
+
+
+def over_budget(chat, text=""):
+    """None when a run may go ahead; otherwise which cap stops it: ('chat'|'total', spent, cap)."""
+    if cap_lifted(chat, text):
+        return None
+    spent, cap = spent_today(chat), budget_for(chat)
+    if spent >= cap:
+        return ("chat", spent, cap)
+    tot, tcap = spent_today(), total_budget()
+    if tot >= tcap:
+        return ("total", tot, tcap)
+    return None
 
 
 # The owner's questions are stored before they are answered and closed only after the reply went out,
@@ -723,7 +889,7 @@ def set_override(model, hours=None, chat=None):
         o["model"], o["until"] = model, until
     else:
         o.setdefault("groups", {})[chat] = {"model": model, "until": until}
-    json.dump(o, open(MODEL_FILE, "w", encoding="utf-8"))
+    write_json(MODEL_FILE, o)
 
 
 def models_guide(chat=None):
@@ -753,23 +919,40 @@ def recommend(text, used, failed):
     return want, why
 
 
-def pick_model(text, chat=None):
-    """Cost routing: Haiku for short lookups/updates, Sonnet for anything heavier (config: light_model / claude_model)."""
+DEEP_WORDS = ("נתח לעומק", "ניתוח מעמיק", "תכנן", "תכנון", "ארכיטקטורה", "החלטה", "תחליט", "השווה בין", "בדוק לעומק")
+
+
+def pick_model_info(text, chat=None):
+    """(model, how): how = 'forced' (/מודל or dashboard), 'bang' (!!), 'auto', or 'sticky_deep' (deep words in a running
+    session: the session keeps its model so its prompt cache stays valid — the answer suggests !! instead).
+    Automatic routing in a running session never switches models mid-session except one step up (light → strong)."""
     forced = get_override(chat)
     if forced:
-        return forced
+        return forced, "forced"
     s = text.lstrip()
     if s.startswith("!!") and not s.startswith("!!!"):  # "!!" = this one message on the strongest model (owner request 07.11)
-        return CFG.get("deep_model") or "opus"
+        return CFG.get("deep_model") or "opus", "bang"
     t = text.lstrip("!").strip()
-    deep_words = ("נתח לעומק", "ניתוח מעמיק", "תכנן", "תכנון", "ארכיטקטורה", "החלטה", "תחליט", "השווה בין", "בדוק לעומק")
-    if CFG.get("deep_model") and any(w in t for w in deep_words):
-        return CFG["deep_model"]
     heavy_words = ("תמלל", "סכם", "סיכום", "נתח", "ניתוח", "דוח", "דו\"ח", "אקסל", "קובץ", "תקן", "קוד", "סקריפט", "הגדרות",
                    "שלח ל", "טיוטה", "מייל", "הצעת", "השווה", "תכנן", "למה", "בדוק לעומק", "ערוך", "תוסיף", "תשנה", "תעדכן את הקוד")
     heavy = len(t) > 140 or T["attached"].split("{")[0] in text or any(w in t for w in heavy_words)
     light, strong = CFG.get("light_model") or "haiku", CFG.get("claude_model") or "sonnet"
-    return strong if heavy else light
+    base = strong if heavy else light
+    deep = CFG.get("deep_model") if CFG.get("deep_model") and any(w in t for w in DEEP_WORDS) else None
+    sm = kv_get(K("session_model", chat)) if session_active(chat, raw_text(text)) else None
+    if not sm:  # a new session may start on any model
+        return (deep or base), "auto"
+    if deep and sm != deep:
+        return (strong if sm == light and heavy else sm), "sticky_deep"
+    if sm == light and base == strong:
+        return strong, "auto"  # one step up is allowed (then sticky)
+    return sm, "auto"
+
+
+def pick_model(text, chat=None):
+    """Cost routing: light model for short lookups/updates, the normal model for anything heavier (config: light_model /
+    claude_model), deep_model for planning words at the start of a session; see pick_model_info."""
+    return pick_model_info(text, chat)[0]
 
 
 class StatusMsg:
@@ -892,87 +1075,183 @@ def came_back_from_pc(chat, cid):
     return bool(prev) and prev[0] == "pc" and not prev[1]
 
 
-def command_worker():
-    while True:
-        with adb() as db:
-            row = db.execute("SELECT id, msg_id, text, at, chat_jid, source, sync FROM commands WHERE status = 'pending' ORDER BY id LIMIT 1").fetchone()
-        if not row:
-            _command_signal.wait(3)  # short: the dashboard (a separate process) queues PC messages straight into the table
-            _command_signal.clear()
-            continue
-        cid, mid, text, when, chat, src, sync = row
-        chat, src, sync = chat or PRIMARY, src or "wa", sync or 0
-        _ctx.chat, _ctx.src, _ctx.sync = chat, src, sync
-        g = load_groups().get(chat) or {}
+INTERRUPTED_HE = "⚠️ הפקודה נקטעה בהפעלה מחדש — שלח שוב אם צריך"
+INTERRUPTED_EN = "⚠️ This command was cut off by a restart — send it again if needed"
+
+
+def mark_interrupted():
+    """At start-up (before the dispatcher starts): commands that were running when the agent stopped are NOT run again
+    (that could double drafts, edits and cost). Returns them; notify_interrupted tells the owner."""
+    with adb() as db:
+        rows = db.execute("SELECT id, msg_id, chat_jid, source, sync FROM commands WHERE status = 'running'").fetchall()
+        db.execute("UPDATE commands SET status = 'interrupted', answered = ? WHERE status = 'running'", (dt.datetime.now().isoformat(),))
+    return rows
+
+
+def notify_interrupted(rows):
+    """Tell the owner, in each conversation, that a command was cut off (waits for the bridge; runs in its own thread)."""
+    if rows and not pc_rows_only(rows):
+        wait_bridge(300)
+    for cid, mid, chat, src, sync in rows:
+        _ctx.chat, _ctx.src, _ctx.sync = chat or PRIMARY, src or "wa", sync or 0
         try:
-            local = owner_command(text, chat)
-            if local is not None:
-                reply(local, quoted=mid if src == "wa" else None)
-                react(mid, "✅")
-                with adb() as db:
-                    db.execute("UPDATE commands SET status = 'done', answered = ? WHERE id = ?", (dt.datetime.now().isoformat(), cid))
-                if RESTART_REQ.is_set():
-                    restart_now("/הפעל מחדש")
-                continue
-            budget = budget_for(chat)
-            spent = spent_today(chat)
-            if text.lstrip().startswith("!!!"):  # lift the cap for an hour
-                until = dt.datetime.now() + dt.timedelta(hours=1)
-                kv_set(K("override_until", chat), until.isoformat(timespec="seconds"))
-                reply(T["override_hour"].format(until=until.strftime("%H:%M")))
-            override = text.lstrip().startswith("!") or (kv_get(K("override_until", chat)) or "") > dt.datetime.now().isoformat(timespec="seconds")
-            if spent >= budget and not override:
-                reply(T["budget_stop"].format(spent=spent, budget=budget))
-            else:
-                if spent >= budget * 0.8 and kv_get(K("budget_warned", chat)) != dt.date.today().isoformat():
-                    kv_set(K("budget_warned", chat), dt.date.today().isoformat())
-                    reply(T["budget_warn"].format(spent=spent, budget=budget))
-                gname = g.get("name") or ""
-                if chat == PRIMARY and src == "wa":
-                    where, dest = ("בקבוצת הבקרה בווצאפ", "לקבוצה") if LANG == "he" else ("in the WhatsApp control group", "to the group")
-                elif pc_only():
-                    where, dest = (f'מהמחשב (לוח הבקרה, "{gname}")', "לחלון השיחה בלוח הבקרה") if LANG == "he" else (f'from the PC (dashboard, "{gname}")', "to the dashboard chat")
-                elif src == "pc":
-                    where, dest = (f'מהמחשב (לוח הבקרה) לקבוצה "{gname}"', "גם לקבוצה בווצאפ") if LANG == "he" else (f'from the PC (dashboard) for group "{gname}"', "to the WhatsApp group too")
-                else:
-                    where, dest = (f'בקבוצה "{gname}" בווצאפ', "לקבוצה") if LANG == "he" else (f'in the WhatsApp group "{gname}"', "to the group")
-                prompt = T["prompt"].format(owner=OWNER, when=when, text=text.lstrip("!").strip(), where=where, dest=dest)
-                if src == "wa" and came_back_from_pc(chat, cid):
-                    prompt = (T_BACK_HE if LANG == "he" else T_BACK_EN) + prompt
-                model = pick_model(text, chat)
-                started = time.time()
-                status = StatusMsg(model, chat, wa=not pc_only())
-                try:
-                    answer = claude(prompt, model=model, session=not CFG.get("fresh_sessions"), on_stage=status.set_stage, chat=chat)
-                finally:
-                    status.finish()
-                stopped = (answer or "").startswith("⛔ עצרתי")
-                streak = 0 if answer else int(kv_get(K("fail_streak", chat)) or 0) + 1
-                kv_set(K("fail_streak", chat), str(streak))
-                kv_set(K("last_model", chat), model)
-                rec = None if stopped else recommend(text, model, streak)
-                kv_set(K("last_recommend", chat), json.dumps({"model": rec[0], "why": rec[1], "at": dt.datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False) if rec else "")
-                out = answer or T["failed"]
-                if rec:
-                    out += f"\n\n💡 כדאי לעבור ל-{MODELS[rec[0]]['he']} ({rec[1]}). פקודה: {MODELS[rec[0]]['cmd']}"
-                reply(out, quoted=mid if (CFG.get("quote_replies", True) and src == "wa") else None)
-                send_outbox(started)
-                react(mid, "✅")
-        except Exception:
-            log("command error", traceback.format_exc())
+            reply(INTERRUPTED_HE if LANG == "he" else INTERRUPTED_EN, quoted=mid if (src or "wa") == "wa" else None)
+        except Exception as e:
+            log("interrupted notice failed", cid, e)
         finally:
             _ctx.chat = None
+
+
+def pc_rows_only(rows):
+    return all((src or "wa") == "pc" and not sync or (chat == LOCAL) for _, _, chat, src, sync in rows)
+
+
+def claim_next(chat):
+    """The next pending command of one conversation, atomically marked running (attempts + 1), or None."""
+    with adb() as db:
+        row = db.execute("SELECT id, msg_id, text, at, chat_jid, source, sync FROM commands WHERE status = 'pending' "
+                         "AND coalesce(chat_jid, ?) = ? ORDER BY id LIMIT 1", (PRIMARY, chat)).fetchone()
+        if not row:
+            return None
+        n = db.execute("UPDATE commands SET status = 'running', attempts = coalesce(attempts, 0) + 1 WHERE id = ? AND status = 'pending'",
+                       (row[0],)).rowcount
+    return row if n == 1 else claim_next(chat)
+
+
+def run_command(row):
+    """Answer one owner command (in the calling thread; _ctx = its conversation)."""
+    cid, mid, text, when, chat, src, sync = row
+    chat, src, sync = chat or PRIMARY, src or "wa", sync or 0
+    _ctx.chat, _ctx.src, _ctx.sync, _ctx.auto_pick = chat, src, sync, False
+    g = load_groups().get(chat) or {}
+    try:
+        local = owner_command(text, chat)
+        if local is not None:
+            reply(local, quoted=mid if src == "wa" else None)
+            react(mid, "✅")
+            return
+        if text.lstrip().startswith("!!!"):  # lift the cap for an hour
+            until = dt.datetime.now() + dt.timedelta(hours=1)
+            kv_set(K("override_until", chat), until.isoformat(timespec="seconds"))
+            reply(T["override_hour"].format(until=until.strftime("%H:%M")))
+        stop = over_budget(chat, text)
+        if stop:
+            kind, spent, cap = stop
+            msg = T["budget_stop"].format(spent=spent, budget=cap)
+            if kind == "total":
+                msg = ("(תקרה כוללת לכל השיחות) " if LANG == "he" else "(total cap, all conversations) ") + msg
+            reply(msg)
+            return
+        budget, spent = budget_for(chat), spent_today(chat)
+        if spent >= budget * 0.8 and kv_get(K("budget_warned", chat)) != dt.date.today().isoformat():
+            kv_set(K("budget_warned", chat), dt.date.today().isoformat())
+            reply(T["budget_warn"].format(spent=spent, budget=budget))
+        gname = g.get("name") or ""
+        if chat == PRIMARY and src == "wa":
+            where, dest = ("בקבוצת הבקרה בווצאפ", "לקבוצה") if LANG == "he" else ("in the WhatsApp control group", "to the group")
+        elif pc_only():
+            where, dest = (f'מהמחשב (לוח הבקרה, "{gname}")', "לחלון השיחה בלוח הבקרה") if LANG == "he" else (f'from the PC (dashboard, "{gname}")', "to the dashboard chat")
+        elif src == "pc":
+            where, dest = (f'מהמחשב (לוח הבקרה) לקבוצה "{gname}"', "גם לקבוצה בווצאפ") if LANG == "he" else (f'from the PC (dashboard) for group "{gname}"', "to the WhatsApp group too")
+        else:
+            where, dest = (f'בקבוצה "{gname}" בווצאפ', "לקבוצה") if LANG == "he" else (f'in the WhatsApp group "{gname}"', "to the group")
+        prompt = T["prompt"].format(owner=OWNER, when=when, text=text.lstrip("!").strip(), where=where, dest=dest)
+        if src == "wa" and came_back_from_pc(chat, cid):
+            prompt = (T_BACK_HE if LANG == "he" else T_BACK_EN) + prompt
+        model, how = pick_model_info(text, chat)
+        _ctx.auto_pick = how == "auto"
+        started = time.time()
+        status = StatusMsg(model, chat, wa=not pc_only())
+        try:
+            answer = claude(prompt, model=model, session=not CFG.get("fresh_sessions"), on_stage=status.set_stage, chat=chat,
+                            raw=raw_text(text.lstrip("!")))
+        finally:
+            status.finish()
+        stopped = (answer or "").startswith("⛔ עצרתי")
+        streak = 0 if answer else int(kv_get(K("fail_streak", chat)) or 0) + 1
+        kv_set(K("fail_streak", chat), str(streak))
+        kv_set(K("last_model", chat), model)
+        rec = None if stopped else recommend(text, model, streak)
+        kv_set(K("last_recommend", chat), json.dumps({"model": rec[0], "why": rec[1], "at": dt.datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False) if rec else "")
+        out = answer or T["failed"]
+        if rec:
+            out += f"\n\n💡 כדאי לעבור ל-{MODELS[rec[0]]['he']} ({rec[1]}). פקודה: {MODELS[rec[0]]['cmd']}"
+        elif how == "sticky_deep" and not stopped:
+            out += ("\n\n💡 לניתוח לעומק: התחל את ההודעה ב-!! (המודל החזק להודעה אחת; הסשן נשאר על המודל הנוכחי כדי לא לשלם שוב על כל ההקשר)."
+                    if LANG == "he" else "\n\n💡 For deep analysis start the message with !! (strongest model for one message).")
+        reply(out, quoted=mid if (CFG.get("quote_replies", True) and src == "wa") else None)
+        send_outbox(started)
+        react(mid, "✅")
+    except Exception:
+        log("command error", traceback.format_exc())
+    finally:
+        _ctx.chat, _ctx.auto_pick = None, False
         with adb() as db:
             db.execute("UPDATE commands SET status = 'done', answered = ? WHERE id = ?", (dt.datetime.now().isoformat(), cid))
-        if RESTART_REQ.is_set():
-            restart_now("/הפעל מחדש")
-        if os.path.exists(RESTART_FILE):
-            try:
-                reason = open(RESTART_FILE, encoding="utf-8").read().strip()[:200]
-                os.remove(RESTART_FILE)
-            except OSError:
-                reason = ""
-            restart_now(reason or "בקשת Claude")
+
+
+_workers = set()  # conversations that have a worker thread right now
+_workers_lock = threading.Lock()
+
+
+def restart_wanted():
+    """A restart was asked for (/הפעל מחדש or restart.request): returns the reason, or None."""
+    if RESTART_REQ.is_set():
+        return "/הפעל מחדש"
+    if os.path.exists(RESTART_FILE):
+        try:
+            reason = open(RESTART_FILE, encoding="utf-8").read().strip()[:200]
+        except OSError:
+            reason = ""
+        return reason or "בקשת Claude"
+    return None
+
+
+def conversation_worker(chat):
+    """Answers one conversation's commands in order; other conversations run in parallel in their own workers."""
+    try:
+        while not restart_wanted():
+            row = claim_next(chat)
+            if not row:
+                break
+            run_command(row)
+    except Exception:
+        log("conversation worker error", chat, traceback.format_exc())
+    finally:
+        with _workers_lock:
+            _workers.discard(chat)
+        _command_signal.set()
+
+
+def command_worker():
+    """Dispatcher: one worker thread per conversation with pending commands (serial within a conversation, parallel
+    across conversations). A requested restart waits until every running answer has been sent."""
+    while True:
+        try:
+            reason = restart_wanted()
+            with _workers_lock:
+                busy = bool(_workers)
+            if reason:
+                if not busy:
+                    if os.path.exists(RESTART_FILE):
+                        try:
+                            os.remove(RESTART_FILE)
+                        except OSError:
+                            pass
+                    restart_now(reason)
+            else:
+                with adb() as db:
+                    chats = [r[0] for r in db.execute("SELECT DISTINCT coalesce(chat_jid, ?) FROM commands WHERE status = 'pending'", (PRIMARY,))]
+                for chat in chats:
+                    with _workers_lock:
+                        if chat in _workers:
+                            continue
+                        _workers.add(chat)
+                    threading.Thread(target=conversation_worker, args=(chat,), daemon=True, name=f"conv:{chat}").start()
+        except Exception:
+            log("dispatcher error", traceback.format_exc())
+        _command_signal.wait(3)  # short: the dashboard (a separate process) queues PC messages straight into the table
+        _command_signal.clear()
 
 
 # ---------- backup ----------
@@ -1026,7 +1305,7 @@ def update_check():
         return
     if "error" in res:
         return
-    json.dump(res, open(os.path.join(HERE, "update_check.json"), "w", encoding="utf-8"), ensure_ascii=False)
+    write_json(os.path.join(HERE, "update_check.json"), res)
     if res.get("available") and kv_get("update_notified") != res["latest"]:
         kv_set("update_notified", res["latest"])
         reply(T["update"].format(latest=res["latest"], current=res["current"], notes=(res.get("notes") or "")[:800]))
@@ -1084,16 +1363,87 @@ def load_plugins():
 
 # ---------- message intake ----------
 
-work = queue.Queue()  # slow jobs (transcription, plugin work) so intake never blocks
+work = queue.Queue()  # the owner's intake (voice / files) and reminders: must never wait behind slow jobs
+slow = queue.Queue()  # slow jobs: backup, update / group checks, plugin jobs, other people's voice notes
 
 
-def worker():
+def worker(q=None):
+    q = q or work
     while True:
-        job = work.get()
+        job = q.get()
         try:
             job()
         except Exception:
             log("job error", traceback.format_exc())
+
+
+def slow_worker():
+    worker(slow)
+
+
+def intake_failed(chat, mid, reason):
+    """Tell the owner (in that conversation) that a message of theirs could not be taken in, instead of losing it silently."""
+    log("intake failed", chat, mid, reason)
+    _ctx.chat, _ctx.src, _ctx.sync = chat, "wa", 0
+    try:
+        reply(("⚠️ לא הצלחתי לקלוט את ההודעה: " if LANG == "he" else "⚠️ I couldn't take in that message: ") + str(reason)[:200], quoted=mid)
+    except Exception as e:
+        log("intake failure notice failed", e)
+    finally:
+        _ctx.chat = None
+
+
+APPROVE_PHRASE = "מאשר לך שליחה"
+
+
+def select_draft(pending, quoted=None):
+    """Which draft a text approval is for. pending = [(draft id, card message id)], quoted = the message the owner replied to.
+    Returns (draft id or None, reason): a reply on a card approves that card; without a reply only a single pending draft."""
+    if quoted:
+        for did, card in pending:
+            if card and card == quoted:
+                return did, "quoted"
+        return None, "not_a_card"
+    if len(pending) == 1:
+        return pending[0][0], "only"
+    return None, ("none" if not pending else "several")
+
+
+def quoted_id_of(chat, mid):
+    """The message the owner's message replied to, if the bridge records it (messages.quoted_id); None otherwise."""
+    try:
+        with mdb() as db:
+            if "quoted_id" not in [r[1] for r in db.execute("PRAGMA table_info(messages)")]:
+                return None
+            r = db.execute("SELECT quoted_id FROM messages WHERE id = ? AND chat_jid = ?", (mid, chat)).fetchone()
+        return (r[0] or None) if r else None
+    except Exception as e:
+        log("quoted id lookup failed", e)
+        return None
+
+
+def approve_by_text(chat, mid, content):
+    """The owner wrote "מאשר לך שליחה" in a control group: approve exactly one pending draft (one approval = one message)
+    through the bridge with the owner-only token. No Claude run. Returns the rest of the message (to answer as a command)."""
+    with mdb() as db:
+        pending = db.execute("SELECT id, coalesce(card_id, '') FROM drafts WHERE status = 'pending' ORDER BY id").fetchall()
+    did, why = select_draft(pending, quoted_id_of(chat, mid))
+    _ctx.chat, _ctx.src, _ctx.sync = chat, "wa", 0
+    try:
+        if did is None:
+            reply({"none": "אין טיוטה ממתינה לאישור.",
+                   "several": f"יש {len(pending)} טיוטות ממתינות — הגב \"{APPROVE_PHRASE}\" בציטוט על הכרטיס הנכון, או ✅ עליו.",
+                   "not_a_card": "ההודעה שציטטת אינה כרטיס טיוטה ממתין — לא נשלח כלום."}[why], quoted=mid)
+        else:
+            res = bridge("/draft_decide", {"id": int(did), "approve": True}, timeout=30, tok=owner_token())
+            if res.get("success") is False:
+                reply(f"⚠️ האישור לטיוטה #{did} נכשל: {res.get('error') or res.get('message') or 'שגיאה'}", quoted=mid)
+            else:
+                react(mid, "✅")  # the bridge itself posts "✅ נשלח ל…" (or the failure) when the send is done
+        log("text approval", chat, mid, why, did)
+    finally:
+        _ctx.chat = None
+    return content.replace(APPROVE_PHRASE, "").strip(" \n.,!-")
 
 
 def handle(row):
@@ -1102,23 +1452,47 @@ def handle(row):
     if cj != LOCAL and cj in load_groups() and me:  # the owner's own message in a connected group (others' messages stay plain information)
         if content.startswith(CFG["reply_prefix"].strip()):
             return  # our own reply
-        kv_set(K("last_owner_msg", cj), json.dumps({"ts": ts[:19], "text": content[:300] or f"[{mtype}]"}, ensure_ascii=False))
+        try:
+            kv_set(K("last_owner_msg", cj), json.dumps({"ts": ts[:19], "text": content[:300] or f"[{mtype}]"}, ensure_ascii=False))
+        except Exception as e:
+            log("last_owner_msg failed", e)
+        if APPROVE_PHRASE in content and mtype != "audio":
+            try:
+                content = approve_by_text(cj, mid, content)
+            except Exception as e:
+                intake_failed(cj, mid, f"האישור נכשל ({e})")
+                return
+            if len(content) < 4:
+                return
         if mtype == "audio" and voice_enabled():
             def voice_cmd():
-                text = transcript_of(cj, mid, sender, ts)
-                if text:
+                try:
+                    text = transcript_of(cj, mid, sender, ts)
+                except Exception as e:
+                    return intake_failed(cj, mid, f"התמלול נכשל ({e})")
+                if not text:
+                    return intake_failed(cj, mid, "התמלול ריק או שההקלטה לא ירדה")
+                try:
                     enqueue_command(mid, f"{T['voice']} {text}", ts[:16], cj)
+                except Exception as e:
+                    intake_failed(cj, mid, e)
             work.put(voice_cmd)
         elif mtype in ("image", "document", "video"):
             def file_cmd():
-                p = media_path(cj, mid)
-                enqueue_command(mid, (content + "\n" if content else "") + T["attached"].format(path=p or T["download_failed"]), ts[:16], cj)
+                try:
+                    p = media_path(cj, mid)
+                    enqueue_command(mid, (content + "\n" if content else "") + T["attached"].format(path=p or T["download_failed"]), ts[:16], cj)
+                except Exception as e:
+                    intake_failed(cj, mid, e)
             work.put(file_cmd)
         elif content:
-            enqueue_command(mid, content, ts[:16], cj)
+            try:
+                enqueue_command(mid, content, ts[:16], cj)
+            except Exception as e:
+                intake_failed(cj, mid, e)
         return
     if mtype == "audio" and CFG.get("transcribe_all_chats") and voice_enabled():
-        work.put(lambda: transcript_of(cj, mid, sender, ts))
+        slow.put(lambda: transcript_of(cj, mid, sender, ts))
     for hook in _hooks:
         try:
             hook(row)
@@ -1153,7 +1527,12 @@ def sweep_once(cursor, on_row=None):
         with adb() as db:  # mark first: a crash must never make us act on the same message twice
             fresh = db.execute("INSERT OR IGNORE INTO handled VALUES (?, ?, ?)", (r[1], r[2], dt.datetime.now().isoformat())).rowcount
         if fresh:
-            (on_row or handle)(r[1:])
+            try:
+                (on_row or handle)(r[1:])
+            except Exception as e:  # never lose an owner message silently (it is already marked handled)
+                log("handle error", traceback.format_exc())
+                if r[6] and r[2] != LOCAL and r[2] in load_groups():
+                    intake_failed(r[2], r[1], e)
         cursor = r[0]
     if rows:
         kv_set("cursor_rowid", cursor)
@@ -1263,7 +1642,7 @@ def scheduler():
             for at, key, fn in [(CFG["backup_time"], "backup", backup), (CFG.get("update_check_time", "09:00"), "update_check", update_check), (CFG.get("group_check_time", "10:00"), "group_check", group_check)] + _daily:
                 if now.strftime("%H:%M") >= at and kv_get(f"day:{key}") != today:
                     kv_set(f"day:{key}", today)
-                    work.put(fn)
+                    slow.put(fn)  # backup / checks / plugin reports never delay the owner's voice notes or reminders
             if kv_get("at:reminders") != now.strftime("%Y%m%d%H%M"):
                 kv_set("at:reminders", now.strftime("%Y%m%d%H%M"))
                 work.put(reminders_check)
@@ -1271,7 +1650,7 @@ def scheduler():
                 last = kv_get(f"at:{key}")
                 if not last or now - dt.datetime.fromisoformat(last) > dt.timedelta(minutes=minutes):
                     kv_set(f"at:{key}", now.isoformat())
-                    work.put(fn)
+                    slow.put(fn)  # plugin jobs (e.g. extracting requests with Claude) run off the owner's fast queue
         except Exception:
             log("scheduler error", traceback.format_exc())
         time.sleep(30)
@@ -1289,7 +1668,14 @@ if __name__ == "__main__":
     if os.path.exists(RESTART_FILE):  # a request left over from before this start is already fulfilled
         os.remove(RESTART_FILE)
     threading.Thread(target=report_restart, daemon=True).start()
-    for target in [worker, command_worker, scheduler, event_listener, watchdog] + _threads:
+    try:
+        cut = mark_interrupted()  # synchronous, before the dispatcher can mark anything 'running'
+        if cut:
+            log(f"{len(cut)} command(s) were cut off by the restart: owner told, not re-run")
+            threading.Thread(target=notify_interrupted, args=(cut,), daemon=True).start()
+    except Exception:
+        log("mark_interrupted failed", traceback.format_exc())
+    for target in [worker, slow_worker, command_worker, scheduler, event_listener, watchdog] + _threads:
         threading.Thread(target=target, daemon=True).start()
     sys.path.insert(0, ROOT)
     from dash import server as dash_server  # control panel, also on http://127.0.0.1:8770

@@ -1,6 +1,7 @@
 // Dashboard front-end: renders /data, sends actions to /action. Hebrew (default) and English.
 const $ = id => document.getElementById(id);
-const post = a => fetch("/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(a) }).then(r => r.json());
+const DASH_TOKEN = (document.querySelector('meta[name="dash-token"]') || {}).content || "";
+const post = a => fetch("/action", { method: "POST", headers: { "Content-Type": "application/json", "X-Dash-Token": DASH_TOKEN }, body: JSON.stringify(a) }).then(r => r.json());
 let curChat = ""; try { curChat = localStorage.getItem("wa-dash-chat") || ""; } catch (e) {}
 let syncMap = {}; try { syncMap = JSON.parse(localStorage.getItem("wa-dash-sync") || "{}"); } catch (e) {}
 const PURPOSE = { dev: "פיתוח הגשר והכלי", general: "כללית", "4m": "עבודת 4M", local: "מקומית (בלי ווצאפ)" };
@@ -40,7 +41,7 @@ function ago(s) {
 function toast(t) { const el = $("toast"); el.textContent = t; el.classList.add("show"); clearTimeout(el._t); el._t = setTimeout(() => el.classList.remove("show"), 2600); }
 async function act(a, msg) {
   try {
-    const j = await (await fetch("/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(a) })).json();
+    const j = await (await fetch("/action", { method: "POST", headers: { "Content-Type": "application/json", "X-Dash-Token": DASH_TOKEN }, body: JSON.stringify(a) })).json();
     if (j.error) toast(L("שגיאה: ", "Error: ") + j.error); else if (msg) toast(msg);
     load(); return j;
   } catch (e) { toast(L("הפעולה נכשלה", "Action failed")); }
@@ -144,7 +145,7 @@ function drawAttach() {
 }
 async function upload(file) {
   try {
-    const j = await (await fetch("/upload?name=" + encodeURIComponent(file.name || "image.png"), { method: "POST", body: file })).json();
+    const j = await (await fetch("/upload?name=" + encodeURIComponent(file.name || "image.png"), { method: "POST", headers: { "X-Dash-Token": DASH_TOKEN }, body: file })).json();
     if (j.ok) attached.push(j); else toast(L("העלאה נכשלה: ", "Upload failed: ") + (j.error || ""));
   } catch (e) { toast(L("העלאה נכשלה", "Upload failed")); }
   drawAttach();

@@ -39,7 +39,9 @@ def step(n, he, en):
 
 
 def api(path, body=None):
-    tok = open(os.path.join(STORE, "api_token")).read().strip()
+    # the owner token (created by bridges >= 1.0.8) is needed to set the send policy; older bridges only have api_token
+    p = os.path.join(STORE, "owner_token")
+    tok = open(p if os.path.exists(p) else os.path.join(STORE, "api_token")).read().strip()
     req = urllib.request.Request("http://127.0.0.1:8765/api" + path, data=json.dumps(body).encode() if body is not None else None,
                                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + tok})
     return json.loads(urllib.request.urlopen(req, timeout=15).read().decode())

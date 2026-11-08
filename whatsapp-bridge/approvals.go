@@ -7,16 +7,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
-
-// oneShotApproval holds recipients (JID strings) allowed exactly one direct send; checkPolicy consumes the entry.
-var oneShotApproval sync.Map
 
 // handleReaction returns true if the event was a reaction (handled or not).
 func handleReaction(client *whatsmeow.Client, msg *events.Message) bool {
@@ -68,16 +64,20 @@ func decideDraft(client *whatsmeow.Client, id int64, approve bool, control strin
 	go func() {
 		var ok bool
 		var detail string
-		if kind != "" {
+		switch kind {
+		case "":
+			ok, detail = sendCore(client, recipient, message, media, quoted, true)
+		case "api":
+			ok, detail = sendApprovedAPI(client, payload)
+		default:
 			ok, detail = sendApprovedSpecial(client, recipient, kind, payload)
-		} else {
-			oneShotApproval.Store(recipient, true)
-			ok, detail = sendWhatsAppMessageQuoted(client, recipient, message, media, quoted)
-			oneShotApproval.Delete(recipient) // never leave an approval behind
 		}
 		status, note := "sent", fmt.Sprintf("🤖 ✅ _נשלח ל%s (אישור אחד = הודעה אחת)._", name)
+		if kind == "api" {
+			note = fmt.Sprintf("🤖 ✅ _בוצע (פעולה #%d, אישור אחד = פעולה אחת)._", id)
+		}
 		if !ok {
-			status, note = "failed", fmt.Sprintf("🤖 ⚠️ _השליחה ל%s נכשלה: %s_", name, detail)
+			status, note = "failed", fmt.Sprintf("🤖 ⚠️ _הביצוע של #%d (%s) נכשל: %s_", id, name, detail)
 		}
 		globalStore.db.Exec("UPDATE drafts SET status = ? WHERE id = ?", status, id)
 		sendWhatsAppMessage(client, control, note, "")

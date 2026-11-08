@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -91,7 +92,12 @@ func isOwnTarget(jid types.JID) bool {
 }
 
 // checkPolicy decides how a send to jid is handled: "send", "draft", or "paused".
-func checkPolicy(jid types.JID) (string, SendPolicy) {
+func checkPolicy(jid types.JID) (string, SendPolicy) { return checkPolicyApproved(jid, false) }
+
+// checkPolicyApproved: approved=true only for the single send of a draft the owner approved (✅ / dashboard / "מאשר לך
+// שליחה"). There is no auto mode and no standing allow-list any more: "mode", "auto_until" and "allow" in the policy
+// file are ignored. A pause always wins.
+func checkPolicyApproved(jid types.JID, approved bool) (string, SendPolicy) {
 	policyMu.Lock()
 	defer policyMu.Unlock()
 	p := loadPolicy()
@@ -101,16 +107,8 @@ func checkPolicy(jid types.JID) (string, SendPolicy) {
 	if t, err := time.Parse(time.RFC3339, p.PausedUntil); err == nil && time.Now().Before(t) {
 		return "paused", p
 	}
-	if _, ok := oneShotApproval.LoadAndDelete(jid.String()); ok {
-		return "send", p // a single ✅-approved draft
-	}
-	if inList(p.Allow, jid) {
+	if approved {
 		return "send", p
-	}
-	if p.Mode == "auto" {
-		if t, err := time.Parse(time.RFC3339, p.AutoUntil); p.AutoUntil == "" || (err == nil && time.Now().Before(t)) {
-			return "send", p
-		}
 	}
 	return "draft", p
 }
@@ -199,11 +197,14 @@ func makeDraftKind(client *whatsmeow.Client, p SendPolicy, jid types.JID, messag
 			draftID, _ = r.LastInsertId()
 		}
 	}
-	ok, res := sendWhatsAppMessage(client, p.ControlGroup, draftCardText(draftID, name, jid, message, mediaPath), "")
+	text := draftCardText(draftID, name, jid, message, mediaPath)
+	if kind == "api" {
+		text = apiCardText(draftID, message)
+	}
+	ok, res := sendWhatsAppMessage(client, p.ControlGroup, text, "")
 	if ok && draftID > 0 && globalStore != nil {
-		// remember the card's message id so a ✅ reaction on it can approve exactly this draft
-		var cardID string
-		if globalStore.db.QueryRow("SELECT message_id FROM send_log WHERE recipient = ? AND ok = 1 ORDER BY id DESC LIMIT 1", p.ControlGroup).Scan(&cardID) == nil {
+		// remember the card's message id (from this send's own result) so a ✅ on it approves exactly this draft
+		if cardID := sentID(res); cardID != "" {
 			globalStore.db.Exec("UPDATE drafts SET card_id = ? WHERE id = ?", cardID, draftID)
 		}
 	}
@@ -214,4 +215,14 @@ func makeDraftKind(client *whatsmeow.Client, p SendPolicy, jid types.JID, messag
 		return false, "Draft could not be posted: " + res
 	}
 	return false, fmt.Sprintf("DRAFT: not sent — draft for %s posted to the control group for approval", name)
+}
+
+var sentIDRe = regexp.MustCompile(`id=([A-Za-z0-9]+)`)
+
+// sentID extracts the message id from sendWhatsAppMessage's result ("Message sent to X id=3EB0…").
+func sentID(res string) string {
+	if m := sentIDRe.FindStringSubmatch(res); m != nil {
+		return m[1]
+	}
+	return ""
 }

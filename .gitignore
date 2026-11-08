@@ -28,3 +28,8 @@ agent/assets/
 agent/groups.json
 agent/agent.db.bak-*
 agent/restart-agent-once.ps1
+agent/outbox/
+agent/tmp/
+agent/*.request
+agent/*.tmp
+agent/stop.request

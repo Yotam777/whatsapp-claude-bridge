@@ -257,7 +257,7 @@ import extras  # noqa: E402
 
 @mcp.tool()
 def get_status() -> Dict[str, Any]:
-    """WhatsApp connection status: connected, connected_since, disconnects, sent_today, send policy (draft/auto, paused), pending drafts."""
+    """WhatsApp connection status: connected, connected_since, disconnects, sent_today, send policy (always draft for others, paused), pending drafts."""
     return extras.status()
 
 

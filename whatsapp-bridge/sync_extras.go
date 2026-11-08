@@ -148,7 +148,8 @@ func handleProtocol(client *whatsmeow.Client, store *MessageStore, msg *events.M
 
 func addSyncColumns(store *MessageStore) {
 	for _, col := range []string{"ALTER TABLE messages ADD COLUMN edited INTEGER DEFAULT 0",
-		"ALTER TABLE messages ADD COLUMN deleted INTEGER DEFAULT 0"} {
+		"ALTER TABLE messages ADD COLUMN deleted INTEGER DEFAULT 0",
+		"ALTER TABLE messages ADD COLUMN quoted_id TEXT"} {
 		store.db.Exec(col) // fails harmlessly when the column already exists
 	}
 	store.db.Exec("PRAGMA journal_mode=WAL")
@@ -164,11 +165,15 @@ func loadToken() string {
 	if b, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(b))) >= 16 {
 		return strings.TrimSpace(string(b))
 	}
-	buf := make([]byte, 24)
-	rand.Read(buf)
-	t := hex.EncodeToString(buf)
+	t := newSecret()
 	os.WriteFile(path, []byte(t), 0600)
 	return t
+}
+
+func newSecret() string {
+	buf := make([]byte, 24)
+	rand.Read(buf)
+	return hex.EncodeToString(buf)
 }
 
 // withAuth requires "Authorization: Bearer <token>" (or ?token= for EventSource clients) on every request.
@@ -178,8 +183,16 @@ func withAuth(next http.Handler) http.Handler {
 		if got == "" {
 			got = r.URL.Query().Get("token")
 		}
-		if apiToken == "" || got != apiToken {
+		owner := ownerToken != "" && got == ownerToken
+		if !owner && (apiToken == "" || got != apiToken) {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if ownerOnly(r) && !owner {
+			http.Error(w, "owner token required (approve in WhatsApp with ✅ or in the dashboard)", http.StatusForbidden)
+			return
+		}
+		if gateRequest(w, r, owner) {
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -242,4 +255,20 @@ func registerSyncAPI(client *whatsmeow.Client) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{"success": err == nil})
 	})
+}
+
+// quotedStanza: the id of the message this one replies to (text, image, video, document or audio reply), or "".
+func quotedStanza(m *waProto.Message) string {
+	if m == nil {
+		return ""
+	}
+	for _, ci := range []interface{ GetStanzaID() string }{
+		m.GetExtendedTextMessage().GetContextInfo(), m.GetImageMessage().GetContextInfo(),
+		m.GetVideoMessage().GetContextInfo(), m.GetDocumentMessage().GetContextInfo(), m.GetAudioMessage().GetContextInfo(),
+	} {
+		if id := ci.GetStanzaID(); id != "" {
+			return id
+		}
+	}
+	return ""
 }

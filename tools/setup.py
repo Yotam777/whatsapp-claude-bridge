@@ -35,6 +35,16 @@ def uv():
     return shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe")
 
 
+GPU_PACKAGES = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12>=9,<10"]
+
+
+def install_gpu_libs(agent_dir):
+    """config whisper_device "cuda": the CUDA 12 libraries ctranslate2 needs, installed into the agent's venv after
+    `uv sync` (not in the lock: newer nvidia-cublas releases have no Windows wheel, and `uv pip` picks one that does).
+    uv pip finds the venv in agent_dir (the cwd). The agent starts with --no-sync, so they stay; the next `uv sync` removes them and this puts them back."""
+    subprocess.run([uv(), "pip", "install", "-q", *GPU_PACKAGES],
+                   cwd=agent_dir, check=True)
+
 def step(n, he, en):
     say(f"\n━━ שלב {n}: {he}", f"\n━━ Step {n}: {en}")
 
@@ -153,9 +163,10 @@ def main():
 
     step(5, "התקנת רכיבים", "Installing components")
     extras = ["--extra", "voice"] if cfg["transcribe"] else []
-    if cfg["transcribe"] and cfg.get("whisper_device") == "cuda":
-        extras += ["--extra", "gpu"]  # NVIDIA GPU transcription: the CUDA 12 libraries
     subprocess.run([uv(), "sync", "-q"] + extras + ["--extra", "plugins"], cwd=AGENT, check=True)
+    if cfg["transcribe"] and cfg.get("whisper_device") == "cuda":
+        say("מתקין ספריות CUDA לתמלול על כרטיס המסך (כ-1GB)…", "Installing CUDA libraries for GPU transcription (~1 GB)…")
+        install_gpu_libs(AGENT)
     subprocess.run([uv(), "sync", "-q"], cwd=os.path.join(ROOT, "whatsapp-mcp-server"), check=True)
     run_agent = os.path.join(ROOT, "run-agent.cmd")
     say("✔ הרכיבים הותקנו", "✔ components installed")

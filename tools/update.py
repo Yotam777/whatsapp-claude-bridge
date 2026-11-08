@@ -64,6 +64,16 @@ def uv():
     return shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe")
 
 
+GPU_PACKAGES = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12>=9,<10"]
+
+
+def install_gpu_libs(agent_dir):
+    """config whisper_device "cuda": the CUDA 12 libraries ctranslate2 needs, installed into the agent's venv after
+    `uv sync` (not in the lock: newer nvidia-cublas releases have no Windows wheel, and `uv pip` picks one that does).
+    uv pip finds the venv in agent_dir (the cwd). The agent starts with --no-sync, so they stay; the next `uv sync` removes them and this puts them back."""
+    subprocess.run([uv(), "pip", "install", "-q", *GPU_PACKAGES],
+                   cwd=agent_dir, check=True)
+
 def ps(cmd):
     return subprocess.run(["powershell.exe", "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=60, creationflags=NO_WINDOW)
 
@@ -90,9 +100,9 @@ def sync_deps():
     except Exception:
         pass
     extras = ["--extra", "plugins"] + (["--extra", "voice"] if cfg.get("transcribe", True) else [])
-    if cfg.get("transcribe", True) and cfg.get("whisper_device") == "cuda":
-        extras += ["--extra", "gpu"]
     subprocess.run([uv(), "sync", "-q"] + extras, cwd=os.path.join(ROOT, "agent"), check=True)
+    if cfg.get("transcribe", True) and cfg.get("whisper_device") == "cuda":
+        install_gpu_libs(os.path.join(ROOT, "agent"))
     subprocess.run([uv(), "sync", "-q"], cwd=os.path.join(ROOT, "whatsapp-mcp-server"), check=True)
 
 

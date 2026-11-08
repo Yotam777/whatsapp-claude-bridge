@@ -805,13 +805,25 @@ def readonly_mcp_config():
         "env": {"WA_TOOL_ROOT": ROOT, "WA_MCP_READONLY": "1"}}}}, ensure_ascii=False)
 
 
+def claude_exe():
+    """The claude executable — also where installers put it when PATH (e.g. of a Task Scheduler start) lacks it."""
+    found = shutil.which("claude")
+    if found:
+        return found
+    for p in (os.path.expanduser("~/.local/bin/claude.exe"), os.path.join(os.environ.get("APPDATA", ""), "npm", "claude.cmd"),
+              os.path.expanduser("~/.claude/local/claude.exe")):
+        if os.path.isfile(p):
+            return p
+    return "claude"
+
+
 def claude_cmd(model, resume, append=None, tools=None, max_budget=None):
     """The `claude -p` command line of one run."""
     ro = readonly() and tools != ""
     # config "permission_mode" (default "auto"; e.g. "bypassPermissions" on a PC where nothing should wait for a click);
     # restricted runs over other people's text never get more than "auto"; a read-only run allows only its listed tools
     mode = "dontAsk" if ro else "auto" if tools == "" else CFG.get("permission_mode", "auto")
-    cmd = [shutil.which("claude") or "claude", "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", mode]
+    cmd = [claude_exe(), "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", mode]
     if model:
         cmd += ["--model", model]
     if append:

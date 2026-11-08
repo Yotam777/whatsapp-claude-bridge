@@ -1,6 +1,6 @@
 ---
 name: whatsapp
-description: Read, search and manage the user's personal WhatsApp through the whatsapp-bridge MCP tools — find chats and contacts, search messages and voice-note transcripts, read polls and votes, prepare messages to people (drafts the user approves), react, reply with a quote, download media, check the connection. Use for any request about WhatsApp messages, chats, groups, contacts, voice notes, polls or sending something on WhatsApp. ווצאפ: חיפוש הודעות, שיחות, קבוצות, תמלולי הקלטות, סקרים ושליחה.
+description: "Read, search and manage the user's personal WhatsApp through the whatsapp-bridge MCP tools — find chats and contacts, search messages and voice-note transcripts, read polls and votes, prepare messages to people (drafts the user approves), react, reply with a quote, download media, check the connection. Use for any request about WhatsApp messages, chats, groups, contacts, voice notes, polls or sending something on WhatsApp. ווצאפ: חיפוש הודעות, שיחות, קבוצות, תמלולי הקלטות, סקרים ושליחה."
 ---
 
 # WhatsApp (whatsapp-bridge)

@@ -826,3 +826,19 @@ def test_media_path_waits_for_the_auto_saved_file(agent, monkeypatch):
     monkeypatch.setattr(mod, "bridge", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no /download needed")))
     _th.Timer(1.2, lambda: open(os.path.join(d, "audio_a1.ogg"), "wb").write(b"ogg")).start()
     assert mod.media_path("c@s.whatsapp.net", "a1", wait=5).endswith("audio_a1.ogg")
+
+
+def test_whisper_unloaded_when_idle(agent, monkeypatch):
+    mod, _ = agent
+    mod._whisper, mod._whisper_used = object(), 0.0
+    monkeypatch.setitem(mod.CFG, "whisper_idle_unload_minutes", 10)
+    ticks = []
+
+    def fake_sleep(s):
+        ticks.append(s)
+        if len(ticks) > 1:
+            raise SystemExit
+    monkeypatch.setattr(mod.time, "sleep", fake_sleep)
+    with pytest.raises(SystemExit):
+        mod.whisper_reaper()
+    assert mod._whisper is None

@@ -679,18 +679,39 @@ def _load_whisper():
 
 
 _whisper_device = None
+_whisper_used = 0.0
+
+
+def whisper_reaper():
+    """config whisper_idle_unload_minutes (default 10; 0 = keep loaded): free the speech model (GPU memory) after it
+    has not been used for that long. The next voice note loads it again — a few seconds from the local cache."""
+    global _whisper, _whisper_device
+    while True:
+        time.sleep(30)
+        idle = float(CFG.get("whisper_idle_unload_minutes", 10) or 0)
+        if not idle:
+            continue
+        with _whisper_lock:
+            if _whisper is not None and time.time() - _whisper_used > idle * 60:
+                _whisper, _whisper_device = None, None
+                import gc
+                gc.collect()
+                log(f"whisper model unloaded after {idle:g} idle minutes")
 
 
 def transcribe(path):
-    global _whisper, _whisper_device
+    global _whisper, _whisper_device, _whisper_used
     with _whisper_lock:
+        _whisper_used = time.time()
         if _whisper is None:
             log("loading whisper model", CFG["whisper_model"])
             _whisper, _whisper_device = _load_whisper()
         # on the GPU a wider beam costs almost nothing and gives better Hebrew; on the CPU keep it greedy (fast)
         beam = int(CFG.get("whisper_beam_size") or (5 if _whisper_device == "cuda" else 1))
         segs, _ = _whisper.transcribe(decode_audio(path), language=CFG.get("whisper_language", "he"), vad_filter=True, beam_size=beam)
-        return " ".join(s.text.strip() for s in segs).strip()
+        text = " ".join(s.text.strip() for s in segs).strip()
+        _whisper_used = time.time()
+        return text
 
 
 def transcript_of(chat_jid, msg_id, sender, ts):
@@ -2737,7 +2758,7 @@ if __name__ == "__main__":
     except Exception:
         log("mark_interrupted failed", traceback.format_exc())
     # backfill on its own thread: the whisper lock interleaves it with live notes instead of queueing them behind it
-    for target in [worker, slow_worker, voice_worker, transcribe_requests_loop, backfill_transcripts, command_worker,
+    for target in [worker, slow_worker, voice_worker, transcribe_requests_loop, backfill_transcripts, whisper_reaper, command_worker,
                    scheduler, event_listener, watchdog, tunnel_keeper] + _threads:
         threading.Thread(target=target, daemon=True).start()
     sys.path.insert(0, ROOT)

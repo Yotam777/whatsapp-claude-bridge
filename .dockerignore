@@ -1,0 +1,21 @@
+.git
+**/__pycache__
+**/.venv
+**/.pytest_cache
+# personal data never goes into the image
+whatsapp-bridge/store
+whatsapp-bridge/bridge.log*
+whatsapp-bridge/qr.png
+whatsapp-bridge/*.exe
+agent/config.json
+agent/home
+agent/*.db
+agent/*.db-*
+agent/*.log*
+agent/agent.out*
+agent/groups.json
+agent/model_override.json
+agent/selftest.json
+releases
+build
+dist

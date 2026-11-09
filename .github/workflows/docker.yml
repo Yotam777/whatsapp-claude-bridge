@@ -1,0 +1,51 @@
+name: docker
+
+# Builds the server image (docker/Dockerfile) on every push to main, smoke-tests it, and publishes it to
+# ghcr.io/<owner>/whatsapp-claude-bridge:latest — the image the TrueNAS app pulls.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          load: true
+          tags: ${{ env.IMAGE }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test
+        run: |
+          set -e
+          run() { docker run --rm --entrypoint "$1" "$IMAGE:latest" "${@:2}"; }
+          run claude --version
+          run /opt/agent-venv/bin/python -c "import faster_whisper, ctranslate2, av, numpy; print('ctranslate2', ctranslate2.__version__, 'cuda devices', ctranslate2.get_cuda_device_count())"
+          run /opt/agent-venv/bin/python -c "import ctypes, glob; [ctypes.CDLL(p) for p in glob.glob('/opt/agent-venv/lib/python3.12/site-packages/nvidia/cublas/lib/libcublas.so.*')[:1]]; print('cublas loads')"
+          run /opt/mcp-venv/bin/python -c "import mcp.server.fastmcp, requests, httpx; print('mcp ok')"
+          run /bin/bash -c "test -x /usr/local/bin/whatsapp-bridge && echo bridge ok"
+          # the agent module imports with a minimal config (no WhatsApp needed)
+          run /bin/bash -c 'set -e; mkdir -p /tmp/a/store; cp /opt/src/agent/config.readonly.example.json /tmp/a/config.json;
+            cd /opt/src/agent; WA_AGENT_CONFIG=/tmp/a/config.json WA_AGENT_DB=/tmp/a/agent.db /opt/agent-venv/bin/python -c "
+          import json,agent; print(\"agent imports, readonly:\", agent.readonly()); print(json.loads(agent.readonly_mcp_config())[\"mcpServers\"][\"whatsapp\"][\"command\"])"'
+          # the read-only MCP server starts and lists no send tools
+          run /bin/bash -c 'cd /opt/src/whatsapp-mcp-server && WA_MCP_READONLY=1 WA_TOOL_ROOT=/tmp /opt/mcp-venv/bin/python -c "
+          import asyncio, main; names=sorted(t.name for t in asyncio.run(main.mcp.list_tools())); print(names); assert not [n for n in names if n.startswith((\"send\",\"react\"))]"'
+      - name: Push
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE:latest"

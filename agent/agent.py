@@ -350,6 +350,9 @@ def restart_now(reason):
 
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# WA_CONTAINER=1: running in the Docker image (Linux server). Windows-only jobs (toasts, Task Scheduler updates, the
+# Windows self-test, release checks of the upstream project) are skipped; Docker restarts the agent when it exits.
+CONTAINER = os.environ.get("WA_CONTAINER") == "1"
 
 
 def report_auto_update():
@@ -384,7 +387,7 @@ def auto_update():
     """Nightly (config auto_update_time, default 23:50): if a newer release exists, tell the owner and run tools/update.py
     detached — it stops the bridge and the agent, updates, restarts both, self-tests and rolls back on failure. The new
     agent reports the result (report_auto_update). Personal files (config, home, store, databases) are never touched."""
-    if not CFG.get("auto_update", True):
+    if not CFG.get("auto_update", True) or CONTAINER:
         return
     upd = os.path.join(ROOT, "tools", "update.py")
     uvx = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe")
@@ -587,7 +590,11 @@ def phone_of(chat_jid):
 
 
 def notify(title, body):
-    """Windows toast notification (works without WhatsApp)."""
+    """Windows toast notification (works without WhatsApp). In the container: the log (Uptime Kuma watches the
+    container's health check instead)."""
+    if CONTAINER or os.name != "nt":
+        log(f"ALERT: {title} — {body}")
+        return
     ps = ("[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;"
           "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
           "$x=$t.GetElementsByTagName('text');"
@@ -1066,6 +1073,12 @@ def _kill_tree(proc):
             subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30)
         except Exception as e:
             log("taskkill failed", e)
+    else:  # Claude runs in its own process group (start_new_session): end the whole group
+        import signal
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
     try:
         proc.kill()
     except Exception:
@@ -1104,9 +1117,14 @@ def readonly():
 def readonly_mcp_config():
     """MCP config (JSON string) for the read-only WhatsApp server: the same server the plugin uses, started with
     WA_MCP_READONLY=1 so its send / react tools are not even registered."""
-    uvx = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe")
+    main = os.path.join(ROOT, "whatsapp-mcp-server", "main.py")
+    if os.environ.get("WA_MCP_PYTHON"):  # the Docker image: the server's dependencies are pre-installed in this venv
+        command, args = os.environ["WA_MCP_PYTHON"], [main]
+    else:
+        command = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe")
+        args = ["--directory", os.path.dirname(main), "run", "main.py"]
     return json.dumps({"mcpServers": {"whatsapp": {
-        "command": uvx, "args": ["--directory", os.path.join(ROOT, "whatsapp-mcp-server"), "run", "main.py"],
+        "command": command, "args": args,
         "env": {"WA_TOOL_ROOT": ROOT, "WA_MCP_READONLY": "1"}}}}, ensure_ascii=False)
 
 
@@ -1158,7 +1176,7 @@ def _run_claude(prompt, model, resume, timeout, on_stage=None, append=None, chat
         stoppable = on_stage is not None  # only the owner's interactive runs; plugin / hand-off runs never eat a stop request
     t0 = time.time()
     proc = subprocess.Popen(cmd, cwd=HOME, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, encoding="utf-8", errors="replace")
+                            text=True, encoding="utf-8", errors="replace", start_new_session=os.name != "nt")
     errbuf = []
 
     def read_err():  # stderr carries the sign-in expiry warning and limit / login errors
@@ -2087,6 +2105,8 @@ def backup():
 
 def update_check():
     """Daily: tell the owner once about each new release (they decide when to update)."""
+    if CONTAINER or not CFG.get("update_check", True):
+        return
     out = subprocess.run([shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe"), "run", "-q", "--no-project", "python", "-X", "utf8",
                           os.path.join(ROOT, "tools", "update.py"), "--check"], capture_output=True, text=True, encoding="utf-8", timeout=120)
     try:
@@ -2607,7 +2627,7 @@ def nightly_selftest():
     """tools/selftest.py --quiet every night (no test messages, no end-to-end step — that one fails when the agent is
     busy); the owner hears about it only when something failed."""
     script = os.path.join(ROOT, "tools", "selftest.py")
-    if not os.path.exists(script):
+    if CONTAINER or not os.path.exists(script):  # the self-test checks the Windows installation (tasks, exe, ...)
         return
     try:
         p = subprocess.run([sys.executable, "-X", "utf8", script, "--quiet"], cwd=ROOT, capture_output=True, text=True,

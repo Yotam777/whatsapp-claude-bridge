@@ -1259,6 +1259,11 @@ def _run_claude(prompt, model, resume, timeout, on_stage=None, append=None, chat
         raise AuthError((result or errtext).strip()[:200])
     if not res:
         raise RuntimeError("claude returned no result" + (f": {errtext.strip()[-200:]}" if errtext.strip() else ""))
+    if res.get("is_error"):  # say why in the log (the stream's own error fields + the tail of stderr)
+        detail = {k: v for k, v in res.items() if k in ("subtype", "result", "errors", "error", "permission_denials")}
+        log("claude error:", json.dumps(detail, ensure_ascii=False)[:600], "| stderr:", errtext.strip()[-400:] or "-")
+        if resume and not res.get("result"):  # e.g. a session id from another machine
+            raise RuntimeError("claude error during execution (resume)")
     usage = res.get("usage", {})
     with adb() as db:
         # total_cost_usd is cumulative for a resumed session: store only this run's share (budget + dashboard sum `cost`)

@@ -773,20 +773,24 @@ def test_transcribe_command_and_in_chat_reply(agent, monkeypatch):
     monkeypatch.setattr(mod, "bridge", fake_bridge)
     monkeypatch.setattr(mod, "send", lambda r, t, media=None, quoted=None: sent.append((r, t, quoted)) or True)
     out = mod.owner_command("/תמלול הוסף שון")
-    assert "שון שלי" in out and "רואה" in out
+    assert "שון שלי" in out and "תשלח" in out
     # both keys of the chat are allowed, and the earlier approved recipient is kept
     assert set(policy["allow"]) == {"972500000077", "972501234567@s.whatsapp.net", "111222@lid"}
     assert "שון שלי" in mod.owner_command("/תמלול")
-    # a voice note arriving under the LID gets a quoted reply in that chat, and still goes to the control group
     monkeypatch.setattr(mod, "transcript_of", lambda *a: "תביא ביצים")
     monkeypatch.setattr(mod, "voice_label", lambda c, s: "שון שלי")
     monkeypatch.setitem(mod.CFG, "post_transcripts", True)
-    mod.transcribe_and_post("111222@lid", "v9", "111222@lid", "2026-11-09 18:00:00+02:00")
-    assert sent[0] == ("111222@lid", "📝 תביא ביצים", "v9") and sent[1][0] == mod.PRIMARY
-    # a contact not in the list: control group only
+    # MY voice note to the chosen contact (chat keyed by LID): its transcript goes right under it, in that chat only
+    mod.transcribe_and_post("111222@lid", "v9", "me", "2026-11-09 18:00:00+02:00", me=True)
+    assert sent == [("111222@lid", "📝 תביא ביצים", "v9")]
+    # THEIR voice note: the control group only (nothing in their chat)
     sent.clear()
-    mod.transcribe_and_post("972509999999@s.whatsapp.net", "v10", "x", "2026-11-09 18:01:00+02:00")
+    mod.transcribe_and_post("111222@lid", "v10", "111222@lid", "2026-11-09 18:01:00+02:00")
     assert [r for r, _, _ in sent] == [mod.PRIMARY]
+    # my voice note to someone not on the list: nothing at all
+    sent.clear()
+    mod.transcribe_and_post("972509999999@s.whatsapp.net", "v11", "me", "2026-11-09 18:02:00+02:00", me=True)
+    assert sent == []
     # removing takes both keys off the allow list again
     assert "הוסר" in mod.owner_command("/תמלול הסר שון")
     assert policy["allow"] == ["972500000077"]

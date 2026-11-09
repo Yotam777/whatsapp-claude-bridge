@@ -757,15 +757,15 @@ def sync_allow():
 
 
 def transcribe_command(arg):
-    """/תמלול [הוסף|הסר|רשימה] <name or number> — the contacts whose voice notes get an in-chat transcript."""
+    """/תמלול [הוסף|הסר|רשימה] <name or number> — contacts whose chat gets a transcript of the owner's own voice notes."""
     parts = arg.split(None, 1)
     verb, who = (parts[0] if parts else ""), (parts[1].strip() if len(parts) > 1 else "")
     cur = reply_chats()
     if verb in ("", "רשימה", "list"):
         if not cur:
-            return ("אין אנשי קשר עם תמלול בשיחה.\nהוספה: /תמלול הוסף <שם או מספר>\n"
-                    "התמלול נשלח כתגובה מצוטטת להקלטה, *והצד השני רואה אותו*.")
-        return "📝 תמלול בשיחה עצמה (גלוי לצד השני):\n" + "\n".join(f"• {c['name']}" for c in cur) + \
+            return ("אין אנשי קשר ברשימה.\nהוספה: /תמלול הוסף <שם או מספר>\n"
+                    "כל הקלטה *שאתה* שולח להם תקבל מתחתיה את התמלול שלה, כדי שיוכלו לקרוא.")
+        return "📝 ההקלטות שלך לאנשי הקשר האלה מקבלות תמלול בשיחה:\n" + "\n".join(f"• {c['name']}" for c in cur) + \
             "\n\nהסרה: /תמלול הסר <שם>"
     if verb in ("הוסף", "add"):
         if not who:
@@ -782,8 +782,8 @@ def transcribe_command(arg):
         cur.append({"jid": jid, "name": name})
         kv_set("reply_chats", json.dumps(cur, ensure_ascii=False))
         sync_allow()
-        return (f"✅ מעכשיו כל הקלטה מ*{name}* תקבל תמלול בשיחה איתו/איתה, כתגובה מצוטטת.\n"
-                "שים לב: הצד השני רואה את התמלול. הסרה: /תמלול הסר " + name)
+        return (f"✅ מעכשיו כל הקלטה שתשלח ל*{name}* תקבל מתחתיה את התמלול שלה (📝), כדי שיוכל/תוכל לקרוא.\n"
+                "בדיקה: שלח הקלטה קצרה. הסרה: /תמלול הסר " + name)
     if verb in ("הסר", "remove", "מחק"):
         keep = [c for c in cur if who not in c["name"] and who not in c["jid"]]
         if len(keep) == len(cur):
@@ -795,20 +795,27 @@ def transcribe_command(arg):
 
 
 def transcribe_and_post(chat_jid, msg_id, sender, ts, me=False):
-    """A voice note from another chat: transcribe it (stored for search) and, with config post_transcripts, post it to
-    the control group as '🎙️ Name: text'. The reply prefix keeps the agent from reading the post as a command."""
+    """A voice note in another chat: transcribe it (stored for search).
+    - the owner's own voice note to a chosen contact (/תמלול — e.g. someone who cannot hear): its transcript is sent
+      right under it in that chat, as a quoted reply, so the contact can read what was said;
+    - someone else's voice note, with config post_transcripts: posted to the control group as '🎙️ Name: text'
+      (the reply prefix keeps the agent from reading the post as a command)."""
+    in_chat = me and not chat_jid.endswith("@g.us") and chat_jid not in control_chats() and is_reply_chat(chat_jid)
+    if me and not in_chat:
+        return  # the owner's own voice notes elsewhere: nothing to do
     try:
         text = transcript_of(chat_jid, msg_id, sender, ts)
     except Exception as e:
         log("transcribe failed", msg_id, e)
         return
-    if not text or me or chat_jid in control_chats():
+    if not text or chat_jid in control_chats():
         return
-    if not chat_jid.endswith("@g.us") and is_reply_chat(chat_jid):  # chosen contact: a quoted reply in their chat
+    if in_chat:
         try:
             send(chat_jid, f"📝 {text}", quoted=msg_id)
         except Exception as e:
             log("in-chat transcript failed", e)
+        return
     if CFG.get("post_transcripts"):
         try:
             send(PRIMARY, f"{CFG['reply_prefix']}🎙️ *{voice_label(chat_jid, sender)}* ({str(ts)[11:16]}):\n{text}")

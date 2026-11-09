@@ -842,3 +842,19 @@ def test_whisper_unloaded_when_idle(agent, monkeypatch):
     with pytest.raises(SystemExit):
         mod.whisper_reaper()
     assert mod._whisper is None
+
+
+def test_stale_session_starts_fresh(agent, monkeypatch):
+    mod, _ = agent
+    mod.kv_set(mod.K("session_id", mod.PRIMARY), "old-pc-session")
+    calls = []
+
+    def fake_run(prompt, model, sid, *a, **k):
+        calls.append(sid)
+        if sid:
+            raise RuntimeError("claude returned no result: No conversation found with session ID: old-pc-session")
+        return {"result": "שלום", "session_id": "new"}
+    monkeypatch.setattr(mod, "_run_claude", fake_run)
+    monkeypatch.setattr(mod, "session_rotates", lambda *a: False)
+    assert mod.claude("hi", on_stage=lambda *a: None) == "שלום"
+    assert calls == ["old-pc-session", None] and mod.kv_get(mod.K("session_id", mod.PRIMARY)) == "new"

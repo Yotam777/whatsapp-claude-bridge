@@ -1319,6 +1319,9 @@ def session_active(chat, raw=""):
     return bool(kv_get(K("session_id", chat or PRIMARY))) and not session_rotates(chat or PRIMARY, raw) and not CFG.get("fresh_sessions")
 
 
+STALE_SESSION_RE = re.compile(r"No conversation found|session.{0,40}not found|--resume", re.I)
+
+
 def claude(prompt, model=None, session=True, timeout=900, on_stage=None, chat=None, raw=None, tools=None, max_budget=None,
            budget_check=False):
     """Run Claude Code headless in HOME. Each conversation (group / local chat) has its own session, resumed until it is
@@ -1343,7 +1346,22 @@ def claude(prompt, model=None, session=True, timeout=900, on_stage=None, chat=No
         write_handoff(sid, chat)
         sid = None
     try:
-        res = _run_claude(prompt, model, sid, timeout, on_stage, append=group_prompt(chat), chat=chat, tools=tools, max_budget=max_budget)
+        try:
+            res = _run_claude(prompt, model, sid, timeout, on_stage, append=group_prompt(chat), chat=chat, tools=tools,
+                              max_budget=max_budget)
+            if sid and res.get("is_error") and STALE_SESSION_RE.search(res.get("result") or ""):
+                raise RuntimeError(res.get("result"))
+        except RuntimeError as e:
+            # the saved session does not exist in this Claude Code (e.g. agent.db moved to another machine, or ~/.claude
+            # was cleared): start a fresh session instead of failing every message
+            if not sid:
+                raise
+            log(f"claude: resume of session {sid} failed ({e}); starting a fresh session")
+            kv_set(K("session_id", chat), "")
+            kv_set(K("session_runs", chat), "0")
+            sid = None
+            res = _run_claude(prompt, model, None, timeout, on_stage, append=group_prompt(chat), chat=chat, tools=tools,
+                              max_budget=max_budget)
     except Stopped:
         return "⛔ עצרתי את העבודה לבקשתך."
     except LimitHit:
@@ -1369,6 +1387,8 @@ def claude(prompt, model=None, session=True, timeout=900, on_stage=None, chat=No
         kv_set(K("session_runs", chat), str(int(kv_get(K("session_runs", chat)) or 0) + 1))
         if model and getattr(_ctx, "auto_pick", False):
             kv_set(K("session_model", chat), model)  # automatic routing stays on this model for the rest of the session
+    if not res.get("result"):
+        log(f"claude: empty answer (is_error={res.get('is_error')}, subtype={res.get('subtype')})")
     return res.get("result")
 
 

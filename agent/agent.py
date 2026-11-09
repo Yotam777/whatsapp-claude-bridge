@@ -932,6 +932,9 @@ def transcribe_requests_loop():
                     log("requested transcribe failed", mid, e)
                 with adb() as db:
                     db.execute("UPDATE transcribe_requests SET status=? WHERE id=? AND chat_jid=?", (status, mid, cj))
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e):  # another writer held agent.db for a moment: just look again next round
+                log("transcribe requests", traceback.format_exc())
         except Exception:
             log("transcribe requests", traceback.format_exc())
         time.sleep(2)

@@ -794,3 +794,35 @@ def test_transcribe_command_and_in_chat_reply(agent, monkeypatch):
     # removing takes both keys off the allow list again
     assert "הוסר" in mod.owner_command("/תמלול הסר שון")
     assert policy["allow"] == ["972500000077"]
+
+
+def test_send_reset_after_bridge_sent_is_not_resent(agent, monkeypatch):
+    import datetime as _dt
+    mod, db = agent
+    db.execute("CREATE TABLE IF NOT EXISTS send_log (id INTEGER PRIMARY KEY AUTOINCREMENT, recipient TEXT, message_id TEXT, "
+               "ok BOOLEAN, detail TEXT, timestamp TIMESTAMP)")
+    db.commit()
+    calls = []
+
+    def fake_bridge(path, body=None, timeout=180, tok=None):
+        calls.append(path)
+        now = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.123456+02:00")
+        db.execute("INSERT INTO send_log (recipient, message_id, ok, detail, timestamp) VALUES (?, 'M1', 1, '', ?)",
+                   (body["recipient"], now))
+        db.commit()
+        raise ConnectionResetError(10054, "forcibly closed")
+    monkeypatch.setattr(mod, "bridge", fake_bridge)
+    assert mod.send("972500000001@s.whatsapp.net", "hi") is True
+    assert calls == ["/send"]  # confirmed in the send log: not sent twice
+
+
+def test_media_path_waits_for_the_auto_saved_file(agent, monkeypatch):
+    import threading as _th
+    mod, db = agent
+    db.execute("INSERT INTO messages VALUES ('a1', 'c@s.whatsapp.net', 'x', '', '2026-11-09 18:39:10+02:00', 1, 'audio', 'audio_a1.ogg')")
+    db.commit()
+    d = os.path.join(mod.STORE, "c@s.whatsapp.net")
+    os.makedirs(d, exist_ok=True)
+    monkeypatch.setattr(mod, "bridge", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no /download needed")))
+    _th.Timer(1.2, lambda: open(os.path.join(d, "audio_a1.ogg"), "wb").write(b"ogg")).start()
+    assert mod.media_path("c@s.whatsapp.net", "a1", wait=5).endswith("audio_a1.ogg")

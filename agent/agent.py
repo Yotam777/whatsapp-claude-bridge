@@ -271,9 +271,19 @@ def send(recipient, text, media=None, quoted=None):
         body["media_path"] = media
     if quoted:
         body["quoted_id"] = quoted
+    started = dt.datetime.now()
     try:
         try:
             res = bridge("/send", body)
+        except (ConnectionResetError, ConnectionAbortedError) as e:
+            # the connection broke, possibly AFTER the bridge sent it: look in its send log before deciding to resend
+            sid = sent_after(recipient, started)
+            if sid:
+                log(f"send to {recipient}: connection reset, but the bridge sent it ({sid})")
+                res = {"success": True, "message": f"sent (confirmed in send_log) id={sid}"}
+            else:
+                log(f"send to {recipient}: connection reset and not in the send log — sending again")
+                res = bridge("/send", body)
         except Exception as e:
             if not _refused(e) or not wait_bridge(180):
                 raise
@@ -285,6 +295,30 @@ def send(recipient, text, media=None, quoted=None):
         db.execute("INSERT INTO sent VALUES (?, ?, ?, ?, ?)", (dt.datetime.now().isoformat(), recipient, text[:500], ok, detail))
     log("send", recipient, ok, detail[:120])
     return ok
+
+
+def sent_after(recipient, since, wait=15):
+    """Message id of a successful send to `recipient` that the bridge logged after `since`, waiting up to `wait` s
+    (a WhatsApp send can take a few seconds to finish after the connection to the agent broke)."""
+    user = recipient.split("@")[0]
+    end = time.time() + wait
+    while True:
+        try:
+            with mdb() as db:
+                for rid, mid, ts in db.execute("SELECT recipient, message_id, timestamp FROM send_log WHERE ok = 1 "
+                                               "ORDER BY id DESC LIMIT 20"):
+                    if (rid or "").split("@")[0] == user:
+                        try:
+                            t = dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00").split(".")[0].replace(" ", "T")[:19])
+                        except ValueError:
+                            continue
+                        if t >= since.replace(microsecond=0) - dt.timedelta(seconds=2):
+                            return mid or "?"
+        except sqlite3.Error:
+            pass
+        if time.time() > end:
+            return None
+        time.sleep(1)
 
 
 def _refused(e):
@@ -518,20 +552,28 @@ def react(msg_id, emoji):
         log("react failed", e)
 
 
-def media_path(chat_jid, msg_id):
-    """Local file of a media message; asks the bridge to download it if it is not on disk yet."""
-    with mdb() as db:
-        r = db.execute("SELECT filename FROM messages WHERE id=? AND chat_jid=?", (msg_id, chat_jid)).fetchone()
-    if r and r[0]:
-        p = os.path.join(STORE, chat_jid.replace(":", "_"), r[0])
-        if os.path.exists(p):
-            return p
-    try:
-        res = bridge("/download", {"message_id": msg_id, "chat_jid": chat_jid}, timeout=300)
-        return res.get("path") if res.get("success") else None
-    except Exception as e:
-        log("download failed", msg_id, e)
-        return None
+def media_path(chat_jid, msg_id, wait=20):
+    """Local file of a media message. The bridge saves incoming / outgoing media by itself a moment after storing the
+    message, so wait for the file first; ask the bridge to download it only if it does not appear."""
+    end = time.time() + wait
+    while True:
+        with mdb() as db:
+            r = db.execute("SELECT filename FROM messages WHERE id=? AND chat_jid=?", (msg_id, chat_jid)).fetchone()
+        if r and r[0]:
+            p = os.path.join(STORE, chat_jid.replace(":", "_"), r[0])
+            if os.path.exists(p) and os.path.getsize(p) > 0:
+                return p
+        if time.time() > end:
+            break
+        time.sleep(1)
+    for attempt in range(3):
+        try:
+            res = bridge("/download", {"message_id": msg_id, "chat_jid": chat_jid}, timeout=300)
+            return res.get("path") if res.get("success") else None
+        except Exception as e:
+            log(f"download failed (attempt {attempt + 1}/3)", msg_id, e)
+            time.sleep(2 * (attempt + 1))
+    return None
 
 
 def phone_of(chat_jid):

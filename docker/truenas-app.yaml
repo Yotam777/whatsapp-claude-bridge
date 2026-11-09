@@ -1,5 +1,5 @@
 # TrueNAS → Apps → Discover Apps → ⋮ → Install via YAML. Name: whatsapp-claude
-# Before installing: create the dataset SSD-Cache/apps/whatsapp-claude and copy the export from the PC into it
+# Before installing: create the dataset Yotam-Storage/whatsapp-claude and copy the export from the PC into it
 # (see docker/README.he.md). Replace PASTE-TOKEN-HERE with the output of `claude setup-token`.
 services:
   whatsapp-claude:
@@ -12,7 +12,7 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
-      - /mnt/SSD-Cache/apps/whatsapp-claude:/data
+      - /mnt/Yotam-Storage/whatsapp-claude:/data
     deploy:
       resources:
         reservations:

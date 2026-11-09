@@ -30,13 +30,13 @@ powershell -ExecutionPolicy Bypass -File tools\export_for_server.ps1
 מהרגע הזה השירות לא רץ במחשב. שני עותקים של אותו סשן ווצאפ מתנגשים, ולכן אסור שירוצו יחד.
 
 ## 4. dataset בשרת
-1. ב-TrueNAS: **Datasets ← SSD-Cache ← Add Dataset**, ושם `apps/whatsapp-claude` (אם `apps` עוד לא קיים, צור אותו קודם).
+1. ב-TrueNAS: **Datasets ← Yotam-Storage ← Add Dataset**, ושם `whatsapp-claude`.
 2. העתק לשם את **התוכן** של ה-zip, כך שבתוך ה-dataset תהיה תיקייה בשם `app`:
    ```
-   /mnt/SSD-Cache/apps/whatsapp-claude/app/whatsapp-bridge/store/...
-   /mnt/SSD-Cache/apps/whatsapp-claude/app/agent/config.json ...
+   /mnt/Yotam-Storage/whatsapp-claude/app/whatsapp-bridge/store/...
+   /mnt/Yotam-Storage/whatsapp-claude/app/agent/config.json ...
    ```
-   אפשר דרך שיתוף SMB, או ב-Shell של TrueNAS: `unzip whatsapp-claude-export.zip -d /mnt/SSD-Cache/apps/whatsapp-claude`
+   אפשר דרך שיתוף SMB, או ב-Shell של TrueNAS: `unzip whatsapp-claude-export.zip -d /mnt/Yotam-Storage/whatsapp-claude`
 
 ## 5. התקנת האפליקציה
 1. **Apps ← Discover Apps ← ⋮ ← Install via YAML**, ושם `whatsapp-claude`.

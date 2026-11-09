@@ -1884,10 +1884,14 @@ def restart_wanted():
     return None
 
 
+_GENERATION = object()  # new on every (re)load of this module
+
+
 def conversation_worker(chat):
     """Answers one conversation's commands in order; other conversations run in parallel in their own workers."""
+    gen = _GENERATION
     try:
-        while not restart_wanted():
+        while not restart_wanted() and _GENERATION is gen:
             row = claim_next(chat)
             if not row:
                 break
@@ -1929,7 +1933,8 @@ def command_worker():
     """Dispatcher: one worker thread per conversation with pending commands (serial within a conversation, parallel
     across conversations). A requested restart waits until every running answer has been sent. Conversations the owner
     paused in the dashboard are skipped (their commands wait in the queue)."""
-    while True:
+    gen = _GENERATION
+    while _GENERATION is gen:  # a reloaded module (tests) stops the old dispatcher instead of sharing the new database
         try:
             reason = restart_wanted()
             with _workers_lock:

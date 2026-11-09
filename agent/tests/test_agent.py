@@ -746,3 +746,47 @@ def test_bridge_retries_dropped_connection_only_when_safe(agent, monkeypatch):
     with pytest.raises(ConnectionResetError):
         mod.bridge("/send", {})
     assert calls == ["send"]  # never repeated: it may already have gone out
+
+
+def _contacts_db(mod, tmp_rows):
+    w = sqlite3.connect(mod.WA_DB)
+    w.execute("CREATE TABLE IF NOT EXISTS whatsmeow_contacts (our_jid TEXT, their_jid TEXT, first_name TEXT, full_name TEXT, "
+              "push_name TEXT, business_name TEXT)")
+    w.execute("CREATE TABLE IF NOT EXISTS whatsmeow_lid_map (lid TEXT, pn TEXT)")
+    for r in tmp_rows:
+        w.execute("INSERT INTO whatsmeow_contacts VALUES ('me', ?, '', ?, ?, '')", r)
+    w.execute("INSERT INTO whatsmeow_lid_map VALUES ('111222', '972501234567')")
+    w.commit()
+    w.close()
+
+
+def test_transcribe_command_and_in_chat_reply(agent, monkeypatch):
+    mod, _ = agent
+    _contacts_db(mod, [("972501234567@s.whatsapp.net", "שון שלי", "Shon"), ("972509999999@s.whatsapp.net", "", "שוני")])
+    policy = {"allow": ["972500000077"]}
+    sent = []
+
+    def fake_bridge(path, body=None, timeout=180, tok=None):
+        if path == "/policy" and body is not None:
+            policy.update(body)
+        return dict(policy)
+    monkeypatch.setattr(mod, "bridge", fake_bridge)
+    monkeypatch.setattr(mod, "send", lambda r, t, media=None, quoted=None: sent.append((r, t, quoted)) or True)
+    out = mod.owner_command("/תמלול הוסף שון")
+    assert "שון שלי" in out and "רואה" in out
+    # both keys of the chat are allowed, and the earlier approved recipient is kept
+    assert set(policy["allow"]) == {"972500000077", "972501234567@s.whatsapp.net", "111222@lid"}
+    assert "שון שלי" in mod.owner_command("/תמלול")
+    # a voice note arriving under the LID gets a quoted reply in that chat, and still goes to the control group
+    monkeypatch.setattr(mod, "transcript_of", lambda *a: "תביא ביצים")
+    monkeypatch.setattr(mod, "voice_label", lambda c, s: "שון שלי")
+    monkeypatch.setitem(mod.CFG, "post_transcripts", True)
+    mod.transcribe_and_post("111222@lid", "v9", "111222@lid", "2026-11-09 18:00:00+02:00")
+    assert sent[0] == ("111222@lid", "📝 תביא ביצים", "v9") and sent[1][0] == mod.PRIMARY
+    # a contact not in the list: control group only
+    sent.clear()
+    mod.transcribe_and_post("972509999999@s.whatsapp.net", "v10", "x", "2026-11-09 18:01:00+02:00")
+    assert [r for r, _, _ in sent] == [mod.PRIMARY]
+    # removing takes both keys off the allow list again
+    assert "הוסר" in mod.owner_command("/תמלול הסר שון")
+    assert policy["allow"] == ["972500000077"]

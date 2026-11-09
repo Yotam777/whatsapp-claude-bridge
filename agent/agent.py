@@ -682,6 +682,118 @@ def voice_label(chat_jid, sender):
     return name(chat_jid)
 
 
+# ---------- in-chat transcripts for chosen contacts ----------
+# The list lives in agent.db (kv "reply_chats": [{"jid", "name"}]), managed from WhatsApp with /תמלול. Each chosen chat is
+# keyed by both its phone JID and its LID (WhatsApp may deliver a private chat under either), and both are added to the
+# bridge's "allow" list so the agent's quoted reply is sent instead of becoming a draft. In read-only mode Claude has no
+# send tool at all, so that list is used only by this code.
+
+def reply_chats():
+    try:
+        return json.loads(kv_get("reply_chats") or "[]")
+    except ValueError:
+        return []
+
+
+def _chat_keys(jid):
+    """Every JID a private chat may arrive under: phone@s.whatsapp.net and lid@lid."""
+    user = jid.split("@")[0]
+    keys = {jid}
+    try:
+        with sqlite3.connect(f"file:{WA_DB}?mode=ro", uri=True, timeout=10) as w:
+            if jid.endswith("@lid"):
+                r = w.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid=?", (user,)).fetchone()
+                if r:
+                    keys.add(r[0] + "@s.whatsapp.net")
+            else:
+                r = w.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn=?", (user,)).fetchone()
+                if r:
+                    keys.add(r[0] + "@lid")
+    except sqlite3.Error:
+        pass
+    return keys
+
+
+def is_reply_chat(chat_jid):
+    return any(chat_jid in _chat_keys(c["jid"]) or c["jid"] in _chat_keys(chat_jid) for c in reply_chats())
+
+
+def find_contacts(q):
+    """Private chats matching a contact name (or part of it) or a phone number: [(jid, name)], best first.
+    Names saved in the phone win over the names people gave themselves in WhatsApp."""
+    q = q.strip()
+    digits = re.sub(r"\D", "", q)
+    if digits and len(digits) >= 7 and len(digits) >= len(re.sub(r"[\s\-+()]", "", q)):
+        if digits.startswith("0"):
+            digits = "972" + digits[1:]
+        return [(digits + "@s.whatsapp.net", _contact_names().get(digits) or "+" + digits)]
+    try:
+        with sqlite3.connect(f"file:{WA_DB}?mode=ro", uri=True, timeout=10) as w:
+            rows = w.execute("SELECT their_jid, full_name, push_name FROM whatsmeow_contacts").fetchall()
+    except sqlite3.Error:
+        return []
+    for col in (1, 2):  # saved name first, then WhatsApp name
+        hits = {}
+        for r in rows:
+            name = r[col] or ""
+            if name and q in name and not r[0].endswith("@g.us"):
+                hits.setdefault(name, r[0])
+        if hits:
+            exact = [(j, n) for n, j in hits.items() if n == q]
+            return exact or sorted(((j, n) for n, j in hits.items()), key=lambda x: len(x[1]))
+    return []
+
+
+def sync_allow():
+    """The bridge's allow list = what was there before (approved in words) + every key of the chosen chats."""
+    keys = sorted({k for c in reply_chats() for k in _chat_keys(c["jid"])})
+    old = set(json.loads(kv_get("reply_allow") or "[]"))
+    try:
+        cur = set(bridge("/policy", timeout=15).get("allow") or [])
+        bridge("/policy", {"allow": sorted((cur - old) | set(keys))}, timeout=15)
+        kv_set("reply_allow", json.dumps(keys))
+    except Exception as e:
+        log("sync allow list failed", e)
+
+
+def transcribe_command(arg):
+    """/תמלול [הוסף|הסר|רשימה] <name or number> — the contacts whose voice notes get an in-chat transcript."""
+    parts = arg.split(None, 1)
+    verb, who = (parts[0] if parts else ""), (parts[1].strip() if len(parts) > 1 else "")
+    cur = reply_chats()
+    if verb in ("", "רשימה", "list"):
+        if not cur:
+            return ("אין אנשי קשר עם תמלול בשיחה.\nהוספה: /תמלול הוסף <שם או מספר>\n"
+                    "התמלול נשלח כתגובה מצוטטת להקלטה, *והצד השני רואה אותו*.")
+        return "📝 תמלול בשיחה עצמה (גלוי לצד השני):\n" + "\n".join(f"• {c['name']}" for c in cur) + \
+            "\n\nהסרה: /תמלול הסר <שם>"
+    if verb in ("הוסף", "add"):
+        if not who:
+            return "למי? /תמלול הוסף <שם או מספר>"
+        found = find_contacts(who)
+        if not found:
+            return f"לא מצאתי איש קשר בשם \"{who}\". נסה חלק מהשם כפי שהוא שמור בטלפון, או מספר טלפון."
+        if len(found) > 1:
+            return f"מצאתי כמה אנשי קשר עם \"{who}\":\n" + "\n".join(f"• {n}" for _, n in found[:8]) + \
+                "\n\nכתוב את השם המלא, למשל: /תמלול הוסף " + found[0][1]
+        jid, name = found[0]
+        if is_reply_chat(jid):
+            return f"{name} כבר ברשימה."
+        cur.append({"jid": jid, "name": name})
+        kv_set("reply_chats", json.dumps(cur, ensure_ascii=False))
+        sync_allow()
+        return (f"✅ מעכשיו כל הקלטה מ*{name}* תקבל תמלול בשיחה איתו/איתה, כתגובה מצוטטת.\n"
+                "שים לב: הצד השני רואה את התמלול. הסרה: /תמלול הסר " + name)
+    if verb in ("הסר", "remove", "מחק"):
+        keep = [c for c in cur if who not in c["name"] and who not in c["jid"]]
+        if len(keep) == len(cur):
+            return f"\"{who}\" לא ברשימה. /תמלול רשימה"
+        kv_set("reply_chats", json.dumps(keep, ensure_ascii=False))
+        sync_allow()
+        return "✅ הוסר: " + ", ".join(c["name"] for c in cur if c not in keep)
+    return "שימוש: /תמלול רשימה · /תמלול הוסף <שם> · /תמלול הסר <שם>"
+
+
 def transcribe_and_post(chat_jid, msg_id, sender, ts, me=False):
     """A voice note from another chat: transcribe it (stored for search) and, with config post_transcripts, post it to
     the control group as '🎙️ Name: text'. The reply prefix keeps the agent from reading the post as a command."""
@@ -690,12 +802,18 @@ def transcribe_and_post(chat_jid, msg_id, sender, ts, me=False):
     except Exception as e:
         log("transcribe failed", msg_id, e)
         return
-    if not text or me or not CFG.get("post_transcripts") or chat_jid in control_chats():
+    if not text or me or chat_jid in control_chats():
         return
-    try:
-        send(PRIMARY, f"{CFG['reply_prefix']}🎙️ *{voice_label(chat_jid, sender)}* ({str(ts)[11:16]}):\n{text}")
-    except Exception as e:
-        log("post transcript failed", e)
+    if not chat_jid.endswith("@g.us") and is_reply_chat(chat_jid):  # chosen contact: a quoted reply in their chat
+        try:
+            send(chat_jid, f"📝 {text}", quoted=msg_id)
+        except Exception as e:
+            log("in-chat transcript failed", e)
+    if CFG.get("post_transcripts"):
+        try:
+            send(PRIMARY, f"{CFG['reply_prefix']}🎙️ *{voice_label(chat_jid, sender)}* ({str(ts)[11:16]}):\n{text}")
+        except Exception as e:
+            log("post transcript failed", e)
 
 
 def backfill_transcripts():
@@ -1411,6 +1529,9 @@ def owner_command(text, chat=None):
     if re.match(r"^/(הפעל מחדש|אתחל|restart)\s*$", text.strip()):
         RESTART_REQ.set()
         return "🔄 מפעיל את הסוכן מחדש. אכתוב כאן כשאעלה (בערך 20 שניות)."
+    m = re.match(r"^/(תמלול|transcribe)\s*(.*)$", text.strip(), re.S)
+    if m:
+        return transcribe_command(m.group(2).strip())
     m = re.match(r"^/(מודל|model|מודלים|סשן|session)\s*(.*)$", text.strip(), re.S)
     if not m:
         return None

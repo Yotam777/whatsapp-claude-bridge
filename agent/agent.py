@@ -1,14 +1,14 @@
 """WhatsApp agent: the always-on companion of the whatsapp-bridge (the WhatsApp ↔ Claude tool).
 
-Runs as one background process (started at logon by Task Scheduler):
+Runs as one background process in the Docker container (docker/start.sh restarts it when it exits):
   * the owner's messages in his control group (text, voice, images, documents) are answered by a headless Claude Code
     session: 👀 reaction on receipt, progress note for long tasks, files Claude leaves in home/outbox are sent back,
     daily session rotation with a written hand-off, daily budget cap.
   * every voice note is transcribed locally (faster-whisper, Hebrew model) into the `transcripts` table.
   * new messages arrive by push (bridge /api/events) with a database sweep by insertion order as a safety net,
     so nothing is missed and nothing is handled twice.
-  * watchdog: Windows notification when WhatsApp is disconnected too long or the device is logged out.
-  * nightly backup + quiet self-test (reported only on failure); control panel (dash) on http://127.0.0.1:8770.
+  * watchdog: an alert in the log (and the control group) when WhatsApp is disconnected too long or logged out.
+  * nightly backup.
   * Claude usage limit: commands wait and run by themselves after the reset; sign-in expiry warning.
   * after a WhatsApp outage: why / how long, and the owner's missed messages are taken in.
   * reply to a draft card with a time = scheduled send; morning summary; voice answers to voice notes.
@@ -56,7 +56,6 @@ T = {
         "logged_out_t": "ווצאפ נותק מהחשבון", "logged_out_b": "צריך לסרוק QR מחדש — הכלי לא מקבל הודעות",
         "down_t": "ווצאפ מנותק", "down_b": "אין חיבור כבר {mins} דקות",
         "back": "✅ החיבור לווצאפ חזר אחרי כ-{mins} דקות.",
-        "update": "🆕 גרסה {latest} של הכלי זמינה (מותקנת {current}).\n{notes}\n\nלעדכון: בלוח הבקרה ← \"בדוק עדכון לכל הכלי\", או הרץ update.cmd.",
         "handoff_prompt": "השיחה הזו נסגרת ותתחיל שיחה חדשה. כתוב סיכום העברה של עד 12 שורות: משימות פתוחות, החלטות, "
                           "העדפות של {owner} ודברים שחייבים לזכור. רק הסיכום, בלי הקדמה.",
         "handoff_title": "# סיכום מהשיחה הקודמת",
@@ -78,7 +77,6 @@ T = {
         "logged_out_t": "WhatsApp logged out", "logged_out_b": "Scan the QR code again — the tool receives no messages",
         "down_t": "WhatsApp disconnected", "down_b": "No connection for {mins} minutes",
         "back": "✅ WhatsApp connection is back after about {mins} minutes.",
-        "update": "🆕 Version {latest} of the tool is available (installed {current}).\n{notes}\n\nTo update: dashboard → \"Check for a tool update\", or run update.cmd.",
         "handoff_prompt": "This session is closing and a new one starts. Write a hand-off summary of up to 12 lines: open tasks, "
                           "decisions, {owner}'s preferences and things to remember. Only the summary.",
         "handoff_title": "# Summary of the previous session",
@@ -343,85 +341,12 @@ RESTART_FILE = os.path.join(HERE, "restart.request")  # Claude (or anyone) creat
 
 
 def restart_now(reason):
-    """Exit cleanly; run-agent.cmd starts the agent again within ~15 s and the new process reports in the group."""
+    """Exit cleanly; docker/start.sh starts the agent again within ~10 s and the new process reports in the group."""
     kv_set("restart_pending", json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "reason": reason}, ensure_ascii=False))
     log("restart requested:", reason)
     os._exit(0)
 
 
-NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-# WA_CONTAINER=1: running in the Docker image (Linux server). Windows-only jobs (toasts, Task Scheduler updates, the
-# Windows self-test, release checks of the upstream project) are skipped; Docker restarts the agent when it exits.
-CONTAINER = os.environ.get("WA_CONTAINER") == "1"
-
-
-def report_auto_update():
-    """The nightly update stopped and restarted us: tell the owner how it ended (read from agent/update.log)."""
-    raw = kv_get("auto_update_pending")
-    if not raw:
-        return
-    kv_set("auto_update_pending", "")
-    try:
-        info = json.loads(raw)
-    except Exception:
-        info = {}
-    wait_bridge(300)
-    tail = ""
-    try:
-        tail = open(os.path.join(HERE, "update.log"), encoding="utf-8", errors="replace").read()[-3000:]
-    except OSError:
-        pass
-    cur = open(os.path.join(ROOT, "VERSION")).read().strip()
-    if "↩" in tail.split("מעדכן")[-1]:
-        msg = f"↩ העדכון האוטומטי ל-{info.get('to', '?')} נכשל בבדיקה — הכלי חזר לגרסה {cur}. הגשר והסוכן פועלים."
-    else:
-        msg = f"✅ עודכן אוטומטית לגרסה {cur} ({dt.datetime.now():%H:%M}). הגשר והסוכן הופעלו מחדש."
-    _ctx.chat = PRIMARY
-    try:
-        reply(msg)
-    finally:
-        _ctx.chat = None
-
-
-def auto_update():
-    """Nightly (config auto_update_time, default 23:50): if a newer release exists, tell the owner and run tools/update.py
-    detached — it stops the bridge and the agent, updates, restarts both, self-tests and rolls back on failure. The new
-    agent reports the result (report_auto_update). Personal files (config, home, store, databases) are never touched."""
-    if not CFG.get("auto_update", True) or CONTAINER:
-        return
-    upd = os.path.join(ROOT, "tools", "update.py")
-    uvx = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe")
-    try:
-        out = subprocess.run([uvx, "run", "-q", "--no-project", "python", "-X", "utf8", upd, "--check"], cwd=ROOT,
-                             capture_output=True, text=True, encoding="utf-8", timeout=90, creationflags=NO_WINDOW)
-        res = json.loads(out.stdout.strip().splitlines()[-1])
-    except Exception as e:
-        log("auto_update check failed", e)
-        return
-    if not res.get("available"):
-        log("auto_update: up to date", res.get("current"))
-        return
-    dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
-    _ctx.chat = PRIMARY
-    try:
-        if dirty:
-            reply(f"⚠️ עדכון אוטומטי לגרסה {res.get('latest')} לא בוצע: יש שינויים לא שמורים בקבצי הכלי במחשב הזה. שמור אותם בגיט ואעדכן מחר (או עכשיו מהלוח).")
-            return
-        reply(f"🔄 עדכון אוטומטי: גרסה {res.get('current')} ← {res.get('latest')}. הגשר והסוכן יופעלו מחדש בעוד רגע; אודיע כשסיימתי.")
-    finally:
-        _ctx.chat = None
-    kv_set("auto_update_pending", json.dumps({"from": res.get("current"), "to": res.get("latest"),
-                                              "at": dt.datetime.now().isoformat(timespec="seconds")}))
-    # the updater stops this agent and its run-agent loop, so it must not live in our process tree / Task Scheduler job
-    base = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    for flags in (base | 0x01000000, base):  # 0x01000000 = CREATE_BREAKAWAY_FROM_JOB (not always allowed)
-        try:
-            subprocess.Popen([uvx, "run", "-q", "--no-project", "python", "-X", "utf8", upd], cwd=ROOT, creationflags=flags,
-                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True)
-            break
-        except OSError as e:
-            log("auto_update launch retry", e)
-    log("auto_update started", res.get("latest"))
 
 
 def report_restart():
@@ -590,22 +515,8 @@ def phone_of(chat_jid):
 
 
 def notify(title, body):
-    """Windows toast notification (works without WhatsApp). In the container: the log (Uptime Kuma watches the
-    container's health check instead)."""
-    if CONTAINER or os.name != "nt":
-        log(f"ALERT: {title} — {body}")
-        return
-    ps = ("[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;"
-          "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
-          "$x=$t.GetElementsByTagName('text');"
-          f"$x.Item(0).AppendChild($t.CreateTextNode('{title}'))>$null; $x.Item(1).AppendChild($t.CreateTextNode('{body}'))>$null;"
-          "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
-          "'{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($t))")
-    try:
-        subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps], capture_output=True, timeout=30)
-    except Exception as e:
-        log("notify failed", e)
-    log("notify:", title, body)
+    """An alert that does not depend on WhatsApp: the log (the container's health check turns unhealthy as well)."""
+    log(f"ALERT: {title} — {body}")
 
 
 # ---------- transcription ----------
@@ -645,23 +556,6 @@ def voice_enabled():
     return _voice_ok
 
 
-def _cuda_dll_dirs():
-    """Windows: the CUDA libraries from the pip wheels (nvidia-cublas-cu12, nvidia-cudnn-cu12 — the `gpu` extra) live in
-    site-packages/nvidia/*/bin, which is not on the DLL search path. Add them so ctranslate2 finds cuBLAS / cuDNN."""
-    if os.name != "nt":
-        return
-    try:
-        import nvidia  # namespace package of the nvidia-* wheels
-    except ImportError:
-        return
-    for base in getattr(nvidia, "__path__", []):
-        for sub in os.listdir(base):
-            b = os.path.join(base, sub, "bin")
-            if os.path.isdir(b):
-                os.add_dll_directory(b)
-                os.environ["PATH"] = b + os.pathsep + os.environ.get("PATH", "")
-
-
 def _load_whisper():
     """config whisper_device: "auto" (default — the GPU when CUDA works, else the CPU), "cuda" or "cpu".
     GPU = float16 (an RTX card transcribes a minute of speech in about a second); CPU = int8."""
@@ -670,7 +564,6 @@ def _load_whisper():
     name = CFG["whisper_model"]
     if want in ("auto", "cuda"):
         try:
-            _cuda_dll_dirs()
             import ctranslate2
             if ctranslate2.get_cuda_device_count() > 0:
                 m = WhisperModel(name, device="cuda", compute_type=CFG.get("whisper_compute_type") or "float16")
@@ -1071,17 +964,11 @@ def _kill_tree(proc):
     """Kill Claude and everything it started (MCP servers, shells): a bare kill leaves children holding the pipe open."""
     if proc.poll() is not None:
         return
-    if os.name == "nt":
-        try:
-            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=30)
-        except Exception as e:
-            log("taskkill failed", e)
-    else:  # Claude runs in its own process group (start_new_session): end the whole group
-        import signal
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            pass
+    import signal  # Claude runs in its own process group (start_new_session): end the whole group
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        pass
     try:
         proc.kill()
     except Exception:
@@ -1132,15 +1019,7 @@ def readonly_mcp_config():
 
 
 def claude_exe():
-    """The claude executable — also where installers put it when PATH (e.g. of a Task Scheduler start) lacks it."""
-    found = shutil.which("claude")
-    if found:
-        return found
-    for p in (os.path.expanduser("~/.local/bin/claude.exe"), os.path.join(os.environ.get("APPDATA", ""), "npm", "claude.cmd"),
-              os.path.expanduser("~/.claude/local/claude.exe")):
-        if os.path.isfile(p):
-            return p
-    return "claude"
+    return shutil.which("claude") or "claude"
 
 
 def claude_cmd(model, resume, append=None, tools=None, max_budget=None):
@@ -1179,7 +1058,7 @@ def _run_claude(prompt, model, resume, timeout, on_stage=None, append=None, chat
         stoppable = on_stage is not None  # only the owner's interactive runs; plugin / hand-off runs never eat a stop request
     t0 = time.time()
     proc = subprocess.Popen(cmd, cwd=HOME, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, encoding="utf-8", errors="replace", start_new_session=os.name != "nt")
+                            text=True, encoding="utf-8", errors="replace", start_new_session=True)
     errbuf = []
 
     def read_err():  # stderr carries the sign-in expiry warning and limit / login errors
@@ -2013,82 +1892,6 @@ def command_worker():
         _command_signal.clear()
 
 
-# ---------- the other machine: one ssh tunnel both ways (its dashboard here, ours there) ----------
-
-def peer_port(peer):
-    """Local port of a peer's dashboard URL (default 8781)."""
-    m = re.search(r":(\d+)", str(peer.get("url") or "").split("//")[-1])
-    return int(m.group(1)) if m else 8781
-
-
-def tunnel_cmd(peer, ssh="ssh"):
-    """ssh -L <port>→the peer's dashboard, -R <port>→ours, so each machine reaches the other on 127.0.0.1:<port>."""
-    port = peer_port(peer)
-    return [ssh, "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=15",
-            "-L", f"{port}:127.0.0.1:8770", "-R", f"{port}:127.0.0.1:8770", str(peer["tunnel"])]
-
-
-def _kill_old_tunnels():
-    """An ssh left over from a previous agent still holds the ports: stop it (only our tunnels, matched by the forward)."""
-    ps = ("Get-CimInstance Win32_Process -Filter \"Name='ssh.exe'\" | Where-Object { $_.CommandLine -like '*127.0.0.1:8770*' -and "
-          "$_.CommandLine -like '* -N *' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }")
-    try:
-        subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps], capture_output=True, timeout=30, creationflags=NO_WINDOW)
-    except Exception as e:
-        log("old tunnels", e)
-
-
-def tunnel_keeper():
-    """Keeps one ssh tunnel per peer that has "tunnel" (restart with backoff; kv tunnel_off:<name> = switched off from the
-    dashboard). State for the dashboard in kv tunnel:<name>."""
-    peers = [p for p in CFG.get("peers") or [] if p.get("tunnel")]
-    if not peers:
-        return
-    ssh = shutil.which("ssh") or r"C:\Windows\System32\OpenSSH\ssh.exe"
-    _kill_old_tunnels()
-    procs, wait, next_try = {}, {}, {}
-    while True:
-        for p in peers:
-            name = p.get("name") or p["tunnel"]
-            proc = procs.get(name)
-            off = kv_get(f"tunnel_off:{name}") == "1"
-            if off:
-                if proc and proc.poll() is None:
-                    _kill_tree(proc)
-                procs[name] = None
-                kv_set(f"tunnel:{name}", json.dumps({"state": "off", "at": dt.datetime.now().isoformat(timespec="seconds")}))
-                continue
-            if proc and proc.poll() is None:
-                continue
-            if proc is not None:  # it died
-                err = ""
-                try:
-                    err = (proc.stderr.read() or b"").decode("utf-8", "replace")[-200:]
-                except Exception:
-                    pass
-                wait[name] = min(120, max(5, wait.get(name, 5) * 2))
-                next_try[name] = time.time() + wait[name]
-                kv_set(f"tunnel:{name}", json.dumps({"state": "down", "error": err.strip(), "retry_in": wait[name],
-                                                     "at": dt.datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False))
-                procs[name] = None
-                log("tunnel down", name, err.strip()[:120])
-                continue
-            if time.time() < next_try.get(name, 0):
-                continue
-            try:
-                procs[name] = subprocess.Popen(tunnel_cmd(p, ssh), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                               stderr=subprocess.PIPE, creationflags=NO_WINDOW)
-                kv_set(f"tunnel:{name}", json.dumps({"state": "up", "since": dt.datetime.now().isoformat(timespec="seconds")}))
-                wait[name] = 5 if wait.get(name, 5) <= 5 else wait[name]
-            except Exception as e:
-                kv_set(f"tunnel:{name}", json.dumps({"state": "down", "error": str(e)[:200]}, ensure_ascii=False))
-                next_try[name] = time.time() + 60
-        for name, proc in procs.items():  # a tunnel that stayed up a minute resets the backoff
-            if proc and proc.poll() is None:
-                wait[name] = 5
-        time.sleep(10)
-
 
 # ---------- backup ----------
 
@@ -2131,24 +1934,6 @@ def backup():
 
 # ---------- updates ----------
 
-def update_check():
-    """Daily: tell the owner once about each new release (they decide when to update)."""
-    if CONTAINER or not CFG.get("update_check", True):
-        return
-    out = subprocess.run([shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe"), "run", "-q", "--no-project", "python", "-X", "utf8",
-                          os.path.join(ROOT, "tools", "update.py"), "--check"], capture_output=True, text=True, encoding="utf-8", timeout=120)
-    try:
-        res = json.loads(out.stdout.strip().splitlines()[-1])
-    except Exception:
-        return
-    if "error" in res:
-        return
-    write_json(os.path.join(HERE, "update_check.json"), res)
-    if res.get("available") and kv_get("update_notified") != res["latest"]:
-        kv_set("update_notified", res["latest"])
-        reply(T["update"].format(latest=res["latest"], current=res["current"], notes=(res.get("notes") or "")[:800]))
-
-
 def group_check():
     """Daily: ask WhatsApp for each connected group's current name, compare with the bridge's stored name,
     let the bridge heal the stored name, and tell the owner only if something was wrong or changed."""
@@ -2179,7 +1964,7 @@ def group_check():
 #   agent.background(fn)                         long-running thread
 #   agent.manual(name, fn)                       `agent.py <name>` on the command line
 
-_hooks, _periodic, _daily, _threads, _manual = [], [], [], [], {"backup": backup, "update_check": update_check, "group_check": group_check}
+_hooks, _periodic, _daily, _threads, _manual = [], [], [], [], {"backup": backup, "group_check": group_check}
 on_message = _hooks.append
 background = _threads.append
 every = lambda minutes, key, fn: _periodic.append((minutes, key, fn))
@@ -2651,31 +2436,6 @@ def signin_check():
             _ctx.chat = None
 
 
-def nightly_selftest():
-    """tools/selftest.py --quiet every night (no test messages, no end-to-end step — that one fails when the agent is
-    busy); the owner hears about it only when something failed."""
-    script = os.path.join(ROOT, "tools", "selftest.py")
-    if CONTAINER or not os.path.exists(script):  # the self-test checks the Windows installation (tasks, exe, ...)
-        return
-    try:
-        p = subprocess.run([sys.executable, "-X", "utf8", script, "--quiet"], cwd=ROOT, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=900)
-        res = json.load(open(os.path.join(HERE, "selftest.json"), encoding="utf-8"))
-        failed = [r for r in res if not r.get("ok")]
-        if p.returncode not in (0, None) and not failed and not res:
-            failed = [{"name": "selftest", "detail": (p.stderr or p.stdout)[-200:]}]
-    except Exception as e:
-        failed = [{"name": "selftest", "detail": str(e)[:200]}]
-    kv_set("selftest_last", json.dumps({"at": dt.datetime.now().isoformat(timespec="seconds"), "failed": len(failed)}))
-    if failed:
-        _ctx.chat = PRIMARY
-        try:
-            reply(("🧪 בדיקה לילית: נכשלו " if LANG == "he" else "🧪 Nightly self-test: failed ") + f"{len(failed)}:" +
-                  "".join(f"\n• {r.get('name')} — {str(r.get('detail', ''))[:120]}" for r in failed[:10]))
-        finally:
-            _ctx.chat = None
-
-
 def _contact_names():
     names = {}
     try:
@@ -2766,12 +2526,10 @@ def scheduler():
         today = now.date().isoformat()
         try:
             kv_set("heartbeat", now.isoformat())
-            daily = [(CFG["backup_time"], "backup", backup), (CFG.get("update_check_time", "09:00"), "update_check", update_check),
+            daily = [(CFG["backup_time"], "backup", backup),
                      (CFG.get("group_check_time", "10:00"), "group_check", group_check),
-                     (CFG.get("selftest_time", "04:30"), "selftest", nightly_selftest),
                      (CFG.get("morning_summary_time", "07:30"), "morning_summary", morning_summary),
-                     (CFG.get("signin_check_time", "09:30"), "signin_check", signin_check),
-                     (CFG.get("auto_update_time", "23:50"), "auto_update", auto_update)]
+                     (CFG.get("signin_check_time", "09:30"), "signin_check", signin_check)]
             for at, key, fn in daily + _daily:
                 if now.strftime("%H:%M") >= at and kv_get(f"day:{key}") != today:
                     kv_set(f"day:{key}", today)
@@ -2802,7 +2560,6 @@ if __name__ == "__main__":
     if os.path.exists(RESTART_FILE):  # a request left over from before this start is already fulfilled
         os.remove(RESTART_FILE)
     threading.Thread(target=report_restart, daemon=True).start()
-    threading.Thread(target=report_auto_update, daemon=True).start()
     try:
         cut = mark_interrupted()  # synchronous, before the dispatcher can mark anything 'running'
         if cut:
@@ -2812,9 +2569,6 @@ if __name__ == "__main__":
         log("mark_interrupted failed", traceback.format_exc())
     # backfill on its own thread: the whisper lock interleaves it with live notes instead of queueing them behind it
     for target in [worker, slow_worker, voice_worker, transcribe_requests_loop, backfill_transcripts, whisper_reaper, command_worker,
-                   scheduler, event_listener, watchdog, tunnel_keeper] + _threads:
+                   scheduler, event_listener, watchdog] + _threads:
         threading.Thread(target=target, daemon=True).start()
-    sys.path.insert(0, ROOT)
-    from dash import server as dash_server  # control panel, also on http://127.0.0.1:8770
-    threading.Thread(target=dash_server.serve, args=(8770,), daemon=True).start()
     sweep_loop()

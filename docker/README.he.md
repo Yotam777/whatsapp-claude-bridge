@@ -19,24 +19,10 @@ claude setup-token
 ```
 זה מדפיס טוקן ארוך שמחובר למנוי שלך. שמור אותו לשלב 5.
 
-## 3. ייצוא מהמחשב
-ב-PowerShell:
-```
-cd ~\whatsapp-claude-bridge
-git pull
-powershell -ExecutionPolicy Bypass -File tools\export_for_server.ps1
-```
-הסקריפט **עוצר את השירות במחשב** ויוצר קובץ `whatsapp-claude-export.zip` על שולחן העבודה.
-מהרגע הזה השירות לא רץ במחשב. שני עותקים של אותו סשן ווצאפ מתנגשים, ולכן אסור שירוצו יחד.
-
-## 4. dataset בשרת
-1. ב-TrueNAS: **Datasets ← Yotam-Storage ← Add Dataset**, ושם `whatsapp-claude`.
-2. העתק לשם את **התוכן** של ה-zip, כך שבתוך ה-dataset תהיה תיקייה בשם `app`:
-   ```
-   /mnt/Yotam-Storage/whatsapp-claude/app/whatsapp-bridge/store/...
-   /mnt/Yotam-Storage/whatsapp-claude/app/agent/config.json ...
-   ```
-   אפשר דרך שיתוף SMB, או ב-Shell של TrueNAS: `unzip whatsapp-claude-export.zip -d /mnt/Yotam-Storage/whatsapp-claude`
+## 3–4. dataset בשרת
+ב-TrueNAS: **Datasets ← Yotam-Storage ← Add Dataset**, ושם `whatsapp-claude`. ההרשאות: root בלבד (`chmod 700`).
+בהתקנה חדשה ה-dataset ריק. האפליקציה מעתיקה לתוכו את הקוד ומחכה ל-`app/agent/config.json`:
+מעתיקים לשם את `agent/config.readonly.example.json` בשם `config.json`, ובהפעלה הראשונה סורקים QR מה-Logs.
 
 ## 5. התקנת האפליקציה
 1. **Apps ← Discover Apps ← ⋮ ← Install via YAML**, ושם `whatsapp-claude`.
@@ -56,6 +42,7 @@ powershell -ExecutionPolicy Bypass -File tools\export_for_server.ps1
 אחרי שאני דוחף שינוי, GitHub בונה image חדש בתוך 5–10 דקות. ב-TrueNAS: **Apps ← whatsapp-claude ← Update**,
 או **Stop** ואחר כך **Start** (`pull_policy: always` מושך את הגרסה החדשה). ההגדרות והמידע ב-dataset לא משתנים.
 
-## חזרה למחשב (אם צריך)
-עצור את האפליקציה ב-TrueNAS, העתק את `app/whatsapp-bridge/store` ואת `app/agent/agent.db*` חזרה למחשב, ואז ב-PowerShell:
-`Enable-ScheduledTask 'WhatsApp bridge'; Enable-ScheduledTask 'WhatsApp agent'`
+## נקודות שחזור
+- **הקוד:** כל בנייה נשמרת ב-image עם תג משלה, `ghcr.io/yotam777/whatsapp-claude-bridge:sha-<commit>`. הגרסה שרצה לפני העדכון האחרון נשמרת גם בתג `:previous`.
+  כדי לחזור לגרסה קודמת, מחליפים ב-YAML של האפליקציה את `:latest` בתג הרצוי.
+- **המידע:** Snapshots של ה-dataset ב-TrueNAS (**Datasets ← whatsapp-claude ← Snapshots**).

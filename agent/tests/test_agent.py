@@ -589,33 +589,6 @@ def test_tts_text_cleaning(agent):
     assert len(c) < 900 and c.endswith("ההמשך בהודעה הכתובה.")
 
 
-def test_auto_update_is_scheduled_and_reports(agent, monkeypatch, tmp_path):
-    mod, _ = agent
-    calls = []
-    monkeypatch.setattr(mod, "reply", lambda t, *a, **k: calls.append(t))
-    monkeypatch.setattr(mod, "wait_bridge", lambda *a, **k: True)
-    monkeypatch.setattr(mod, "HERE", str(tmp_path))  # never touch the real update.log
-    mod.report_auto_update()
-    assert calls == [], "nothing pending -> silent"
-    mod.kv_set("auto_update_pending", '{"from": "1.0.8", "to": "1.0.9"}')
-    (tmp_path / "update.log").write_text("[x] \u05de\u05e2\u05d3\u05db\u05df 1.0.8 v1.0.9\n[x] ok 1.0.9\n", encoding="utf-8")
-    mod.report_auto_update()
-    assert calls and "עודכן אוטומטית" in calls[-1]
-    assert mod.kv_get("auto_update_pending") == ""
-    mod.kv_set("auto_update_pending", '{"from": "1.0.8", "to": "1.0.9"}')
-    (tmp_path / "update.log").write_text("[x] \u05de\u05e2\u05d3\u05db\u05df 1.0.8 v1.0.9\n[x] \u21a9 back 1.0.8\n", encoding="utf-8")
-    mod.report_auto_update()
-    assert "נכשל" in calls[-1]
-
-
-def test_tunnel_command_both_ways(agent):
-    mod, _ = agent
-    cmd = mod.tunnel_cmd({"name": "נייח", "url": "http://127.0.0.1:8781", "tunnel": "ybhw"}, ssh="ssh")
-    assert cmd[0] == "ssh" and cmd[-1] == "ybhw" and "-N" in cmd and "BatchMode=yes" in cmd
-    assert cmd[cmd.index("-L") + 1] == "8781:127.0.0.1:8770" and cmd[cmd.index("-R") + 1] == "8781:127.0.0.1:8770"
-    assert mod.peer_port({"url": "http://127.0.0.1:9001"}) == 9001 and mod.peer_port({}) == 8781
-
-
 def test_paused_conversation_keeps_commands_queued(agent, monkeypatch):
     mod, _ = agent
     notes = []

@@ -17,6 +17,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # ---- tests first: a broken commit never becomes :latest ----
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: whatsapp-bridge/go.mod
+          cache-dependency-path: whatsapp-bridge/go.sum
+      - name: Bridge — vet + tests
+        working-directory: whatsapp-bridge
+        run: go vet ./... && go test ./...
+      - uses: astral-sh/setup-uv@v6
+      - name: Agent — unit tests
+        working-directory: agent
+        run: uv run --frozen --group dev pytest -q -p no:cacheprovider tests
+      # ---- the image ----
       - uses: docker/setup-buildx-action@v3
       - name: Image name
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"

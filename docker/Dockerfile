@@ -29,7 +29,7 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 COPY agent/pyproject.toml agent/uv.lock /tmp/agent/
 COPY whatsapp-mcp-server/pyproject.toml whatsapp-mcp-server/uv.lock /tmp/mcp/
 RUN uv venv /opt/agent-venv --python /usr/local/bin/python3 \
-    && (cd /tmp/agent && uv export --frozen --no-hashes --no-emit-project --extra voice --extra plugins -o req.txt) \
+    && (cd /tmp/agent && uv export --frozen --no-hashes --no-emit-project --extra voice -o req.txt) \
     && uv pip install --python /opt/agent-venv/bin/python -r /tmp/agent/req.txt \
        nvidia-cublas-cu12 "nvidia-cudnn-cu12>=9,<10" \
     && uv venv /opt/mcp-venv --python /usr/local/bin/python3 \

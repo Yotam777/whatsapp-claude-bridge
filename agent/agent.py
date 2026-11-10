@@ -12,7 +12,6 @@ Runs as one background process in the Docker container (docker/start.sh restarts
   * Claude usage limit: commands wait and run by themselves after the reset; sign-in expiry warning.
   * after a WhatsApp outage: why / how long, and the owner's missed messages are taken in.
   * reply to a draft card with a time = scheduled send; morning summary; voice answers to voice notes.
-  * project-specific behaviour lives in plugins (config "plugins"), not here.
 """
 import datetime as dt
 import importlib.util
@@ -143,7 +142,6 @@ def _create_schema(db):
             status TEXT DEFAULT 'pending', answered TEXT);
         CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT DEFAULT 'time', text TEXT,
             due TEXT, chat_jid TEXT, ref_ts TEXT, status TEXT DEFAULT 'active', created TEXT, fired TEXT);
-        CREATE TABLE IF NOT EXISTS local_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, chat TEXT, at TEXT, role TEXT, text TEXT, files TEXT);
         CREATE TABLE IF NOT EXISTS transcribe_requests (id TEXT, chat_jid TEXT, at TEXT, status TEXT DEFAULT 'pending',
             PRIMARY KEY (id, chat_jid));
         CREATE TABLE IF NOT EXISTS scheduled_drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id INTEGER, send_at TEXT,
@@ -347,8 +345,6 @@ def restart_now(reason):
     os._exit(0)
 
 
-
-
 def report_restart():
     """After a requested restart: confirm in the group with the settings actually loaded."""
     raw = kv_get("restart_pending")
@@ -367,37 +363,16 @@ def report_restart():
           + (f"\nסיבה: {info['reason']}" if info.get("reason") else ""))
 
 
-# ---------- conversations: the primary control group, extra groups (groups.json) and the dashboard's local chat ----------
-GROUPS_FILE = os.path.join(HERE, "groups.json")
-GROUPS_DIR = os.path.join(HOME, "groups")
+# ---------- the conversation: the owner's control group ----------
 INBOX = os.path.join(HOME, "inbox")
-LOCAL_FILES = os.path.join(HOME, "local_files")
 STOP_FILE = os.path.join(HERE, "stop.request")
 PRIMARY = CFG["claude_group"]
-LOCAL = "local"
 _ctx = threading.local()  # the conversation the command worker is answering right now (chat, src, sync)
-_groups_last = None  # last groups.json that parsed (used if the file is caught mid-write)
 
 
 def load_groups():
-    """jid -> {name, purpose, instructions, budget_usd, ...} for every conversation Claude answers in. Re-read on every use,
-    so a group connected from the dashboard works without a restart."""
-    global _groups_last
-    try:
-        with open(GROUPS_FILE, encoding="utf-8") as f:
-            raw = json.load(f)
-        _groups_last = raw
-    except FileNotFoundError:
-        raw = {}
-    except Exception as e:  # half-written / broken file: keep the last good copy instead of dropping the extra groups
-        log("groups.json unreadable, using the last good copy:", e)
-        raw = _groups_last or {}
-    g = {PRIMARY: {"name": "4M", "purpose": "4m", **(raw.get(PRIMARY) or {})}}
-    for jid, v in raw.items():
-        if jid not in g and jid != LOCAL and v.get("enabled", True):
-            g[jid] = dict(v)
-    g[LOCAL] = {"name": "שיחה מקומית", "purpose": "local", **(raw.get(LOCAL) or {})}
-    return g
+    """The conversations Claude answers in: only the owner's control group."""
+    return {PRIMARY: {"name": "Claude", "purpose": "control"}}
 
 
 def K(name, chat=None):
@@ -449,31 +424,15 @@ def italic(text):
     return "\n".join(out)
 
 
-def pc_only():
-    """True while answering a message that came from the dashboard and must not be posted to WhatsApp (local chat, or sync off)."""
-    return cur_chat() == LOCAL or (getattr(_ctx, "src", "wa") == "pc" and not getattr(_ctx, "sync", 0))
-
-
-def local_say(chat, role, text, files=None):
-    with adb() as db:
-        db.execute("INSERT INTO local_messages (chat, at, role, text, files) VALUES (?, ?, ?, ?, ?)",
-                   (chat, dt.datetime.now().isoformat(timespec="seconds"), role, text, json.dumps(files or [], ensure_ascii=False)))
-
-
 def reply(text, quoted=None):
     chat = cur_chat()
     if chat == PRIMARY:
         kv_set("last_tool_msg", json.dumps({"ts": dt.datetime.now().isoformat(timespec="seconds"), "text": text.strip()[:300]}, ensure_ascii=False))
-    if pc_only():  # answer shown in the dashboard chat only
-        local_say(chat, "tool", text.strip())
-        return
     body = italic(text.strip()) if CFG.get("reply_italic", True) else text.strip()
     send(chat, CFG["reply_prefix"] + body, quoted=quoted)
 
 
 def react(msg_id, emoji):
-    if pc_only() or getattr(_ctx, "src", "wa") == "pc":
-        return
     try:
         bridge("/react", {"chat_jid": cur_chat(), "message_id": msg_id, "sender": "", "emoji": emoji}, timeout=20)
     except Exception as e:
@@ -1400,7 +1359,7 @@ def enqueue_command(msg_id, text, when, chat=None):
 
 
 def send_outbox(since):
-    """Files Claude saved in home/outbox during the answer are sent to the owner (WhatsApp, or shown in the dashboard chat), then archived."""
+    """Files Claude saved in home/outbox during the answer are sent to the owner, then archived."""
     if not os.path.isdir(OUTBOX):
         return
     done = os.path.join(OUTBOX, "sent")
@@ -1409,12 +1368,7 @@ def send_outbox(since):
         p = os.path.join(OUTBOX, f)
         if os.path.isfile(p) and os.path.getmtime(p) >= since - 5:
             stamp = f"{dt.datetime.now():%Y%m%d_%H%M%S}_{f}"
-            if pc_only():
-                os.makedirs(LOCAL_FILES, exist_ok=True)
-                shutil.copy(p, os.path.join(LOCAL_FILES, stamp))
-                local_say(cur_chat(), "tool", "📎 " + f, [stamp])
-            else:
-                send(cur_chat(), CFG["reply_prefix"] + "📎 " + f, media=p)
+            send(cur_chat(), CFG["reply_prefix"] + "📎 " + f, media=p)
             shutil.move(p, os.path.join(done, stamp))
 
 
@@ -1622,19 +1576,6 @@ def owner_command(text, chat=None):
     return f"✅ המודל הוחלף ל-*{MODELS[name]['he']}*{' לשעה' if hours else ''} ({MODELS[name]['cost']}). חזרה לאוטו: /מודל אוטו"
 
 
-T_BACK_HE = ("[המשך מהנייד: ההודעות האחרונות בשיחה הזו נכתבו בלוח הבקרה במחשב ולא הופיעו בקבוצה בווצאפ. "
-             "המשך מאותה נקודה כאילו זו אותה שיחה; אם התשובה נשענת על מה שנעשה במחשב, פתח בשורה קצרה שמסכמת אותו כדי שהקבוצה תבין.]\n")
-T_BACK_EN = ("[Continued from the phone: the latest turns of this conversation were typed in the PC dashboard and never appeared in the "
-             "WhatsApp group. Continue from the same point; if the answer relies on that PC work, open with one short line recapping it.]\n")
-
-
-def came_back_from_pc(chat, cid):
-    """True when the previous command in this conversation was a PC-only one (dashboard, WhatsApp sync off): the phone
-    message continues that same session, and the WhatsApp group hasn't seen those turns."""
-    with adb() as db:
-        prev = db.execute("SELECT source, sync FROM commands WHERE chat_jid = ? AND id < ? AND status = 'done' ORDER BY id DESC LIMIT 1",
-                          (chat, cid)).fetchone()
-    return bool(prev) and prev[0] == "pc" and not prev[1]
 
 
 INTERRUPTED_HE = "⚠️ הפקודה נקטעה בהפעלה מחדש — שלח שוב אם צריך"
@@ -1652,7 +1593,7 @@ def mark_interrupted():
 
 def notify_interrupted(rows):
     """Tell the owner, in each conversation, that a command was cut off (waits for the bridge; runs in its own thread)."""
-    if rows and not pc_rows_only(rows):
+    if rows:
         wait_bridge(300)
     for cid, mid, chat, src, sync in rows:
         _ctx.chat, _ctx.src, _ctx.sync = chat or PRIMARY, src or "wa", sync or 0
@@ -1662,10 +1603,6 @@ def notify_interrupted(rows):
             log("interrupted notice failed", cid, e)
         finally:
             _ctx.chat = None
-
-
-def pc_rows_only(rows):
-    return all((src or "wa") == "pc" and not sync or (chat == LOCAL) for _, _, chat, src, sync in rows)
 
 
 def claim_next(chat):
@@ -1741,22 +1678,12 @@ def run_command(row):
         if spent >= budget * 0.8 and kv_get(K("budget_warned", chat)) != dt.date.today().isoformat():
             kv_set(K("budget_warned", chat), dt.date.today().isoformat())
             reply(T["budget_warn"].format(spent=spent, budget=budget))
-        gname = g.get("name") or ""
-        if chat == PRIMARY and src == "wa":
-            where, dest = ("בקבוצת הבקרה בווצאפ", "לקבוצה") if LANG == "he" else ("in the WhatsApp control group", "to the group")
-        elif pc_only():
-            where, dest = (f'מהמחשב (לוח הבקרה, "{gname}")', "לחלון השיחה בלוח הבקרה") if LANG == "he" else (f'from the PC (dashboard, "{gname}")', "to the dashboard chat")
-        elif src == "pc":
-            where, dest = (f'מהמחשב (לוח הבקרה) לקבוצה "{gname}"', "גם לקבוצה בווצאפ") if LANG == "he" else (f'from the PC (dashboard) for group "{gname}"', "to the WhatsApp group too")
-        else:
-            where, dest = (f'בקבוצה "{gname}" בווצאפ', "לקבוצה") if LANG == "he" else (f'in the WhatsApp group "{gname}"', "to the group")
+        where, dest = ("בקבוצת הבקרה בווצאפ", "לקבוצה") if LANG == "he" else ("in the WhatsApp control group", "to the group")
         prompt = T["prompt_ro" if readonly() else "prompt"].format(owner=OWNER, when=when, text=text.lstrip("!").strip(), where=where, dest=dest)
-        if src == "wa" and came_back_from_pc(chat, cid):
-            prompt = (T_BACK_HE if LANG == "he" else T_BACK_EN) + prompt
         model, how = pick_model_info(text, chat)
         _ctx.auto_pick = how == "auto"
         started = time.time()
-        status = StatusMsg(model, chat, wa=not pc_only())
+        status = StatusMsg(model, chat)
         try:
             answer = claude(prompt, model=model, session=not CFG.get("fresh_sessions"), on_stage=status.set_stage, chat=chat,
                             raw=raw_text(text.lstrip("!")))
@@ -1780,7 +1707,7 @@ def run_command(row):
                     if LANG == "he" else "\n\n💡 For deep analysis start the message with !! (strongest model for one message).")
         reply(out, quoted=mid if (CFG.get("quote_replies", True) and src == "wa") else None)
         send_outbox(started)
-        if answer and not stopped and text.startswith(T["voice"]) and src == "wa" and not pc_only():
+        if answer and not stopped and text.startswith(T["voice"]) and src == "wa":
             voice_reply(chat, out)
         react(mid, "✅")
     except Exception:
@@ -1898,29 +1825,6 @@ def conversation_worker(chat):
         _command_signal.set()
 
 
-PAUSE_NOTE_HE = "⏸ ההאזנה מושהית מלוח הבקרה — ההודעה נשמרה ותטופל כשתחודש."
-PAUSE_NOTE_EN = "⏸ Listening is paused from the dashboard — your message is kept and will be handled on resume."
-
-
-def listening_paused(chat):
-    """The owner paused listening in the dashboard: everywhere (kv listen_paused) or in one conversation
-    (kv listen_paused:<chat>). Value = when it was paused ('' = not paused). Commands stay queued, nothing is lost."""
-    return kv_get("listen_paused") or kv_get(K("listen_paused", chat)) or ""
-
-
-def pause_notice(chat, since):
-    """One short note per conversation per pause, so the owner knows why there is no answer yet."""
-    key = K("pause_notice", chat)
-    if kv_get(key) == since:
-        return
-    kv_set(key, since)
-    _ctx.chat, _ctx.src, _ctx.sync = chat, "wa", 0
-    try:
-        reply(PAUSE_NOTE_HE if LANG == "he" else PAUSE_NOTE_EN)
-    except Exception as e:
-        log("pause notice failed", chat, e)
-    finally:
-        _ctx.chat = None
 
 
 def command_worker():
@@ -1946,10 +1850,6 @@ def command_worker():
                 with adb() as db:
                     chats = [r[0] for r in db.execute("SELECT DISTINCT coalesce(chat_jid, ?) FROM commands WHERE status = 'pending'", (PRIMARY,))]
                 for chat in chats:
-                    paused = listening_paused(chat)
-                    if paused:
-                        pause_notice(chat, paused)
-                        continue
                     with _workers_lock:
                         if chat in _workers:
                             continue
@@ -1957,9 +1857,8 @@ def command_worker():
                     threading.Thread(target=conversation_worker, args=(chat,), daemon=True, name=f"conv:{chat}").start()
         except Exception:
             log("dispatcher error", traceback.format_exc())
-        _command_signal.wait(3)  # short: the dashboard (a separate process) queues PC messages straight into the table
+        _command_signal.wait(3)
         _command_signal.clear()
-
 
 
 # ---------- backup ----------
@@ -2001,14 +1900,12 @@ def backup():
     log(f"backup done: dbs -> {day}, media checked {fetched}/{len(todo)}, new files copied {copied}")
 
 
-# ---------- updates ----------
+# ---------- daily check of the control group ----------
 
 def group_check():
-    """Daily: ask WhatsApp for each connected group's current name, compare with the bridge's stored name,
+    """Daily: ask WhatsApp for the control group's current name, compare with the bridge's stored name,
     let the bridge heal the stored name, and tell the owner only if something was wrong or changed."""
     for jid, g in load_groups().items():
-        if jid == LOCAL:
-            continue
         try:
             res = bridge("/group_info", {"jid": jid}, timeout=60)
         except Exception as e:
@@ -2025,39 +1922,14 @@ def group_check():
             reply(f"שם הקבוצה השתנה ל-\"{name}\". עדכנתי את הגשר (היה רשום \"{stored}\"). המזהה לא השתנה, והחיבור תקין.")
 
 
-# ---------- plugins ----------
-# A plugin is a Python file with setup(agent). It may register:
-#   agent.on_message(fn(row))                    called for every new message (row as in sweep())
-#   agent.every(minutes, key, fn)                periodic job
-#   agent.daily("HH:MM", key, fn)                once a day at/after that time
-#   agent.background(fn)                         long-running thread
-#   agent.manual(name, fn)                       `agent.py <name>` on the command line
-
-_hooks, _periodic, _daily, _threads, _manual = [], [], [], [], {"backup": backup, "group_check": group_check}
-on_message = _hooks.append
-background = _threads.append
-every = lambda minutes, key, fn: _periodic.append((minutes, key, fn))
-daily = lambda at, key, fn: _daily.append((at, key, fn))
-manual = lambda name, fn: _manual.__setitem__(name, fn)
-
-
-def load_plugins():
-    for path in CFG.get("plugins", []):
-        try:
-            spec = importlib.util.spec_from_file_location(os.path.splitext(os.path.basename(path))[0], path)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            mod.setup(sys.modules[__name__])
-            log("plugin loaded:", path)
-        except Exception:
-            log("plugin failed:", path, traceback.format_exc())
+_manual = {"backup": backup, "group_check": group_check}  # `agent.py <name>` on the command line
 
 
 # ---------- message intake ----------
 
 work = queue.Queue()  # the owner's intake (voice / files) and reminders: must never wait behind slow jobs
 voice_q = queue.Queue()  # other people's voice notes: their own queue, so a backup or a check never delays a transcript
-slow = queue.Queue()  # slow jobs: backup, update / group checks, plugin jobs
+slow = queue.Queue()  # slow jobs: backup, the daily group check
 
 
 def worker(q=None):
@@ -2211,7 +2083,7 @@ def sent_special(mid):
 def handle(row):
     mid, cj, sender, ts, content, me, mtype = row
     content = (content or "").strip()
-    if cj != LOCAL and cj in load_groups() and me:  # the owner's own message in a connected group (others' messages stay plain information)
+    if cj in load_groups() and me:  # the owner's own message in a connected group (others' messages stay plain information)
         if content.startswith(CFG["reply_prefix"].strip()):
             return  # our own reply
         if sent_special(mid):
@@ -2254,11 +2126,6 @@ def handle(row):
         return
     if mtype == "audio" and CFG.get("transcribe_all_chats") and voice_enabled():
         voice_q.put(lambda: transcribe_and_post(cj, mid, sender, ts, me))
-    for hook in _hooks:
-        try:
-            hook(row)
-        except Exception:
-            log("plugin hook error", traceback.format_exc())
 
 
 _wake = threading.Event()
@@ -2292,7 +2159,7 @@ def sweep_once(cursor, on_row=None):
                 (on_row or handle)(r[1:])
             except Exception as e:  # never lose an owner message silently (it is already marked handled)
                 log("handle error", traceback.format_exc())
-                if r[6] and r[2] != LOCAL and r[2] in load_groups():
+                if r[6] and r[2] in load_groups():
                     intake_failed(r[2], r[1], e)
         cursor = r[0]
     if rows:
@@ -2337,7 +2204,7 @@ def disconnect_reason(since):
 
 def control_chats():
     """The WhatsApp conversations where the owner talks to Claude (primary control group + connected groups)."""
-    return [j for j in load_groups() if j != LOCAL]
+    return list(load_groups())
 
 
 def outage_window(down_since, now):
@@ -2599,30 +2466,24 @@ def scheduler():
                      (CFG.get("group_check_time", "10:00"), "group_check", group_check),
                      (CFG.get("morning_summary_time", "07:30"), "morning_summary", morning_summary),
                      (CFG.get("signin_check_time", "09:30"), "signin_check", signin_check)]
-            for at, key, fn in daily + _daily:
+            for at, key, fn in daily:
                 if now.strftime("%H:%M") >= at and kv_get(f"day:{key}") != today:
                     kv_set(f"day:{key}", today)
-                    slow.put(fn)  # backup / checks / plugin reports never delay the owner's voice notes or reminders
+                    slow.put(fn)  # backup / checks never delay the owner's voice notes or reminders
             if kv_get("at:reminders") != now.strftime("%Y%m%d%H%M"):
                 kv_set("at:reminders", now.strftime("%Y%m%d%H%M"))
                 work.put(reminders_check)
                 work.put(scheduled_check)
-            for minutes, key, fn in _periodic:
-                last = kv_get(f"at:{key}")
-                if not last or now - dt.datetime.fromisoformat(last) > dt.timedelta(minutes=minutes):
-                    kv_set(f"at:{key}", now.isoformat())
-                    slow.put(fn)  # plugin jobs (e.g. extracting requests with Claude) run off the owner's fast queue
         except Exception:
             log("scheduler error", traceback.format_exc())
         time.sleep(30)
 
 
 if __name__ == "__main__":
-    for d in (OUTBOX, GROUPS_DIR, INBOX, LOCAL_FILES):
+    for d in (OUTBOX, INBOX):
         os.makedirs(d, exist_ok=True)
     adb().close()
-    load_plugins()
-    if len(sys.argv) > 1:  # manual runs: agent.py backup | <plugin job>
+    if len(sys.argv) > 1:  # manual runs: agent.py backup | group_check
         _manual[sys.argv[1]]()
         sys.exit()
     log("agent starting")
@@ -2638,6 +2499,6 @@ if __name__ == "__main__":
         log("mark_interrupted failed", traceback.format_exc())
     # backfill on its own thread: the whisper lock interleaves it with live notes instead of queueing them behind it
     for target in [worker, slow_worker, voice_worker, transcribe_requests_loop, backfill_transcripts, whisper_reaper, command_worker,
-                   scheduler, event_listener, watchdog] + _threads:
+                   scheduler, event_listener, watchdog]:
         threading.Thread(target=target, daemon=True).start()
     sweep_loop()

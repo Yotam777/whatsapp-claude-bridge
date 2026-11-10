@@ -17,7 +17,6 @@
   "whisper_model": "ivrit-ai/whisper-large-v3-turbo-ct2",
   "whisper_language": "he",
   "log_max_mb": 5,
-  "plugins": [],
   "fresh_sessions": false,
   "strict_mcp": true,
   "reply_italic": true,

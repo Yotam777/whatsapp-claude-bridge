@@ -22,7 +22,7 @@ claude setup-token
 ## 3–4. dataset בשרת
 ב-TrueNAS: **Datasets ← Yotam-Storage ← Add Dataset**, ושם `whatsapp-claude`. ההרשאות: root בלבד (`chmod 700`).
 בהתקנה חדשה ה-dataset ריק. האפליקציה מעתיקה לתוכו את הקוד ומחכה ל-`app/agent/config.json`:
-מעתיקים לשם את `agent/config.readonly.example.json` בשם `config.json`, ובהפעלה הראשונה סורקים QR מה-Logs.
+מעתיקים לשם את `agent/config.example.json` בשם `config.json`, ובהפעלה הראשונה סורקים QR מה-Logs.
 
 ## 5. התקנת האפליקציה
 1. **Apps ← Discover Apps ← ⋮ ← Install via YAML**, ושם `whatsapp-claude`.

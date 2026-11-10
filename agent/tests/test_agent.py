@@ -342,48 +342,6 @@ def test_schedule_time_parsing(agent):
         assert mod.parse_send_time(no, now) is None, no
 
 
-def test_reply_to_card_schedules_and_sends(agent, monkeypatch):
-    mod, db = agent
-    db.execute("ALTER TABLE messages ADD COLUMN quoted_id TEXT")
-    db.execute("CREATE TABLE drafts (id INTEGER PRIMARY KEY, recipient TEXT, status TEXT, card_id TEXT)")
-    db.execute("INSERT INTO drafts VALUES (7, '972500000009@s.whatsapp.net', 'pending', 'CARD7')")
-    db.execute("INSERT INTO messages VALUES ('R1', ?, 'me', '20:00', '2026-11-08 13:00:00+02:00', 1, '', '', 'CARD7')", (mod.PRIMARY,))
-    db.commit()
-    sent, decided = [], []
-    monkeypatch.setattr(mod, "send", lambda chat, text, media=None, quoted=None: sent.append(text) or True)
-    monkeypatch.setattr(mod, "react", lambda *a: None)
-    monkeypatch.setattr(mod, "bridge", lambda path, body=None, **k: decided.append((path, body)) or {"success": True})
-    assert mod.schedule_from_reply(mod.PRIMARY, "R1", "20:00")
-    assert "טיוטה #7" in sent[-1]
-    with mod.adb() as a:
-        a.execute("UPDATE scheduled_drafts SET send_at = '2000-01-01T00:00:00'")
-    mod.scheduled_check()
-    assert decided == [("/draft_decide", {"id": 7, "approve": True})]
-    mod.scheduled_check()
-    assert len(decided) == 1, "a schedule fires once"
-    # cancel on a card whose schedule already fired: nothing to cancel -> ordinary message
-    assert not mod.schedule_from_reply(mod.PRIMARY, "R1", "בטל")
-    # not a reply to a card -> an ordinary message
-    db.execute("INSERT INTO messages VALUES ('R2', ?, 'me', '20:00', '2026-11-08 13:01:00+02:00', 1, '', '', NULL)", (mod.PRIMARY,))
-    db.commit()
-    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
-    assert not mod.schedule_from_reply(mod.PRIMARY, "R2", "20:00")
-
-
-def test_schedule_skips_a_draft_that_is_no_longer_pending(agent, monkeypatch):
-    mod, db = agent
-    db.execute("CREATE TABLE drafts (id INTEGER PRIMARY KEY, recipient TEXT, status TEXT, card_id TEXT)")
-    db.execute("INSERT INTO drafts VALUES (8, 'x', 'sent', 'CARD8')")
-    db.commit()
-    sent, decided = [], []
-    monkeypatch.setattr(mod, "send", lambda chat, text, media=None, quoted=None: sent.append(text) or True)
-    monkeypatch.setattr(mod, "bridge", lambda path, body=None, **k: decided.append(body) or {"success": True})
-    with mod.adb() as a:
-        a.execute("INSERT INTO scheduled_drafts (draft_id, send_at, chat) VALUES (8, '2000-01-01T00:00:00', ?)", (mod.PRIMARY,))
-    mod.scheduled_check()
-    assert not decided and "כבר לא ממתינה" in sent[-1]
-
-
 def test_morning_summary_extract(agent):
     mod, db = agent
     db.execute("CREATE TABLE IF NOT EXISTS chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP)")
@@ -416,16 +374,15 @@ def test_tts_text_cleaning(agent):
     assert len(c) < 900 and c.endswith("ההמשך בהודעה הכתובה.")
 
 
-def test_readonly_mode_command_line(agent, monkeypatch):
+def test_command_line_is_read_only(agent, monkeypatch):
     mod, _ = agent
-    monkeypatch.setitem(mod.CFG, "assistant_mode", "readonly")
     cmd = mod.claude_cmd("sonnet", "sid1", append="x")
     assert cmd[cmd.index("--permission-mode") + 1] == "dontAsk"
     tools = cmd[cmd.index("--tools") + 1].split(",")
     assert "Bash" not in tools and "Edit" not in tools and "Write" not in tools and "WebFetch" not in tools
     assert "--strict-mcp-config" in cmd
     mcp = json.loads(cmd[cmd.index("--mcp-config") + 1])["mcpServers"]["whatsapp"]
-    assert mcp["env"]["WA_MCP_READONLY"] == "1"
+    assert mcp["args"][-1].endswith("main.py")
     assert "Bash" in cmd[cmd.index("--disallowedTools") + 1]
     assert cmd[-2:] == ["--resume", "sid1"]
     # a restricted classification run stays restricted (no MCP at all)
@@ -433,17 +390,9 @@ def test_readonly_mode_command_line(agent, monkeypatch):
     assert r[r.index("--tools") + 1] == "" and "--mcp-config" not in r
 
 
-def test_full_mode_command_line_unchanged(agent, monkeypatch):
+def test_prompt_has_no_outbox(agent, monkeypatch):
     mod, _ = agent
-    monkeypatch.setitem(mod.CFG, "assistant_mode", "full")
-    cmd = mod.claude_cmd("sonnet", None)
-    assert cmd[cmd.index("--permission-mode") + 1] == mod.CFG.get("permission_mode", "auto")
-    assert "--mcp-config" not in cmd and "--tools" not in cmd
-
-
-def test_readonly_prompt_has_no_outbox(agent, monkeypatch):
-    mod, _ = agent
-    assert "outbox" not in mod.T["prompt_ro"] and "{text}" in mod.T["prompt_ro"]
+    assert "outbox" not in mod.T["prompt"] and "{text}" in mod.T["prompt"]
 
 
 def test_whisper_uses_gpu_and_falls_back_to_cpu(agent, monkeypatch):

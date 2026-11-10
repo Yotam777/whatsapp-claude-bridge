@@ -17,14 +17,18 @@
   "whisper_language": "he",
   "log_max_mb": 5,
   "fresh_sessions": false,
-  "strict_mcp": true,
   "reply_italic": true,
   "quote_replies": true,
-  "voice_replies": true,
+  "voice_replies": false,
   "voice_name": "he-IL-AvriNeural",
-  "morning_summary": true,
+  "morning_summary": false,
   "morning_summary_time": "07:30",
   "signin_check_time": "09:30",
   "reconnect_settle_seconds": 45,
-  "permission_mode": "auto"
+  "whisper_device": "cuda",
+  "deep_model": "sonnet",
+  "language": "he",
+  "post_transcripts": true,
+  "transcribe_backfill_days": 7,
+  "whisper_idle_unload_minutes": 10
 }

@@ -28,13 +28,6 @@ def _rows(db: str, sql: str, args=()) -> List[Dict[str, Any]]:
         con.close()
 
 
-def status() -> Dict[str, Any]:
-    try:
-        return _LOCAL.get(f"{WHATSAPP_API_BASE_URL}/status", headers=_auth(), timeout=10).json()
-    except Exception as e:
-        return {"error": str(e)}
-
-
 def transcripts(query: Optional[str], chat_jid: Optional[str], limit: int) -> List[Dict[str, Any]]:
     sql, args = "SELECT id, chat_jid, sender, ts, text FROM transcripts WHERE 1=1", []
     if query:
@@ -44,33 +37,6 @@ def transcripts(query: Optional[str], chat_jid: Optional[str], limit: int) -> Li
         sql += " AND chat_jid = ?"
         args.append(chat_jid)
     return _rows(AGENT_DB, sql + " ORDER BY ts DESC LIMIT ?", args + [limit])
-
-
-def polls(chat_jid: Optional[str], limit: int) -> List[Dict[str, Any]]:
-    sql, args = "SELECT poll_id, chat_jid, creator, question, options, timestamp FROM polls", []
-    if chat_jid:
-        sql += " WHERE chat_jid = ?"
-        args.append(chat_jid)
-    out = _rows(MESSAGES_DB_PATH, sql + " ORDER BY timestamp DESC LIMIT ?", args + [limit])
-    for p in out:
-        p["options"] = json.loads(p["options"] or "[]")
-        votes = _rows(MESSAGES_DB_PATH, "SELECT voter, options, timestamp FROM poll_votes WHERE poll_id = ?", (p["poll_id"],))
-        p["votes"] = [{"voter": v["voter"], "chose": json.loads(v["options"] or "[]"), "at": v["timestamp"]} for v in votes]
-        p["tally"] = {o: sum(o in v["chose"] for v in p["votes"]) for o in p["options"]}
-    return out
-
-
-def drafts(status_: str, limit: int) -> List[Dict[str, Any]]:
-    return _rows(MESSAGES_DB_PATH, "SELECT id, recipient, name, message, created, status FROM drafts WHERE status = ? "
-                                   "ORDER BY id DESC LIMIT ?", (status_, limit))
-
-
-def react(chat_jid: str, message_id: str, emoji: str, sender: str = "") -> Dict[str, Any]:
-    try:
-        return _LOCAL.post(f"{WHATSAPP_API_BASE_URL}/react", json={"chat_jid": chat_jid, "message_id": message_id,
-                             "sender": sender, "emoji": emoji}, headers=_auth(), timeout=30).json()
-    except Exception as e:
-        return {"success": False, "error": str(e)}
 
 
 def search(query: str, limit: int) -> List[Dict[str, Any]]:

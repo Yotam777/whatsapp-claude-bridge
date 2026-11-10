@@ -1,38 +1,18 @@
-import os
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
-    list_messages as whatsapp_list_messages,
     list_chats as whatsapp_list_chats,
-    get_chat as whatsapp_get_chat,
-    get_direct_chat_by_contact as whatsapp_get_direct_chat_by_contact,
-    get_contact_chats as whatsapp_get_contact_chats,
-    get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
-    send_message as whatsapp_send_message,
-    send_file as whatsapp_send_file,
-    send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media
 )
 
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
 
-# WA_MCP_READONLY=1 (the agent's read-only assistant mode): tools that send, react or change anything are not registered
-# at all, so a Claude run reading other people's messages has nothing to act with.
-READONLY = os.environ.get("WA_MCP_READONLY") == "1"
+# Read-only by design: no tool here sends, reacts or changes anything, so a Claude run reading other people's messages
+# has nothing to act with.
 
-
-def write_tool():
-    """@mcp.tool() for tools that act on WhatsApp — skipped in read-only mode."""
-    return (lambda fn: fn) if READONLY else mcp.tool()
-
-
-def full_tool():
-    """@mcp.tool() for tools the read-only assistant does not need (chat_history / search_all cover them). Every tool's
-    description is sent to Claude with each message, so fewer tools = faster, cheaper answers and fewer wrong picks."""
-    return (lambda fn: fn) if READONLY else mcp.tool()
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
@@ -44,46 +24,6 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
     contacts = whatsapp_search_contacts(query)
     return contacts
 
-@full_tool()
-def list_messages(
-    after: Optional[str] = None,
-    before: Optional[str] = None,
-    sender_phone_number: Optional[str] = None,
-    chat_jid: Optional[str] = None,
-    query: Optional[str] = None,
-    limit: int = 20,
-    page: int = 0,
-    include_context: bool = True,
-    context_before: int = 1,
-    context_after: int = 1
-) -> List[Dict[str, Any]]:
-    """Get WhatsApp messages matching specified criteria with optional context.
-    
-    Args:
-        after: Optional ISO-8601 formatted string to only return messages after this date
-        before: Optional ISO-8601 formatted string to only return messages before this date
-        sender_phone_number: Optional phone number to filter messages by sender
-        chat_jid: Optional chat JID to filter messages by chat
-        query: Optional search term to filter messages by content
-        limit: Maximum number of messages to return (default 20)
-        page: Page number for pagination (default 0)
-        include_context: Whether to include messages before and after matches (default True)
-        context_before: Number of messages to include before each match (default 1)
-        context_after: Number of messages to include after each match (default 1)
-    """
-    messages = whatsapp_list_messages(
-        after=after,
-        before=before,
-        sender_phone_number=sender_phone_number,
-        chat_jid=chat_jid,
-        query=query,
-        limit=limit,
-        page=page,
-        include_context=include_context,
-        context_before=context_before,
-        context_after=context_after
-    )
-    return messages
 
 @mcp.tool()
 def list_chats(
@@ -111,48 +51,6 @@ def list_chats(
     )
     return chats
 
-@full_tool()
-def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
-    """Get WhatsApp chat metadata by JID.
-    
-    Args:
-        chat_jid: The JID of the chat to retrieve
-        include_last_message: Whether to include the last message (default True)
-    """
-    chat = whatsapp_get_chat(chat_jid, include_last_message)
-    return chat
-
-@full_tool()
-def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
-    """Get WhatsApp chat metadata by sender phone number.
-    
-    Args:
-        sender_phone_number: The phone number to search for
-    """
-    chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
-    return chat
-
-@full_tool()
-def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
-    """Get all WhatsApp chats involving the contact.
-    
-    Args:
-        jid: The contact's JID to search for
-        limit: Maximum number of chats to return (default 20)
-        page: Page number for pagination (default 0)
-    """
-    chats = whatsapp_get_contact_chats(jid, limit, page)
-    return chats
-
-@full_tool()
-def get_last_interaction(jid: str) -> str:
-    """Get most recent WhatsApp message involving the contact.
-    
-    Args:
-        jid: The JID of the contact to search for
-    """
-    message = whatsapp_get_last_interaction(jid)
-    return message
 
 @mcp.tool()
 def get_message_context(
@@ -170,77 +68,6 @@ def get_message_context(
     context = whatsapp_get_message_context(message_id, before, after)
     return context
 
-@write_tool()
-def send_message(
-    recipient: str,
-    message: str,
-    quoted_message_id: str = ""
-) -> Dict[str, Any]:
-    """Send a WhatsApp message to a person or group. For group chats use the JID.
-
-    Sending to anyone except the owner normally produces a *draft* for the owner to review (bridge
-    draft mode), not a sent message — tell the user the draft is waiting.
-
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        message: The message text to send
-        quoted_message_id: optional ID of a message in the same chat to reply to (shown quoted above the reply)
-    
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    # Validate input
-    if not recipient:
-        return {
-            "success": False,
-            "message": "Recipient must be provided"
-        }
-    
-    # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(recipient, message, quoted_message_id)
-    return {
-        "success": success,
-        "message": status_message
-    }
-
-@write_tool()
-def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
-    """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
-    
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the media file to send (image, video, document)
-    
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    
-    # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
-    return {
-        "success": success,
-        "message": status_message
-    }
-
-@write_tool()
-def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
-    """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
-    
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
-    
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
-    return {
-        "success": success,
-        "message": status_message
-    }
 
 @mcp.tool()
 def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
@@ -271,41 +98,10 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
 import extras  # noqa: E402
 
 
-@full_tool()
-def get_status() -> Dict[str, Any]:
-    """WhatsApp connection status: connected, connected_since, disconnects, sent_today, send policy (always draft for others, paused), pending drafts."""
-    return extras.status()
-
-
 @mcp.tool()
 def search_all(query: str, limit: int = 30) -> List[Dict[str, Any]]:
     """Search text in all messages AND in transcripts of voice notes, newest first. Use "a|b" for any of several words — Hebrew has many forms of a word (e.g. "ביצה|ביצים|ביצי")."""
     return extras.search(query, limit)
-
-
-@full_tool()
-def list_transcripts(query: Optional[str] = None, chat_jid: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
-    """Transcripts of voice notes (made locally by the agent). Optional text filter and chat filter."""
-    return extras.transcripts(query, chat_jid, limit)
-
-
-@full_tool()
-def list_polls(chat_jid: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
-    """Polls with their options, each voter's choice and a tally per option."""
-    return extras.polls(chat_jid, limit)
-
-
-@full_tool()
-def list_drafts(status: str = "pending", limit: int = 20) -> List[Dict[str, Any]]:
-    """Drafts waiting for the owner (sends to other people become drafts in draft mode). status: pending | sent | discarded."""
-    return extras.drafts(status, limit)
-
-
-@write_tool()
-def react_to_message(chat_jid: str, message_id: str, emoji: str, sender: str = "") -> Dict[str, Any]:
-    """React to a message with an emoji (empty emoji removes the reaction). sender: author of that message (empty = me)."""
-    return extras.react(chat_jid, message_id, emoji, sender)
-
 
 
 @mcp.tool()

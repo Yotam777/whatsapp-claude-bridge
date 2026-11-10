@@ -11,7 +11,7 @@ Runs as one background process in the Docker container (docker/start.sh restarts
   * nightly backup.
   * Claude usage limit: commands wait and run by themselves after the reset; sign-in expiry warning.
   * after a WhatsApp outage: why / how long, and the owner's missed messages are taken in.
-  * reply to a draft card with a time = scheduled send; morning summary; voice answers to voice notes.
+  * morning summary; voice answers to voice notes (both off by default).
 """
 import datetime as dt
 import importlib.util
@@ -56,9 +56,6 @@ T = {
                           "העדפות של {owner} ודברים שחייבים לזכור. רק הסיכום, בלי הקדמה.",
         "handoff_title": "# סיכום מהשיחה הקודמת",
         "prompt": "[הודעה מ{owner} {where}, {when}]\n{text}\n\n"
-                  "ענה בשפה של {owner}, קצר ולעניין. התשובה שלך תישלח אוטומטית {dest} — אל תשלח אותה בעצמך. "
-                  "אם צריך להחזיר קובץ (אקסל, תמונה, PDF) — שמור אותו בתיקייה outbox והוא יישלח אחרי התשובה.",
-        "prompt_ro": "[הודעה מ{owner} {where}, {when}]\n{text}\n\n"
                      "ענה בשפה של {owner}, קצר ולעניין. התשובה שלך תישלח אוטומטית {dest}. "
                      "לשאלות על הודעות והקלטות בווצאפ השתמש בכלי whatsapp (chat_history, search_all). להקלטה בלי תמלול השתמש ב-transcribe_voice_note.",
     },
@@ -74,9 +71,6 @@ T = {
                           "decisions, {owner}'s preferences and things to remember. Only the summary.",
         "handoff_title": "# Summary of the previous session",
         "prompt": "[Message from {owner} {where}, {when}]\n{text}\n\n"
-                  "Answer briefly in {owner}'s language. Your answer is posted {dest} automatically — do not send it yourself. "
-                  "To return a file (spreadsheet, image, PDF) save it in the outbox folder; it is sent after your answer.",
-        "prompt_ro": "[Message from {owner} {where}, {when}]\n{text}\n\n"
                      "Answer briefly in {owner}'s language. Your answer is posted {dest} automatically. "
                      "For questions about WhatsApp messages and voice notes use the whatsapp tools (chat_history, search_all). For a voice note without a transcript use transcribe_voice_note.",
     },
@@ -134,12 +128,8 @@ def _create_schema(db):
         CREATE TABLE IF NOT EXISTS sent (at TEXT, recipient TEXT, text TEXT, ok INTEGER, detail TEXT);
         CREATE TABLE IF NOT EXISTS commands (id INTEGER PRIMARY KEY AUTOINCREMENT, msg_id TEXT, text TEXT, at TEXT,
             status TEXT DEFAULT 'pending', answered TEXT);
-        CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT DEFAULT 'time', text TEXT,
-            due TEXT, chat_jid TEXT, ref_ts TEXT, status TEXT DEFAULT 'active', created TEXT, fired TEXT);
         CREATE TABLE IF NOT EXISTS transcribe_requests (id TEXT, chat_jid TEXT, at TEXT, status TEXT DEFAULT 'pending',
             PRIMARY KEY (id, chat_jid));
-        CREATE TABLE IF NOT EXISTS scheduled_drafts (id INTEGER PRIMARY KEY AUTOINCREMENT, draft_id INTEGER, send_at TEXT,
-            status TEXT DEFAULT 'scheduled', chat TEXT, created TEXT, done TEXT);
     """)
 
 
@@ -901,8 +891,6 @@ def _stage_of(ev):
                     return "🔀 עובד עם גיט"
                 if re.search(r"go build|go vet|release|pyinstaller", c):
                     return "🛠️ מקמפל/בונה"
-                if "wa_send" in c:
-                    return "📨 מכין טיוטה"
                 return "⚙️ מריץ פקודה"
             return "⚙️ " + name
         if part.get("type") == "thinking":
@@ -1013,27 +1001,20 @@ def stop_applies(target, chat, active):
     return chat == PRIMARY or len(active) <= 1
 
 
-READONLY_TOOLS = "Read,Glob,Grep,WebSearch"  # built-in tools of an assistant_mode=readonly run: nothing that runs, writes or sends
+READONLY_TOOLS = "Read,Glob,Grep,WebSearch"  # Claude's built-in tools: nothing that runs, writes or sends
 
 
-def readonly():
-    """config assistant_mode "readonly": Claude answers and searches WhatsApp but cannot run commands, edit files or send
-    anything. Reading other people's messages is then safe: an instruction hidden in a message has no tool to act with."""
-    return (CFG.get("assistant_mode") or "full") == "readonly"
-
-
-def readonly_mcp_config():
-    """MCP config (JSON string) for the read-only WhatsApp server: the same server the plugin uses, started with
-    WA_MCP_READONLY=1 so its send / react tools are not even registered."""
+def mcp_config():
+    """MCP config (JSON string): the WhatsApp server (read and search only)."""
     main = os.path.join(ROOT, "whatsapp-mcp-server", "main.py")
     if os.environ.get("WA_MCP_PYTHON"):  # the Docker image: the server's dependencies are pre-installed in this venv
         command, args = os.environ["WA_MCP_PYTHON"], [main]
     else:
-        command = shutil.which("uv") or os.path.expanduser("~/.local/bin/uv.exe")
+        command = shutil.which("uv") or "uv"
         args = ["--directory", os.path.dirname(main), "run", "main.py"]
     return json.dumps({"mcpServers": {"whatsapp": {
         "command": command, "args": args,
-        "env": {"WA_TOOL_ROOT": ROOT, "WA_MCP_READONLY": "1"}}}}, ensure_ascii=False)
+        "env": {"WA_TOOL_ROOT": ROOT}}}}, ensure_ascii=False)
 
 
 def claude_exe():
@@ -1041,25 +1022,21 @@ def claude_exe():
 
 
 def claude_cmd(model, resume, append=None, tools=None):
-    """The `claude -p` command line of one run."""
-    ro = readonly() and tools != ""
-    # config "permission_mode" (default "auto"; e.g. "bypassPermissions" on a PC where nothing should wait for a click);
-    # restricted runs over other people's text never get more than "auto"; a read-only run allows only its listed tools
-    mode = "dontAsk" if ro else "auto" if tools == "" else CFG.get("permission_mode", "auto")
-    cmd = [claude_exe(), "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", mode]
+    """The `claude -p` command line of one run. Claude only reads and searches: its built-in tools are READONLY_TOOLS
+    and the WhatsApp MCP server has no tool that sends or changes anything, so an instruction hidden in someone's
+    message has nothing to act with. tools="" = a restricted run with no tools and no MCP at all."""
+    cmd = [claude_exe(), "-p", "--output-format", "stream-json", "--verbose", "--permission-mode", "dontAsk"]
     if model:
         cmd += ["--model", model]
     if append:
         cmd += ["--append-system-prompt", append]
-    if ro:
+    if tools == "":
+        cmd += ["--tools", "", "--strict-mcp-config"]
+    else:
         builtin = CFG.get("readonly_tools") or READONLY_TOOLS
-        cmd += ["--tools", builtin, "--mcp-config", readonly_mcp_config(), "--strict-mcp-config",
+        cmd += ["--tools", builtin, "--mcp-config", mcp_config(), "--strict-mcp-config",
                 "--allowedTools", builtin + ",mcp__whatsapp",
                 "--disallowedTools", "Bash,PowerShell,Edit,Write,NotebookEdit,WebFetch"]
-    elif tools is not None:
-        cmd += ["--tools", tools, "--strict-mcp-config"]  # --tools alone still loads MCP connector tools (e.g. Gmail send)
-    elif CFG.get("strict_mcp"):
-        cmd += ["--strict-mcp-config"]  # skip the heavy connector tool lists (Gmail, Shopify...) to cut tokens
     if resume:
         cmd += ["--resume", resume]
     return cmd
@@ -1606,7 +1583,7 @@ def run_command(row):
             wait_for_limit(cid, chat, mid, src, lu)
             return
         where, dest = ("בקבוצת הבקרה בווצאפ", "לקבוצה") if LANG == "he" else ("in the WhatsApp control group", "to the group")
-        prompt = T["prompt_ro" if readonly() else "prompt"].format(owner=OWNER, when=when, text=text.lstrip("!").strip(), where=where, dest=dest)
+        prompt = T["prompt"].format(owner=OWNER, when=when, text=text.lstrip("!").strip(), where=where, dest=dest)
         model, how = pick_model_info(text, chat)
         _ctx.auto_pick = how == "auto"
         started = time.time()
@@ -1852,7 +1829,7 @@ _manual = {"backup": backup, "group_check": group_check}  # `agent.py <name>` on
 
 # ---------- message intake ----------
 
-work = queue.Queue()  # the owner's intake (voice / files) and reminders: must never wait behind slow jobs
+work = queue.Queue()  # the owner's intake (voice / files): must never wait behind slow jobs
 voice_q = queue.Queue()  # other people's voice notes: their own queue, so a backup or a check never delays a transcript
 slow = queue.Queue()  # slow jobs: backup, the daily group check
 
@@ -1920,79 +1897,6 @@ def quoted_of(chat, mid):
     return None
 
 
-def draft_of_card(card_id, pending_only=True):
-    try:
-        with mdb() as db:
-            q = "SELECT id FROM drafts WHERE card_id = ?" + (" AND status = 'pending'" if pending_only else "") + " ORDER BY id DESC LIMIT 1"
-            r = db.execute(q, (card_id,)).fetchone()
-        return r[0] if r else None
-    except sqlite3.Error:
-        return None
-
-
-def schedule_from_reply(chat, mid, content):
-    """The owner replied to a draft card with a time (schedule it) or with "בטל" (cancel its schedule). True = handled
-    here (no Claude run); False = an ordinary message."""
-    txt = (content or "").strip()
-    cancel = txt in CANCEL_WORDS
-    at = None if cancel else parse_send_time(txt)
-    if not cancel and not at:
-        return False
-    card = quoted_of(chat, mid)
-    did = draft_of_card(card, pending_only=not cancel) if card else None
-    if not did:
-        return False
-    _ctx.chat, _ctx.src, _ctx.sync = chat, "wa", 0
-    try:
-        with adb() as db:
-            n = db.execute("UPDATE scheduled_drafts SET status = 'cancelled', done = ? WHERE draft_id = ? AND status = 'scheduled'",
-                           (dt.datetime.now().isoformat(timespec="seconds"), did)).rowcount
-            if not cancel:
-                db.execute("INSERT INTO scheduled_drafts (draft_id, send_at, chat, created) VALUES (?, ?, ?, ?)",
-                           (did, at.isoformat(timespec="seconds"), chat, dt.datetime.now().isoformat(timespec="seconds")))
-        if cancel:
-            if not n:
-                return False  # nothing was scheduled: let Claude read it
-            reply(f"🕗 התזמון של טיוטה #{did} בוטל — הטיוטה עדיין ממתינה." if LANG == "he" else f"🕗 Schedule of draft #{did} cancelled — the draft is still pending.", quoted=mid)
-        else:
-            day = "" if at.date() == dt.date.today() else (" מחר" if LANG == "he" else " tomorrow")
-            reply(f"🕗 טיוטה #{did} תישלח{day} ב-{at:%H:%M}" if LANG == "he" else f"🕗 Draft #{did} will be sent{day} at {at:%H:%M}", quoted=mid)
-        react(mid, "✅")
-    finally:
-        _ctx.chat = None
-    return True
-
-
-def scheduled_check():
-    """Due scheduled drafts: approve them in the bridge (one approval = one message) if they are still pending."""
-    now = dt.datetime.now().isoformat(timespec="seconds")
-    with adb() as db:
-        rows = db.execute("SELECT id, draft_id, chat FROM scheduled_drafts WHERE status = 'scheduled' AND send_at <= ?", (now,)).fetchall()
-    for sid, did, chat in rows:
-        with adb() as db:  # claim first: never approve twice
-            if db.execute("UPDATE scheduled_drafts SET status = 'sending' WHERE id = ? AND status = 'scheduled'", (sid,)).rowcount != 1:
-                continue
-        _ctx.chat, _ctx.src, _ctx.sync = chat or PRIMARY, "wa", 0
-        try:
-            with mdb() as m:
-                st = (m.execute("SELECT status FROM drafts WHERE id = ?", (did,)).fetchone() or [""])[0]
-            if st != "pending":
-                status = "skipped"
-                reply(f"🕗 טיוטה #{did} כבר לא ממתינה ({st or 'לא נמצאה'}) — לא נשלחה בתזמון." if LANG == "he" else f"🕗 Draft #{did} is no longer pending — not sent.")
-            else:
-                res = bridge("/draft_decide", {"id": int(did), "approve": True}, timeout=30)
-                status = "sent" if res.get("success", True) and not res.get("error") else "failed"
-                if status == "failed":
-                    reply(f"⚠️ השליחה המתוזמנת של טיוטה #{did} נכשלה: {res.get('error') or res}" if LANG == "he" else f"⚠️ Scheduled send of draft #{did} failed: {res}")
-        except Exception as e:
-            status = "failed"
-            log("scheduled draft failed", did, e)
-        finally:
-            _ctx.chat = None
-        with adb() as db:
-            db.execute("UPDATE scheduled_drafts SET status = ?, done = ? WHERE id = ?", (status, dt.datetime.now().isoformat(timespec="seconds"), sid))
-
-
 def sent_special(mid):
     try:
         db = mdb()
@@ -2039,11 +1943,6 @@ def handle(row):
                     intake_failed(cj, mid, e)
             work.put(file_cmd)
         elif content:
-            try:
-                if schedule_from_reply(cj, mid, content):
-                    return
-            except Exception as e:
-                log("schedule from reply failed", e)
             try:
                 enqueue_command(mid, content, ts[:16], cj)
             except Exception as e:
@@ -2246,38 +2145,6 @@ def watchdog():
         time.sleep(60)
 
 
-def reminders_check():
-    """Fires due reminders into the control group (owner only). kind 'time': a plain reminder.
-    kind 'noreply': fires only if nobody wrote in that chat since ref_ts (otherwise it is closed quietly)."""
-    now = dt.datetime.now().astimezone()
-    with adb() as db:
-        rows = db.execute("SELECT id, kind, text, due, chat_jid, ref_ts FROM reminders WHERE status='active' AND due <= ?",
-                          (now.isoformat(timespec="seconds"),)).fetchall()
-    for rid, kind, text, due, chat, ref in rows:
-        late = ""
-        try:
-            mins = int((now - dt.datetime.fromisoformat(due)).total_seconds() // 60)
-            if mins > 10:
-                late = f" (באיחור של {mins} דק')" if LANG == "he" else f" ({mins} min late)"
-        except ValueError:
-            pass
-        if kind == "noreply":
-            try:
-                with mdb() as m:
-                    n = m.execute("SELECT COUNT(*) FROM messages WHERE chat_jid=? AND is_from_me=0 AND datetime(timestamp) > datetime(?)",
-                                  (chat, ref)).fetchone()[0]
-            except Exception:
-                n = 0
-            if n:
-                with adb() as db:
-                    db.execute("UPDATE reminders SET status='answered', fired=? WHERE id=?", (now.isoformat(timespec="seconds"), rid))
-                continue
-        head = "⏰ תזכורת" if LANG == "he" else "⏰ Reminder"
-        reply(f"{head} #{rid}{late}: {text}")
-        with adb() as db:
-            db.execute("UPDATE reminders SET status='done', fired=? WHERE id=?", (now.isoformat(timespec="seconds"), rid))
-
-
 def signin_check():
     """Once a day: warn the owner when Claude Code's sign-in on this PC ends within 3 days (claude auth login)."""
     v = kv_get("signin_ends") or ""
@@ -2394,11 +2261,7 @@ def scheduler():
             for at, key, fn in daily:
                 if now.strftime("%H:%M") >= at and kv_get(f"day:{key}") != today:
                     kv_set(f"day:{key}", today)
-                    slow.put(fn)  # backup / checks never delay the owner's voice notes or reminders
-            if kv_get("at:reminders") != now.strftime("%Y%m%d%H%M"):
-                kv_set("at:reminders", now.strftime("%Y%m%d%H%M"))
-                work.put(reminders_check)
-                work.put(scheduled_check)
+                    slow.put(fn)  # backup / checks never delay the owner's voice notes
         except Exception:
             log("scheduler error", traceback.format_exc())
         time.sleep(30)

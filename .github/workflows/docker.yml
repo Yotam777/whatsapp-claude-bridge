@@ -5,6 +5,7 @@ name: docker
 on:
   push:
     branches: [main]
+    paths-ignore: ['**.md']
   workflow_dispatch:
 
 permissions:
@@ -48,4 +49,14 @@ jobs:
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          # restore points: the image that was :latest until now stays as :previous, and every build also keeps its
+          # own :sha-<commit> tag, so the TrueNAS app can go back to any version by changing the tag
+          if docker buildx imagetools inspect "$IMAGE:latest" >/dev/null 2>&1; then
+            docker buildx imagetools inspect "$IMAGE:restore-before-cleanup" >/dev/null 2>&1 \
+              || docker buildx imagetools create -t "$IMAGE:restore-before-cleanup" "$IMAGE:latest"
+            docker buildx imagetools create -t "$IMAGE:previous" "$IMAGE:latest"
+          fi
+          SHA=sha-${GITHUB_SHA::7}
+          docker tag "$IMAGE:latest" "$IMAGE:$SHA"
+          docker push "$IMAGE:$SHA"
           docker push "$IMAGE:latest"

@@ -203,3 +203,61 @@ def transcribe_voice_note(chat: str, message_id: Optional[str], wait_seconds: in
         else:
             out.append({"id": i, "status": "failed (the recording could not be downloaded)" if i in failed else "still transcribing — try again shortly"})
     return {"chat": jid, "transcripts": out}
+
+
+# ---------- reminders (the agent sends them to the owner's control group when they are due) ----------
+
+REMINDERS_SQL = ("CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT DEFAULT 'time', text TEXT, "
+                 "due TEXT, chat_jid TEXT, ref_ts TEXT, status TEXT DEFAULT 'active', created TEXT, fired TEXT)")
+
+
+def _agent_db():
+    db = sqlite3.connect(AGENT_DB, timeout=30)
+    db.execute(REMINDERS_SQL)
+    return db
+
+
+def set_reminder(text: str, when: str) -> Dict[str, Any]:
+    from datetime import datetime, timedelta
+    text = (text or "").strip()
+    if not text:
+        return {"error": "empty reminder text"}
+    try:
+        due = datetime.fromisoformat(when.strip().replace("Z", "").replace(" ", "T"))
+    except ValueError:
+        return {"error": f"'when' must be a local date-time like 2026-11-11T09:00 (got {when!r})"}
+    if due.tzinfo is not None:  # an offset was given: convert to this machine's local time
+        due = due.astimezone().replace(tzinfo=None)
+    now = datetime.now()
+    if due < now - timedelta(minutes=1):
+        return {"error": f"{due:%Y-%m-%d %H:%M} is in the past (now {now:%Y-%m-%d %H:%M})"}
+    if due > now + timedelta(days=400):
+        return {"error": "more than a year ahead"}
+    db = _agent_db()
+    try:
+        cur = db.execute("INSERT INTO reminders (kind, text, due, status, created) VALUES ('time', ?, ?, 'active', ?)",
+                         (text[:500], due.isoformat(timespec="minutes"), now.isoformat(timespec="seconds")))
+        db.commit()
+        rid = cur.lastrowid
+    finally:
+        db.close()
+    return {"id": rid, "text": text[:500], "due": due.strftime("%Y-%m-%d %H:%M"), "weekday": due.strftime("%A")}
+
+
+def list_reminders() -> List[Dict[str, Any]]:
+    db = _agent_db()
+    try:
+        rows = db.execute("SELECT id, text, due FROM reminders WHERE status='active' ORDER BY due").fetchall()
+    finally:
+        db.close()
+    return [{"id": r[0], "text": r[1], "due": str(r[2]).replace("T", " ")} for r in rows]
+
+
+def cancel_reminder(reminder_id: int) -> Dict[str, Any]:
+    db = _agent_db()
+    try:
+        n = db.execute("UPDATE reminders SET status='cancelled' WHERE id=? AND status='active'", (int(reminder_id),)).rowcount
+        db.commit()
+    finally:
+        db.close()
+    return {"cancelled": bool(n), "id": int(reminder_id)}

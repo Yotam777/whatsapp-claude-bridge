@@ -57,7 +57,9 @@ T = {
         "handoff_title": "# סיכום מהשיחה הקודמת",
         "prompt": "[הודעה מ{owner} {where}, {when}]\n{text}\n\n"
                      "ענה בשפה של {owner}, קצר ולעניין. התשובה שלך תישלח אוטומטית {dest}. "
-                     "לשאלות על הודעות והקלטות בווצאפ השתמש בכלי whatsapp (chat_history, search_all). להקלטה בלי תמלול השתמש ב-transcribe_voice_note.",
+                     "לשאלות על הודעות והקלטות בווצאפ השתמש בכלי whatsapp (chat_history, search_all). להקלטה בלי תמלול השתמש ב-transcribe_voice_note. "
+                     "כש{owner} מבקש תזכורת, קבע אותה עם set_reminder (הזמן עכשיו: {now}, שעון ישראל), וענה בשורה אחת מתי תגיע. "
+                     "לרשימה או ביטול: list_reminders / cancel_reminder.",
     },
     "en": {
         "working": "⏳ Working on it, this takes a bit longer…",
@@ -72,7 +74,9 @@ T = {
         "handoff_title": "# Summary of the previous session",
         "prompt": "[Message from {owner} {where}, {when}]\n{text}\n\n"
                      "Answer briefly in {owner}'s language. Your answer is posted {dest} automatically. "
-                     "For questions about WhatsApp messages and voice notes use the whatsapp tools (chat_history, search_all). For a voice note without a transcript use transcribe_voice_note.",
+                     "For questions about WhatsApp messages and voice notes use the whatsapp tools (chat_history, search_all). For a voice note without a transcript use transcribe_voice_note. "
+                     "When {owner} asks for a reminder, set it with set_reminder (the time now: {now}, local time) and answer in one line when it will come. "
+                     "To list or cancel: list_reminders / cancel_reminder.",
     },
 }[LANG]
 MSG_DB = os.path.join(STORE, "messages.db")
@@ -128,6 +132,8 @@ def _create_schema(db):
         CREATE TABLE IF NOT EXISTS sent (at TEXT, recipient TEXT, text TEXT, ok INTEGER, detail TEXT);
         CREATE TABLE IF NOT EXISTS commands (id INTEGER PRIMARY KEY AUTOINCREMENT, msg_id TEXT, text TEXT, at TEXT,
             status TEXT DEFAULT 'pending', answered TEXT);
+        CREATE TABLE IF NOT EXISTS reminders (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT DEFAULT 'time', text TEXT,
+            due TEXT, chat_jid TEXT, ref_ts TEXT, status TEXT DEFAULT 'active', created TEXT, fired TEXT);
         CREATE TABLE IF NOT EXISTS transcribe_requests (id TEXT, chat_jid TEXT, at TEXT, status TEXT DEFAULT 'pending',
             PRIMARY KEY (id, chat_jid));
     """)
@@ -716,6 +722,68 @@ def _skip_command(verb, who):
         return f"\"{who}\" לא ברשימת הדילוג. /תמלול רשימה"
     kv_set("skip_chats", json.dumps(keep, ensure_ascii=False))
     return "✅ חוזרים לתמלל: " + ", ".join(c["name"] for c in cur if c not in keep)
+
+
+HE_DAYS = ("שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת", "ראשון")
+
+
+def now_text(t=None):
+    """'יום שלישי 10.11.2026 10:54' — what Claude needs to turn "tomorrow at 9" into a time."""
+    t = t or dt.datetime.now()
+    return f"יום {HE_DAYS[t.weekday()]} {t:%d.%m.%Y %H:%M}" if LANG == "he" else f"{t:%A %Y-%m-%d %H:%M}"
+
+
+def reminders_check():
+    """Every minute: due reminders go to the control group (set by Claude's set_reminder tool, or kept from before).
+    A reminder that came due while the agent was down is sent on start, marked late."""
+    now = dt.datetime.now()
+    with adb() as db:
+        rows = db.execute("SELECT id, text, due FROM reminders WHERE status='active' AND due <= ? ORDER BY due",
+                          (now.isoformat(timespec="minutes"),)).fetchall()
+    for rid, text, due in rows:
+        with adb() as db:  # claim first: never send the same reminder twice
+            if db.execute("UPDATE reminders SET status='sending' WHERE id=? AND status='active'", (rid,)).rowcount != 1:
+                continue
+        late = ""
+        try:
+            d = dt.datetime.fromisoformat(due)
+            if now - d > dt.timedelta(minutes=5):
+                late = f"\n_(באיחור: הייתה אמורה להגיע ב-{d:%d.%m %H:%M})_" if LANG == "he" else f"\n_(late: was due {d:%d.%m %H:%M})_"
+        except ValueError:
+            pass
+        _ctx.chat, _ctx.src, _ctx.sync = PRIMARY, "wa", 0
+        try:
+            reply(("⏰ *תזכורת:* " if LANG == "he" else "⏰ *Reminder:* ") + text + late)
+            status = "done"
+        except Exception as e:
+            log("reminder send failed", rid, e)
+            status = "active"  # try again next minute
+        finally:
+            _ctx.chat = None
+        with adb() as db:
+            db.execute("UPDATE reminders SET status=?, fired=? WHERE id=?", (status, now.isoformat(timespec="seconds"), rid))
+
+
+def reminders_command(arg):
+    """/תזכורות — the active reminders; /תזכורות בטל <מספר> — cancel one (no Claude run)."""
+    m = re.match(r"^(בטל|מחק|cancel)\s+#?(\d+)$", arg.strip())
+    with adb() as db:
+        if m:
+            n = db.execute("UPDATE reminders SET status='cancelled' WHERE id=? AND status='active'", (int(m.group(2)),)).rowcount
+            return f"✅ תזכורת {m.group(2)} בוטלה." if n else f"אין תזכורת פעילה מספר {m.group(2)}. /תזכורות"
+        rows = db.execute("SELECT id, text, due FROM reminders WHERE status='active' ORDER BY due").fetchall()
+    if not rows:
+        return "אין תזכורות פעילות. כדי לקבוע, כתוב או הקלט למשל: \"תזכיר לי מחר ב-9 להתקשר לרופא\"."
+    out = ["⏰ *תזכורות פעילות:*"]
+    for rid, text, due in rows:
+        try:
+            d = dt.datetime.fromisoformat(due)
+            when = f"יום {HE_DAYS[d.weekday()]} {d:%d.%m %H:%M}"
+        except ValueError:
+            when = due
+        out.append(f"{rid}. {when}: {text}")
+    out += ["", "ביטול: /תזכורות בטל <מספר>"]
+    return "\n".join(out)
 
 
 def transcribe_command(arg):
@@ -1472,6 +1540,9 @@ def owner_command(text, chat=None):
     m = re.match(r"^/(תמלול|transcribe)\s*(.*)$", text.strip(), re.S)
     if m:
         return transcribe_command(m.group(2).strip())
+    m = re.match(r"^/(תזכורות|תזכורת|reminders)\s*(.*)$", text.strip(), re.S)
+    if m:
+        return reminders_command(m.group(2).strip())
     m = re.match(r"^/(מודל|model|מודלים|סשן|session)\s*(.*)$", text.strip(), re.S)
     if not m:
         return None
@@ -1583,7 +1654,7 @@ def run_command(row):
             wait_for_limit(cid, chat, mid, src, lu)
             return
         where, dest = ("בקבוצת הבקרה בווצאפ", "לקבוצה") if LANG == "he" else ("in the WhatsApp control group", "to the group")
-        prompt = T["prompt"].format(owner=OWNER, when=when, text=text.lstrip("!").strip(), where=where, dest=dest)
+        prompt = T["prompt"].format(owner=OWNER, when=when, text=text.lstrip("!").strip(), where=where, dest=dest, now=now_text())
         model, how = pick_model_info(text, chat)
         _ctx.auto_pick = how == "auto"
         started = time.time()
@@ -2261,7 +2332,10 @@ def scheduler():
             for at, key, fn in daily:
                 if now.strftime("%H:%M") >= at and kv_get(f"day:{key}") != today:
                     kv_set(f"day:{key}", today)
-                    slow.put(fn)  # backup / checks never delay the owner's voice notes
+                    slow.put(fn)  # backup / checks never delay the owner's voice notes or reminders
+            if kv_get("at:reminders") != now.strftime("%Y%m%d%H%M"):
+                kv_set("at:reminders", now.strftime("%Y%m%d%H%M"))
+                work.put(reminders_check)
         except Exception:
             log("scheduler error", traceback.format_exc())
         time.sleep(30)

@@ -131,6 +131,31 @@ def transcribe_voice_note(chat: str, message_id: Optional[str] = None, wait_seco
     return extras.transcribe_voice_note(chat, message_id, wait_seconds)
 
 
+@mcp.tool()
+def set_reminder(text: str, when: str) -> Dict[str, Any]:
+    """Set a reminder for the owner: at `when` the agent posts "⏰ Reminder: <text>" in the owner's Claude group.
+    The only thing a reminder can do is send that message to the owner.
+
+    Args:
+        text: what to remind about, in the owner's words (e.g. "להתקשר לרופא שיניים")
+        when: local date-time, ISO, e.g. "2026-11-11T09:00". Work it out from the current time given in the prompt
+              ("מחר ב-9" → tomorrow 09:00; "בעוד שעה" → now + 1 hour; a day without a time → 09:00)
+    """
+    return extras.set_reminder(text, when)
+
+
+@mcp.tool()
+def list_reminders() -> List[Dict[str, Any]]:
+    """The owner's active reminders (id, text, due), soonest first."""
+    return extras.list_reminders()
+
+
+@mcp.tool()
+def cancel_reminder(reminder_id: int) -> Dict[str, Any]:
+    """Cancel an active reminder by its id (from list_reminders)."""
+    return extras.cancel_reminder(reminder_id)
+
+
 if __name__ == "__main__":
     # Initialize and run the server
     mcp.run(transport='stdio')

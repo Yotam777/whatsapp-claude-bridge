@@ -163,7 +163,7 @@ def test_interrupted_command_is_not_rerun(agent, monkeypatch):
 
 def test_dev_work_uses_the_owners_own_words(agent):
     mod, _ = agent
-    wrapped = mod.T["prompt"].format(owner="יקיר", when="x", text="מה עם הנעליים של דני", where='מהמחשב (לוח הבקרה, "4M")', dest="לחלון")
+    wrapped = mod.T["prompt"].format(owner="יקיר", when="x", text="מה עם הנעליים של דני", where='מהמחשב (לוח הבקרה, "4M")', dest="לחלון", now="x")
     assert mod.is_dev_work(wrapped), "the wrapper itself mentions the dashboard"
     attached = "תסדר את הטופס\n" + mod.T["attached"].format(path="C:/Users/me/whatsapp-mcp/whatsapp-bridge/store/x.jpg")
     assert not mod.is_dev_work(mod.raw_text(attached)), "an attachment path is not dev work"
@@ -597,3 +597,34 @@ def test_skip_groups_from_transcription(agent, monkeypatch):
     assert "משרות QA" in mod.owner_command("/תמלול רשימה").split("🔇")[1]
     assert "חוזרים" in mod.owner_command("/תמלול החזר משרות")
     assert not mod.is_skipped("111@g.us")
+
+
+def test_reminders_fire_once_and_list_cancel(agent, monkeypatch):
+    import datetime as _dt
+    mod, _ = agent
+    sent = []
+    monkeypatch.setattr(mod, "send", lambda r, t, **k: sent.append((r, t)) or True)
+    now = _dt.datetime.now()
+    with mod.adb() as db:
+        for text, due in (("להתקשר לרופא", now - _dt.timedelta(minutes=1)), ("לקנות חלב", now - _dt.timedelta(hours=2)),
+                          ("פגישה מחר", now + _dt.timedelta(days=1))):
+            db.execute("INSERT INTO reminders (kind, text, due, status, created) VALUES ('time', ?, ?, 'active', ?)",
+                       (text, due.isoformat(timespec="minutes"), now.isoformat()))
+    mod.reminders_check()
+    mod.reminders_check()  # a second round sends nothing again
+    texts = [t for r, t in sent]
+    assert len(sent) == 2 and all(r == mod.PRIMARY for r, _ in sent)
+    assert any("להתקשר לרופא" in t and "באיחור" not in t for t in texts)
+    assert any("לקנות חלב" in t and "באיחור" in t for t in texts)  # came due while the agent was down
+    lst = mod.owner_command("/תזכורות")
+    assert "פגישה מחר" in lst and "להתקשר" not in lst
+    rid = lst.split("\n")[1].split(".")[0]
+    assert "בוטלה" in mod.owner_command(f"/תזכורות בטל {rid}")
+    assert "אין תזכורות" in mod.owner_command("/תזכורות")
+
+
+def test_prompt_carries_the_current_time(agent):
+    mod, _ = agent
+    p = mod.T["prompt"].format(owner="יותם", when="2026-11-10 11:00", text="תזכיר לי מחר ב-9", where="", dest="",
+                               now=mod.now_text())
+    assert "set_reminder" in p and "יום " in p

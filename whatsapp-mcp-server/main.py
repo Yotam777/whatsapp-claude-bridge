@@ -28,6 +28,12 @@ def write_tool():
     """@mcp.tool() for tools that act on WhatsApp — skipped in read-only mode."""
     return (lambda fn: fn) if READONLY else mcp.tool()
 
+
+def full_tool():
+    """@mcp.tool() for tools the read-only assistant does not need (chat_history / search_all cover them). Every tool's
+    description is sent to Claude with each message, so fewer tools = faster, cheaper answers and fewer wrong picks."""
+    return (lambda fn: fn) if READONLY else mcp.tool()
+
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number.
@@ -38,7 +44,7 @@ def search_contacts(query: str) -> List[Dict[str, Any]]:
     contacts = whatsapp_search_contacts(query)
     return contacts
 
-@mcp.tool()
+@full_tool()
 def list_messages(
     after: Optional[str] = None,
     before: Optional[str] = None,
@@ -105,7 +111,7 @@ def list_chats(
     )
     return chats
 
-@mcp.tool()
+@full_tool()
 def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
     """Get WhatsApp chat metadata by JID.
     
@@ -116,7 +122,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]
     chat = whatsapp_get_chat(chat_jid, include_last_message)
     return chat
 
-@mcp.tool()
+@full_tool()
 def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
     """Get WhatsApp chat metadata by sender phone number.
     
@@ -126,7 +132,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
     return chat
 
-@mcp.tool()
+@full_tool()
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
     """Get all WhatsApp chats involving the contact.
     
@@ -138,7 +144,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str
     chats = whatsapp_get_contact_chats(jid, limit, page)
     return chats
 
-@mcp.tool()
+@full_tool()
 def get_last_interaction(jid: str) -> str:
     """Get most recent WhatsApp message involving the contact.
     
@@ -265,7 +271,7 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
 import extras  # noqa: E402
 
 
-@mcp.tool()
+@full_tool()
 def get_status() -> Dict[str, Any]:
     """WhatsApp connection status: connected, connected_since, disconnects, sent_today, send policy (always draft for others, paused), pending drafts."""
     return extras.status()
@@ -277,19 +283,19 @@ def search_all(query: str, limit: int = 30) -> List[Dict[str, Any]]:
     return extras.search(query, limit)
 
 
-@mcp.tool()
+@full_tool()
 def list_transcripts(query: Optional[str] = None, chat_jid: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
     """Transcripts of voice notes (made locally by the agent). Optional text filter and chat filter."""
     return extras.transcripts(query, chat_jid, limit)
 
 
-@mcp.tool()
+@full_tool()
 def list_polls(chat_jid: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
     """Polls with their options, each voter's choice and a tally per option."""
     return extras.polls(chat_jid, limit)
 
 
-@mcp.tool()
+@full_tool()
 def list_drafts(status: str = "pending", limit: int = 20) -> List[Dict[str, Any]]:
     """Drafts waiting for the owner (sends to other people become drafts in draft mode). status: pending | sent | discarded."""
     return extras.drafts(status, limit)

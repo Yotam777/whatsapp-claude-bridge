@@ -17,6 +17,7 @@ def agent(tmp_path, monkeypatch):
     db = sqlite3.connect(store / "messages.db")
     db.execute("CREATE TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIMESTAMP, is_from_me BOOLEAN, "
                "media_type TEXT, filename TEXT, PRIMARY KEY (id, chat_jid))")
+    db.execute("CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP)")
     db.commit()
     cfg = json.load(open(os.path.join(HERE, "config.example.json"), encoding="utf-8"))
     cfg.update({"store_dir": str(store), "claude_group": "1203630000@g.us", "transcribe": False, "plugins": []})
@@ -559,7 +560,7 @@ def test_schedule_skips_a_draft_that_is_no_longer_pending(agent, monkeypatch):
 
 def test_morning_summary_extract(multi):
     mod, db = multi
-    db.execute("CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP)")
+    db.execute("CREATE TABLE IF NOT EXISTS chats (jid TEXT PRIMARY KEY, name TEXT, last_message_time TIMESTAMP)")
     db.execute("INSERT INTO chats VALUES ('972500000002@s.whatsapp.net', 'דנה', NULL)")
     db.execute("INSERT INTO chats VALUES ('972500000003@s.whatsapp.net', 'רון', NULL)")
     now = mod.dt.datetime.now().astimezone().replace(microsecond=0)
@@ -831,3 +832,19 @@ def test_stale_session_starts_fresh(agent, monkeypatch):
     monkeypatch.setattr(mod, "session_rotates", lambda *a: False)
     assert mod.claude("hi", on_stage=lambda *a: None) == "שלום"
     assert calls == ["old-pc-session", None] and mod.kv_get(mod.K("session_id", mod.PRIMARY)) == "new"
+
+
+def test_skip_groups_from_transcription(agent, monkeypatch):
+    mod, db = agent
+    db.execute("INSERT OR REPLACE INTO chats VALUES ('111@g.us', 'משרות QA - HireMe', '2026-11-10 09:00:00+02:00')")
+    db.execute("INSERT INTO messages VALUES ('g1', '111@g.us', 'x', '', datetime('now','localtime'), 0, 'audio', '')")
+    db.commit()
+    assert "משרות QA" in mod.owner_command("/תמלול")  # shown among the busiest groups
+    assert "✅" in mod.owner_command("/תמלול דלג משרות")
+    calls = []
+    monkeypatch.setattr(mod, "transcript_of", lambda *a: calls.append(a) or "x")
+    mod.transcribe_and_post("111@g.us", "g2", "x", "2026-11-10 10:00:00+02:00")
+    assert calls == []  # skipped: not transcribed, not posted
+    assert "משרות QA" in mod.owner_command("/תמלול רשימה").split("🔇")[1]
+    assert "חוזרים" in mod.owner_command("/תמלול החזר משרות")
+    assert not mod.is_skipped("111@g.us")

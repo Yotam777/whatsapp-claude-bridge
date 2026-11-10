@@ -719,17 +719,83 @@ def sync_allow():
         log("sync allow list failed", e)
 
 
+def skip_chats():
+    """Chats whose voice notes are not transcribed (kv "skip_chats": [{"jid", "name"}]), e.g. job or stock groups.
+    Their notes can still be transcribed on request (MCP transcribe_voice_note)."""
+    try:
+        return json.loads(kv_get("skip_chats") or "[]")
+    except ValueError:
+        return []
+
+
+def is_skipped(chat_jid):
+    return any(c["jid"] == chat_jid for c in skip_chats())
+
+
+def find_groups(q):
+    """Groups whose name contains q: [(jid, name)], best first."""
+    with mdb() as db:
+        rows = db.execute("SELECT jid, name FROM chats WHERE jid LIKE '%@g.us' AND name LIKE ? ORDER BY last_message_time DESC",
+                          (f"%{q}%",)).fetchall()
+    exact = [(j, n) for j, n in rows if n == q]
+    return exact or [(j, n) for j, n in rows]
+
+
+def busiest_voice_groups(days=7, n=5):
+    """Groups with the most voice notes lately (not already skipped): helps choosing what to skip."""
+    since = (dt.datetime.now() - dt.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with mdb() as db:
+            rows = db.execute("SELECT m.chat_jid, c.name, COUNT(*) FROM messages m LEFT JOIN chats c ON c.jid = m.chat_jid "
+                              "WHERE m.media_type='audio' AND m.chat_jid LIKE '%@g.us' AND m.timestamp > ? "
+                              "GROUP BY m.chat_jid ORDER BY COUNT(*) DESC LIMIT ?", (since, n + 10)).fetchall()
+    except sqlite3.Error:
+        return []
+    return [(j, nm or j, k) for j, nm, k in rows if not is_skipped(j)][:n]
+
+
+def _skip_command(verb, who):
+    cur = skip_chats()
+    if verb in ("דלג", "skip"):
+        if not who:
+            return "על איזו קבוצה לדלג? /תמלול דלג <שם הקבוצה>"
+        found = find_groups(who) or find_contacts(who)
+        if not found:
+            return f"לא מצאתי קבוצה או איש קשר בשם \"{who}\"."
+        if len(found) > 1:
+            return f"מצאתי כמה עם \"{who}\":\n" + "\n".join(f"• {nm}" for _, nm in found[:8]) + \
+                "\n\nכתוב את השם המלא, למשל: /תמלול דלג " + found[0][1]
+        jid, name = found[0]
+        if is_skipped(jid):
+            return f"{name} כבר ברשימת הדילוג."
+        cur.append({"jid": jid, "name": name})
+        kv_set("skip_chats", json.dumps(cur, ensure_ascii=False))
+        return (f"✅ הקלטות ב*{name}* לא יתומללו ולא יישלחו לכאן. אם תצטרך אחת, בקש ממני לתמלל אותה.\n"
+                "ביטול: /תמלול החזר " + name)
+    keep = [c for c in cur if who not in c["name"] and who not in c["jid"]]
+    if not who or len(keep) == len(cur):
+        return f"\"{who}\" לא ברשימת הדילוג. /תמלול רשימה"
+    kv_set("skip_chats", json.dumps(keep, ensure_ascii=False))
+    return "✅ חוזרים לתמלל: " + ", ".join(c["name"] for c in cur if c not in keep)
+
+
 def transcribe_command(arg):
     """/תמלול [הוסף|הסר|רשימה] <name or number> — contacts whose chat gets a transcript of the owner's own voice notes."""
     parts = arg.split(None, 1)
     verb, who = (parts[0] if parts else ""), (parts[1].strip() if len(parts) > 1 else "")
     cur = reply_chats()
+    if verb in ("דלג", "skip", "החזר", "unskip"):
+        return _skip_command(verb, who)
     if verb in ("", "רשימה", "list"):
-        if not cur:
-            return ("אין אנשי קשר ברשימה.\nהוספה: /תמלול הוסף <שם או מספר>\n"
-                    "כל הקלטה *שאתה* שולח להם תקבל מתחתיה את התמלול שלה, כדי שיוכלו לקרוא.")
-        return "📝 ההקלטות שלך לאנשי הקשר האלה מקבלות תמלול בשיחה:\n" + "\n".join(f"• {c['name']}" for c in cur) + \
-            "\n\nהסרה: /תמלול הסר <שם>"
+        out = ["📝 *ההקלטות שלך מקבלות תמלול בשיחה אצל:*"]
+        out += [f"• {c['name']}" for c in cur] or ["(אף אחד) · הוספה: /תמלול הוסף <שם>"]
+        sk = skip_chats()
+        out += ["", "🔇 *בלי תמלול (דילוג):*"] + ([f"• {c['name']}" for c in sk] or ["(אין) · /תמלול דלג <שם קבוצה>"])
+        busy = busiest_voice_groups()
+        if busy:
+            out += ["", "📊 *הקבוצות עם הכי הרבה הקלטות בשבוע האחרון:*"] + [f"• {nm} ({k})" for _, nm, k in busy]
+        out += ["", "פקודות: /תמלול הוסף · הסר · דלג · החזר <שם>"]
+        return "\n".join(out)
     if verb in ("הוסף", "add"):
         if not who:
             return "למי? /תמלול הוסף <שם או מספר>"
@@ -754,7 +820,7 @@ def transcribe_command(arg):
         kv_set("reply_chats", json.dumps(keep, ensure_ascii=False))
         sync_allow()
         return "✅ הוסר: " + ", ".join(c["name"] for c in cur if c not in keep)
-    return "שימוש: /תמלול רשימה · /תמלול הוסף <שם> · /תמלול הסר <שם>"
+    return "שימוש: /תמלול רשימה · /תמלול הוסף <שם> · /תמלול הסר <שם> · /תמלול דלג <קבוצה> · /תמלול החזר <קבוצה>"
 
 
 def transcribe_and_post(chat_jid, msg_id, sender, ts, me=False):
@@ -766,6 +832,8 @@ def transcribe_and_post(chat_jid, msg_id, sender, ts, me=False):
     in_chat = me and not chat_jid.endswith("@g.us") and chat_jid not in control_chats() and is_reply_chat(chat_jid)
     if me and not in_chat:
         return  # the owner's own voice notes elsewhere: nothing to do
+    if not in_chat and is_skipped(chat_jid):
+        return  # a chat the owner chose to skip (/תמלול דלג)
     try:
         text = transcript_of(chat_jid, msg_id, sender, ts)
     except Exception as e:
@@ -798,7 +866,8 @@ def backfill_transcripts():
                           "ORDER BY timestamp DESC", (since,)).fetchall()
     with adb() as db:
         done = {(i, c) for i, c in db.execute("SELECT id, chat_jid FROM transcripts")}
-    todo = [r for r in rows if (r[0], r[1]) not in done]
+    skipped = {c["jid"] for c in skip_chats()}
+    todo = [r for r in rows if (r[0], r[1]) not in done and r[1] not in skipped]
     if todo:
         log(f"backfill: {len(todo)} voice note(s) of the last {days} days")
     for mid, cj, sender, ts in todo:

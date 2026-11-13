@@ -628,3 +628,52 @@ def test_prompt_carries_the_current_time(agent):
     p = mod.T["prompt"].format(owner="יותם", when="2026-11-10 11:00", text="תזכיר לי מחר ב-9", where="", dest="",
                                now=mod.now_text())
     assert "set_reminder" in p and "יום " in p
+
+
+# ---------- agent.db connections (a stuck write lock once blocked the whole agent) ----------
+
+def test_adb_context_closes_the_connection(agent):
+    mod, _ = agent
+    with mod.adb() as db:
+        db.execute("INSERT OR REPLACE INTO kv VALUES ('t', '1')")
+    with pytest.raises(sqlite3.ProgrammingError):  # closed, not left for the garbage collector
+        db.execute("SELECT 1")
+    assert mod.kv_get("t") == "1"
+
+
+def test_agent_db_is_in_wal_mode(agent):
+    mod, _ = agent
+    with mod.adb() as db:
+        assert db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_failed_commit_does_not_keep_the_lock(agent, monkeypatch):
+    """A commit that fails must roll back: before, the open transaction kept the write lock and every other
+    thread got 'database is locked' until the agent was restarted."""
+    mod, _ = agent
+
+    class Boom(mod._AgentDB):
+        def commit(self):
+            raise sqlite3.OperationalError("disk I/O error")
+
+    db = sqlite3.connect(mod.AGENT_DB, timeout=mod.DB_TIMEOUT, factory=Boom)
+    with pytest.raises(sqlite3.OperationalError):
+        with db:
+            db.execute("INSERT OR REPLACE INTO kv VALUES ('x', 'never')")
+    other = sqlite3.connect(mod.AGENT_DB, timeout=1)  # would raise "database is locked" if the lock were still held
+    other.execute("INSERT OR REPLACE INTO kv VALUES ('y', 'ok')")
+    other.commit()
+    assert other.execute("SELECT v FROM kv WHERE k='x'").fetchone() is None
+    other.close()
+
+
+def test_backup_of_agent_db_includes_wal_content(agent, tmp_path, monkeypatch):
+    mod, _ = agent
+    mod.kv_set("fresh", "yes")  # in WAL mode this may still sit in agent.db-wal, not in agent.db
+    day = tmp_path / "bk"
+    day.mkdir()
+    src = sqlite3.connect(mod.AGENT_DB)
+    dst = sqlite3.connect(day / "agent.db")
+    src.backup(dst)
+    dst.close(); src.close()
+    assert sqlite3.connect(day / "agent.db").execute("SELECT v FROM kv WHERE k='fresh'").fetchone()[0] == "yes"

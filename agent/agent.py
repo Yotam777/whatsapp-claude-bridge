@@ -105,10 +105,42 @@ def log(*a):
 
 _schema_lock = threading.Lock()
 _schema_done = set()  # databases whose schema was created in this process (adb() is called very often, from several threads)
+DB_TIMEOUT = 60       # seconds a statement waits for another writer before "database is locked"
+DB_STUCK_SECONDS = 600  # no successful agent.db operation for this long: the agent restarts itself (start.sh brings it back)
+_db_ok_at = time.monotonic()
+
+
+class _AgentDB(sqlite3.Connection):
+    """`with adb() as db:` commits (or rolls back on error) AND closes the connection.
+    A plain sqlite3 connection only commits on `with`; it stays open until garbage collection. When a commit failed
+    (e.g. the disk was too slow to sync), such a connection kept its open write transaction - and the database lock -
+    and every other thread got "database is locked" until the agent was restarted. Here a failed commit is rolled back
+    and the connection is always closed."""
+
+    def __exit__(self, exc_type, exc, tb):
+        global _db_ok_at
+        try:
+            if exc_type is None:
+                self.commit()
+                _db_ok_at = time.monotonic()
+            else:
+                self.rollback()
+        except BaseException:
+            try:
+                self.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            self.close()
+        return False
 
 
 def adb():
-    db = sqlite3.connect(AGENT_DB, timeout=30)
+    db = sqlite3.connect(AGENT_DB, timeout=DB_TIMEOUT, factory=_AgentDB)
+    # WAL: readers never block the writer (and the other way round). synchronous=NORMAL: a commit does not wait for the
+    # disk to sync (only checkpoints do) - safe from corruption in WAL mode; at worst the last moments are lost on a crash.
+    db.execute("PRAGMA synchronous=NORMAL")
     with _schema_lock:
         if AGENT_DB not in _schema_done:
             _create_schema(db)
@@ -122,6 +154,10 @@ def adb():
 
 
 def _create_schema(db):
+    try:  # persistent in the file: set once, applies to every process that opens agent.db (MCP tools, health check)
+        db.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as e:  # another process had it open right now: keep the old mode, try next start
+        log("agent.db: could not switch to WAL:", e)
     db.executescript("""
         CREATE TABLE IF NOT EXISTS handled (id TEXT, chat_jid TEXT, at TIMESTAMP, PRIMARY KEY (id, chat_jid));
         CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT);
@@ -1845,7 +1881,11 @@ def backup():
         dst = sqlite3.connect(os.path.join(day, name))
         src.backup(dst)
         dst.close(); src.close()
-    shutil.copy(AGENT_DB, os.path.join(day, "agent.db"))
+    # agent.db is in WAL mode: a file copy could miss what is still in agent.db-wal - use SQLite's backup instead
+    src = sqlite3.connect(AGENT_DB, timeout=DB_TIMEOUT)
+    dst = sqlite3.connect(os.path.join(day, "agent.db"))
+    src.backup(dst)
+    dst.close(); src.close()
     # fetch any media still only on the server (last 30 days), then mirror the media folders
     cutoff = (dt.datetime.now() - dt.timedelta(days=30)).strftime("%Y-%m-%d")
     with mdb() as db:
@@ -2323,6 +2363,10 @@ def scheduler():
     while True:
         now = dt.datetime.now()
         today = now.date().isoformat()
+        stuck = time.monotonic() - _db_ok_at
+        if stuck > DB_STUCK_SECONDS:  # agent.db unusable for 10 minutes: a fresh process gets a clean start
+            log(f"agent.db: no successful operation for {stuck / 60:.0f} minutes - restarting the agent")
+            os._exit(1)  # not restart_now(): it writes to agent.db, which is exactly what does not work
         try:
             kv_set("heartbeat", now.isoformat())
             daily = [(CFG["backup_time"], "backup", backup),

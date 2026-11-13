@@ -564,12 +564,12 @@ _whisper_used = 0.0
 
 
 def whisper_reaper():
-    """config whisper_idle_unload_minutes (default 10; 0 = keep loaded): free the speech model (GPU memory) after it
+    """config whisper_idle_unload_minutes (default 60; 0 = keep loaded): free the speech model (GPU memory) after it
     has not been used for that long. The next voice note loads it again — a few seconds from the local cache."""
     global _whisper, _whisper_device
     while True:
         time.sleep(30)
-        idle = float(CFG.get("whisper_idle_unload_minutes", 10) or 0)
+        idle = float(CFG.get("whisper_idle_unload_minutes", 60) or 0)
         if not idle:
             continue
         with _whisper_lock:

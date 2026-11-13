@@ -30,5 +30,5 @@
   "language": "he",
   "post_transcripts": true,
   "transcribe_backfill_days": 7,
-  "whisper_idle_unload_minutes": 10
+  "whisper_idle_unload_minutes": 60
 }
